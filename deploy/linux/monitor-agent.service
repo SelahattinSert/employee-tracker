@@ -1,0 +1,22 @@
+# --- deploy/linux/monitor-agent.service ---
+# sudo cp monitor-agent.service /etc/systemd/system/
+# sudo systemctl daemon-reload && sudo systemctl enable --now monitor-agent
+
+[Unit]
+Description=Employee Monitor Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/monitor/agent/monitor_agent.py
+Restart=on-failure
+RestartSec=30
+Environment=MONITOR_COLLECTOR_URI=https://collector.internal/api/v1/telemetry
+Environment=MONITOR_API_TOKEN=__REPLACE__
+Environment=MONITOR_LOG_PATH=/var/log/monitor_agent.log
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

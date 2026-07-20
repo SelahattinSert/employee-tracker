@@ -1,0 +1,4 @@
+# --- agent/requirements.txt equivalent — use pip install -r requirements.txt ---
+# psutil==5.9.8
+# requests==2.31.0
+# schedule==1.2.1
