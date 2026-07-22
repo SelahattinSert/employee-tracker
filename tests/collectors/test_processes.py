@@ -100,6 +100,52 @@ def test_windows_uses_list2cmdline_after_redaction() -> None:
     assert "do-not-print" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "arguments", "expected_arguments"),
+    [
+        (
+            "linux",
+            ["worker", "--token", "--password", "hunter2"],
+            ["worker", "--token", "***", "--password", "***"],
+        ),
+        (
+            "linux",
+            ["worker", "--ToKeN", "--TOKEN", "repeat-secret"],
+            ["worker", "--ToKeN", "***", "--TOKEN", "***"],
+        ),
+        (
+            "win32",
+            ["worker app", "--TOKEN", "--Password", "windows-secret"],
+            ["worker app", "--TOKEN", "***", "--Password", "***"],
+        ),
+        (
+            "win32",
+            ["worker app", "--secret", "--secret", "repeat-windows-secret"],
+            ["worker app", "--secret", "***", "--secret", "***"],
+        ),
+    ],
+)
+def test_consecutive_secret_flags_keep_each_following_value_masked(
+    platform_name: str,
+    arguments: list[str],
+    expected_arguments: list[str],
+) -> None:
+    rendered = redact_command_line(
+        arguments,
+        "redacted",
+        platform_name=platform_name,
+    )
+
+    expected = (
+        subprocess.list2cmdline(expected_arguments)
+        if platform_name == "win32"
+        else " ".join(expected_arguments)
+    )
+    assert rendered == expected
+    assert arguments[-1] not in rendered
+    assert arguments[-1] not in repr(rendered)
+
+
 def test_default_platform_uses_runtime_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(processes_module.sys, "platform", "win32")
 
@@ -140,7 +186,7 @@ def test_processes_preserve_schema_sort_limit_redact_and_report_partial(
     ]
     requested_attrs: list[list[str]] = []
 
-    def process_iter(attrs: list[str]) -> list[FakeProcess]:
+    def process_iter(attrs: list[str], ad_value: object) -> list[FakeProcess]:
         requested_attrs.append(attrs)
         return processes
 
@@ -184,13 +230,48 @@ def test_processes_preserve_schema_sort_limit_redact_and_report_partial(
     json.dumps(result.data, allow_nan=False)
 
 
+def test_process_iter_attribute_sentinel_marks_partial_and_is_not_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_ad_value: list[object] = []
+
+    def process_iter(attrs: list[str], ad_value: object) -> list[FakeProcess]:
+        requested_ad_value.append(ad_value)
+        return [
+            FakeProcess(
+                process_info(
+                    11,
+                    8192,
+                    ["private-worker", "--token", "never-print"],
+                    username=ad_value,
+                )
+            ),
+            FakeProcess(process_info(12, 4096, ["public-worker"])),
+        ]
+
+    monkeypatch.setattr(processes_module.psutil, "process_iter", process_iter)
+
+    result = ProcessesCollector("redacted").collect()
+
+    assert len(requested_ad_value) == 1
+    assert requested_ad_value[0] is not None
+    assert result.status is CollectorStatus.PARTIAL
+    assert result.error_code == "process_access_partial"
+    assert result.error_message == "some processes unavailable"
+    assert [process["pid"] for process in result.data["processes"]] == [12]
+    assert "private-worker" not in repr(result)
+    assert "never-print" not in repr(result)
+    assert repr(requested_ad_value[0]) not in repr(result)
+    json.dumps(result.data, allow_nan=False)
+
+
 def test_no_such_process_is_a_successful_race_and_ties_sort_by_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         processes_module.psutil,
         "process_iter",
-        lambda attrs: [
+        lambda attrs, ad_value: [
             FakeProcess(process_info(9, 2048, ["nine"])),
             FakeProcess(error=psutil.NoSuchProcess(pid=8)),
             FakeProcess(process_info(3, 2048, ["three"])),
@@ -216,7 +297,7 @@ def test_missing_none_and_non_string_values_remain_safe_json(
     monkeypatch.setattr(
         processes_module.psutil,
         "process_iter",
-        lambda attrs: [
+        lambda attrs, ad_value: [
             FakeProcess(
                 {
                     "pid": None,
@@ -261,7 +342,9 @@ def test_none_mode_never_retains_process_arguments(
     monkeypatch.setattr(
         processes_module.psutil,
         "process_iter",
-        lambda attrs: [FakeProcess(process_info(1, 1024, ["worker", "plain-secret"]))],
+        lambda attrs, ad_value: [
+            FakeProcess(process_info(1, 1024, ["worker", "plain-secret"]))
+        ],
     )
 
     result = ProcessesCollector("none").collect()

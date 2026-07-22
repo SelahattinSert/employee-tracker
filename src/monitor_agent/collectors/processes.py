@@ -37,6 +37,7 @@ _PROCESS_ATTRIBUTES = [
     "cmdline",
     "create_time",
 ]
+_ATTRIBUTE_UNAVAILABLE = object()
 
 
 class _Process(Protocol):
@@ -54,13 +55,15 @@ def _redacted_arguments(arguments: Sequence[str]) -> list[str]:
     redacted: list[str] = []
     mask_next = False
     for argument in arguments:
+        name, separator, _ = argument.partition("=")
+        is_secret_flag = name.casefold() in SECRET_FLAGS
         if mask_next:
             redacted.append("***")
             mask_next = False
-            continue
+            if not is_secret_flag:
+                continue
 
-        name, separator, _ = argument.partition("=")
-        if name.casefold() in SECRET_FLAGS:
+        if is_secret_flag:
             if separator:
                 redacted.append(f"{name}=***")
             else:
@@ -172,13 +175,17 @@ class ProcessesCollector:
     def collect(self) -> CollectorPayload:
         processes = cast(
             Iterable[_Process],
-            psutil.process_iter(_PROCESS_ATTRIBUTES),
+            psutil.process_iter(_PROCESS_ATTRIBUTES, ad_value=_ATTRIBUTE_UNAVAILABLE),
         )
         records: list[dict[str, JSONValue]] = []
         access_partial = False
         for process in processes:
             try:
-                records.append(_process_record(process.info, self._cmdline_mode))
+                info = process.info
+                if any(value is _ATTRIBUTE_UNAVAILABLE for value in info.values()):
+                    access_partial = True
+                    continue
+                records.append(_process_record(info, self._cmdline_mode))
             except psutil.AccessDenied:
                 access_partial = True
             except psutil.NoSuchProcess:
