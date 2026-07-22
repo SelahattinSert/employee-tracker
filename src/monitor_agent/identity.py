@@ -109,6 +109,8 @@ def _load_or_create_fallback(state_dir: Path) -> str:
         value = _read_fallback_file(path)
     except FileNotFoundError:
         pass
+    except ValueError:
+        return _read_concurrent_winner(path)
     else:
         path.chmod(0o600)
         return value
@@ -133,7 +135,7 @@ def _load_or_create_fallback(state_dir: Path) -> str:
 
 def _hashed_uuid(raw_identifier: str) -> str:
     digest = bytearray(
-        hashlib.sha256(b"monitor-agent/v2\0" + raw_identifier.encode()).digest()[:16]
+        hashlib.sha256(b"monitor-agent/v2\\0" + raw_identifier.encode()).digest()[:16]
     )
     digest[6] = (digest[6] & 0x0F) | 0x50
     digest[8] = (digest[8] & 0x3F) | 0x80

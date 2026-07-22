@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import subprocess
@@ -9,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from types import ModuleType
 from uuid import UUID
 
@@ -40,18 +39,12 @@ def test_machine_identity_is_frozen_slotted_and_has_exact_fields() -> None:
         machine_identity.value = "replacement"
 
 
-def test_hashed_uuid_uses_domain_separated_sha256_and_rfc_4122_bits() -> None:
+def test_hashed_uuid_matches_domain_separated_golden_vector() -> None:
     raw_identifier = "raw-platform-machine-id"
-    digest = bytearray(
-        hashlib.sha256(b"monitor-agent/v2\0" + raw_identifier.encode()).digest()[:16]
-    )
-    digest[6] = (digest[6] & 0x0F) | 0x50
-    digest[8] = (digest[8] & 0x3F) | 0x80
-    expected = UUID(bytes=bytes(digest))
 
     value = _hashed_uuid(raw_identifier)
 
-    assert value == str(expected)
+    assert value == "5573d7a7-80aa-591f-b5c9-0045f85c134e"
     assert UUID(value).version == 5
     assert UUID(value).variant == "specified in RFC 4122"
     assert raw_identifier not in value
@@ -364,3 +357,60 @@ def test_concurrent_fallback_creators_return_the_winners_value(
     assert values[0] == values[1]
     assert UUID(values[0]).version == 4
     assert (state_dir / "machine-id").read_text(encoding="utf-8").strip() == values[0]
+
+
+def test_late_reader_waits_for_empty_concurrent_winner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_dir = tmp_path / "late-reader-state"
+    empty_file_created = Event()
+    reader_retrying = Event()
+    allow_writer = Event()
+    real_open = os.open
+
+    def gated_open(path: os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        file_descriptor = real_open(path, flags, mode)
+        empty_file_created.set()
+        if not allow_writer.wait(timeout=2):
+            raise TimeoutError("writer gate was not released")
+        return file_descriptor
+
+    def gated_retry(delay: float) -> None:
+        assert delay == identity_module._FALLBACK_READ_DELAY_SEC
+        reader_retrying.set()
+        if not allow_writer.wait(timeout=2):
+            raise TimeoutError("reader retry gate was not released")
+
+    monkeypatch.setattr(identity_module.os, "open", gated_open)
+    monkeypatch.setattr(identity_module.time, "sleep", gated_retry)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(_load_or_create_fallback, state_dir)
+        assert empty_file_created.wait(timeout=2)
+        reader = executor.submit(_load_or_create_fallback, state_dir)
+        try:
+            assert reader_retrying.wait(timeout=1)
+        finally:
+            allow_writer.set()
+        writer_value = writer.result(timeout=2)
+        reader_value = reader.result(timeout=2)
+
+    assert reader_value == writer_value
+    assert UUID(writer_value).version == 4
+
+
+def test_permanently_malformed_fallback_fails_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fallback_path = tmp_path / "machine-id"
+    fallback_path.write_text("not-a-uuid", encoding="utf-8")
+    retry_delays: list[float] = []
+    monkeypatch.setattr(identity_module, "_FALLBACK_READ_ATTEMPTS", 3)
+    monkeypatch.setattr(identity_module.time, "sleep", retry_delays.append)
+
+    with pytest.raises(
+        RuntimeError, match="concurrent machine identity creation did not complete"
+    ):
+        _load_or_create_fallback(tmp_path)
+
+    assert retry_delays == [identity_module._FALLBACK_READ_DELAY_SEC] * 3
