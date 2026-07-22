@@ -1,3 +1,4 @@
+import argparse
 import shlex
 import subprocess
 import sys
@@ -17,6 +18,20 @@ def test_version_constant() -> None:
 def test_version_command(capsys) -> None:
     assert main(["version"]) == 0
     assert capsys.readouterr().out.strip() == "monitor-agent 2.0.0"
+
+
+def test_main_rejects_unhandled_command(monkeypatch) -> None:
+    class FakeParser:
+        def parse_args(self, argv: object) -> argparse.Namespace:
+            assert argv == ["unexpected"]
+            return argparse.Namespace(command="unexpected")
+
+    monkeypatch.setattr("monitor_agent.cli.build_parser", FakeParser)
+
+    with pytest.raises(AssertionError) as exc_info:
+        main(["unexpected"])
+
+    assert str(exc_info.value) == "unhandled command: unexpected"
 
 
 def test_pytest_enforces_line_and_branch_coverage() -> None:
