@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -18,7 +18,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     collector_uri: str | None
-    api_token: str | None
+    api_token: str | None = field(repr=False)
     heartbeat_sec: int
     startup_delay_sec: int
     connect_timeout_sec: float
@@ -102,6 +102,7 @@ def _validate_collector_uri(uri: str) -> None:
         hostname = parsed.hostname
         username = parsed.username
         password = parsed.password
+        _ = parsed.port
     except ValueError as error:
         raise ConfigError("MONITOR_COLLECTOR_URI must be a valid HTTPS URI") from error
     if parsed.scheme.casefold() != "https":

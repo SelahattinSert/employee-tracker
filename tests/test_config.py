@@ -64,6 +64,16 @@ def test_agent_config_is_frozen_slotted_and_has_exact_fields() -> None:
         config.heartbeat_sec = 60
 
 
+def test_agent_config_repr_omits_api_token() -> None:
+    token = "real-secret-token"
+
+    config = load_config(
+        BASE_ENV | {"MONITOR_API_TOKEN": token}, platform_name="linux"
+    )
+
+    assert token not in repr(config)
+
+
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
@@ -143,6 +153,18 @@ def test_false_boolean_spellings_are_accepted(value: str) -> None:
 )
 def test_invalid_collector_uris_are_rejected(uri: str, message: str) -> None:
     with pytest.raises(ConfigError, match=message):
+        load_config(BASE_ENV | {"MONITOR_COLLECTOR_URI": uri}, platform_name="linux")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://collector.internal:notaport/telemetry",
+        "https://collector.internal:70000/telemetry",
+    ],
+)
+def test_invalid_collector_ports_are_rejected(uri: str) -> None:
+    with pytest.raises(ConfigError, match="must be a valid HTTPS URI"):
         load_config(BASE_ENV | {"MONITOR_COLLECTOR_URI": uri}, platform_name="linux")
 
 
