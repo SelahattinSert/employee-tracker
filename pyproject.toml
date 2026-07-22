@@ -31,11 +31,12 @@ monitor-agent = "monitor_agent.cli:entrypoint"
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "--strict-config --strict-markers"
+addopts = "--strict-config --strict-markers --cov=monitor_agent --cov-branch --cov-report=term-missing --cov-fail-under=90"
 testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
+patch = ["subprocess"]
 source = ["monitor_agent"]
 
 [tool.coverage.report]

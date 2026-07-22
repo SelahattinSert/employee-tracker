@@ -1,5 +1,13 @@
+import shlex
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+import pytest
+
 from monitor_agent import __version__
-from monitor_agent.cli import main
+from monitor_agent.cli import entrypoint, main
 
 
 def test_version_constant() -> None:
@@ -9,3 +17,39 @@ def test_version_constant() -> None:
 def test_version_command(capsys) -> None:
     assert main(["version"]) == 0
     assert capsys.readouterr().out.strip() == "monitor-agent 2.0.0"
+
+
+def test_pytest_enforces_line_and_branch_coverage() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    addopts = shlex.split(config["tool"]["pytest"]["ini_options"]["addopts"])
+
+    assert "--cov=monitor_agent" in addopts
+    assert "--cov-branch" in addopts
+    assert "--cov-report=term-missing" in addopts
+    assert "--cov-fail-under=90" in addopts
+
+
+def test_entrypoint_exits_with_success(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["monitor-agent", "version"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        entrypoint()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert captured.out.strip() == "monitor-agent 2.0.0"
+    assert captured.err == ""
+
+
+def test_python_m_monitor_agent() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "monitor_agent", "version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "monitor-agent 2.0.0"
+    assert result.stderr == ""
