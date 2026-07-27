@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import TextIOWrapper
 from logging.handlers import RotatingFileHandler
@@ -17,11 +18,7 @@ from monitor_agent.models import JSONValue
 
 _REDACTED = "[REDACTED]"
 _BEARER_PATTERN = re.compile(
-    r"(authorization\s*:\s*bearer\s+)(?!%)(\S+)",
-    flags=re.IGNORECASE,
-)
-_BEARER_PLACEHOLDER_PREFIX = re.compile(
-    r"authorization\s*:\s*bearer\s*$",
+    r"(authorization\s*:\s*bearer\s+)(\S+)",
     flags=re.IGNORECASE,
 )
 _PRINTF_PATTERN = re.compile(
@@ -32,9 +29,29 @@ _PRINTF_PATTERN = re.compile(
     r"[hlL]?"
     r"(?P<conversion>[diouxXeEfFgGcrsa%])"
 )
+_ACTIVE_MARKER_PATTERN = re.compile(r"\x00(?P<index>\d+)\x00")
 _NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW", 0))
 _MAX_LOG_BYTES = 10_485_760
 _BACKUP_COUNT = 5
+_INTEGER_CONVERSIONS = frozenset("diouxX")
+_FLOAT_CONVERSIONS = frozenset("eEfFgG")
+
+
+@dataclass(frozen=True)
+class _ActiveConversion:
+    start: int
+    end: int
+    conversion: str
+    argument_index: int | None = None
+    key: str | None = None
+
+
+class _SafeRepresentation:
+    def __repr__(self) -> str:
+        return _REDACTED
+
+
+_SAFE_REPRESENTATION = _SafeRepresentation()
 
 
 def _utc_timestamp(created: float) -> str:
@@ -60,71 +77,209 @@ class SecretFilter(logging.Filter):
             redacted = redacted.replace(secret, _REDACTED)
         return _BEARER_PATTERN.sub(rf"\1{_REDACTED}", redacted)
 
-    def _redact_template(self, template: str) -> str:
-        parts: list[str] = []
-        previous_end = 0
-        for match in _PRINTF_PATTERN.finditer(template):
-            parts.append(self._redact(template[previous_end : match.start()]))
-            parts.append(match.group(0))
-            previous_end = match.end()
-        parts.append(self._redact(template[previous_end:]))
-        return "".join(parts)
-
     @staticmethod
-    def _bearer_placeholders(template: str) -> tuple[set[int], set[str]]:
-        positional: set[int] = set()
-        mapping: set[str] = set()
-        argument_index = 0
+    def _active_conversions(
+        template: str,
+        args: tuple[object, ...] | Mapping[str, object],
+    ) -> tuple[list[_ActiveConversion], int]:
+        active: list[_ActiveConversion] = []
+        if isinstance(args, tuple):
+            if not args:
+                return active, 0
+            argument_index = 0
+            arguments_exhausted = False
+            for match in _PRINTF_PATTERN.finditer(template):
+                if match.group("conversion") == "%":
+                    active.append(
+                        _ActiveConversion(
+                            match.start(),
+                            match.end(),
+                            match.group("conversion"),
+                        )
+                    )
+                    continue
+                if arguments_exhausted:
+                    continue
+                if match.group("key") is not None:
+                    arguments_exhausted = True
+                    continue
+                star_count = int(match.group("width") == "*") + int(
+                    match.group("precision") == "*"
+                )
+                if argument_index + star_count >= len(args):
+                    arguments_exhausted = True
+                    continue
+                active.append(
+                    _ActiveConversion(
+                        match.start(),
+                        match.end(),
+                        match.group("conversion"),
+                        argument_index=argument_index + star_count,
+                    )
+                )
+                argument_index += star_count + 1
+            return active, argument_index
+
+        if not args:
+            return active, 0
         for match in _PRINTF_PATTERN.finditer(template):
             if match.group("conversion") == "%":
+                active.append(
+                    _ActiveConversion(
+                        match.start(),
+                        match.end(),
+                        match.group("conversion"),
+                    )
+                )
                 continue
             key = match.group("key")
-            is_bearer = _BEARER_PLACEHOLDER_PREFIX.search(
-                template[: match.start()]
-            )
-            if key is not None:
-                if is_bearer:
-                    mapping.add(key)
+            if (
+                key is None
+                or match.group("width") == "*"
+                or match.group("precision") == "*"
+                or key not in args
+            ):
                 continue
-            argument_index += int(match.group("width") == "*")
-            argument_index += int(match.group("precision") == "*")
-            if is_bearer:
-                positional.add(argument_index)
-            argument_index += 1
-        return positional, mapping
+            active.append(
+                _ActiveConversion(
+                    match.start(),
+                    match.end(),
+                    match.group("conversion"),
+                    key=key,
+                )
+            )
+        return active, 0
+
+    def _redact_secrets_preserving_markers(self, value: str) -> str:
+        parts: list[str] = []
+        previous_end = 0
+        for match in _ACTIVE_MARKER_PATTERN.finditer(value):
+            part = value[previous_end : match.start()]
+            for secret in self._secrets:
+                part = part.replace(secret, _REDACTED)
+            parts.append(part)
+            parts.append(match.group(0))
+            previous_end = match.end()
+        part = value[previous_end:]
+        for secret in self._secrets:
+            part = part.replace(secret, _REDACTED)
+        parts.append(part)
+        return "".join(parts)
+
+    def _redact_template(
+        self,
+        template: str,
+        active: list[_ActiveConversion],
+    ) -> tuple[str, set[int]]:
+        marked_parts: list[str] = []
+        previous_end = 0
+        for index, conversion in enumerate(active):
+            marked_parts.append(template[previous_end : conversion.start])
+            marked_parts.append(f"\x00{index}\x00")
+            previous_end = conversion.end
+        marked_parts.append(template[previous_end:])
+        marked = "".join(marked_parts)
+        bearer_conversions: set[int] = set()
+
+        def redact_bearer(match: re.Match[str]) -> str:
+            markers = list(_ACTIVE_MARKER_PATTERN.finditer(match.group(2)))
+            bearer_conversions.update(
+                int(marker.group("index")) for marker in markers
+            )
+            if not markers:
+                return f"{match.group(1)}{_REDACTED}"
+            return match.group(1) + "".join(marker.group(0) for marker in markers)
+
+        marked = _BEARER_PATTERN.sub(redact_bearer, marked)
+        marked = self._redact_secrets_preserving_markers(marked)
+
+        def restore_conversion(match: re.Match[str]) -> str:
+            conversion = active[int(match.group("index"))]
+            return template[conversion.start : conversion.end]
+
+        return _ACTIVE_MARKER_PATTERN.sub(restore_conversion, marked), bearer_conversions
+
+    @staticmethod
+    def _safe_sentinel(conversions: set[str]) -> object:
+        if conversions & _INTEGER_CONVERSIONS:
+            return 0
+        if conversions & _FLOAT_CONVERSIONS:
+            return 0.0
+        if "c" in conversions:
+            return "*"
+        if conversions & {"r", "a"}:
+            return _SAFE_REPRESENTATION
+        return _REDACTED
+
+    @staticmethod
+    def _argument_conversions(
+        active: list[_ActiveConversion],
+        bearer_conversions: set[int],
+    ) -> tuple[dict[int, set[str]], dict[str, set[str]], set[int], set[str]]:
+        positional: dict[int, set[str]] = {}
+        mapping: dict[str, set[str]] = {}
+        positional_bearers: set[int] = set()
+        mapping_bearers: set[str] = set()
+        for conversion_index, conversion in enumerate(active):
+            if conversion.argument_index is not None:
+                positional.setdefault(conversion.argument_index, set()).add(
+                    conversion.conversion
+                )
+                if conversion_index in bearer_conversions:
+                    positional_bearers.add(conversion.argument_index)
+            elif conversion.key is not None:
+                mapping.setdefault(conversion.key, set()).add(conversion.conversion)
+                if conversion_index in bearer_conversions:
+                    mapping_bearers.add(conversion.key)
+        return positional, mapping, positional_bearers, mapping_bearers
+
+    def _redact_argument(self, value: object, conversions: set[str]) -> object:
+        if not isinstance(value, str):
+            return value
+        redacted = self._redact(value)
+        if redacted == value:
+            return value
+        return self._safe_sentinel(conversions) if "c" in conversions else redacted
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            positional_bearers, mapping_bearers = self._bearer_placeholders(
-                record.msg
-            )
-            record.msg = self._redact_template(record.msg)
-        else:
-            positional_bearers, mapping_bearers = set(), set()
-        if isinstance(record.args, tuple):
-            record.args = tuple(
-                (
-                    _REDACTED
+        if not isinstance(record.msg, str):
+            return True
+        args = record.args
+        if not isinstance(args, (tuple, Mapping)):
+            record.msg = self._redact(record.msg)
+            return True
+        active, consumed_arguments = self._active_conversions(record.msg, args)
+        record.msg, bearer_conversions = self._redact_template(record.msg, active)
+        (
+            positional_conversions,
+            mapping_conversions,
+            positional_bearers,
+            mapping_bearers,
+        ) = self._argument_conversions(active, bearer_conversions)
+
+        if isinstance(args, tuple):
+            redacted_args: list[object] = []
+            for index, value in enumerate(args[:consumed_arguments]):
+                conversions = positional_conversions.get(index, set())
+                redacted_args.append(
+                    self._safe_sentinel(conversions)
                     if index in positional_bearers
-                    else self._redact(value)
+                    else self._redact_argument(value, conversions)
                 )
-                if isinstance(value, str)
-                else value
-                for index, value in enumerate(record.args)
-            )
-        elif isinstance(record.args, Mapping):
+            record.args = tuple(redacted_args)
+        else:
             record.args = {
                 key: (
-                    _REDACTED
+                    self._safe_sentinel(mapping_conversions.get(key, set()))
                     if key in mapping_bearers
-                    else self._redact(value)
+                    else self._redact_argument(
+                        value,
+                        mapping_conversions.get(key, set()),
+                    )
                 )
-                if isinstance(value, str)
-                else value
-                for key, value in record.args.items()
+                for key, value in args.items()
             }
         return True
-
 
 class JsonFormatter(logging.Formatter):
     """Render one compact, structured, exception-text-free log record."""

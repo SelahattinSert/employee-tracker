@@ -95,6 +95,56 @@ def test_secret_filter_keeps_deferred_bearer_placeholder_valid() -> None:
     assert item.getMessage() == "Authorization: Bearer [REDACTED]"
 
 
+@pytest.mark.parametrize(
+    ("message", "secrets", "expected"),
+    [
+        ("Authorization: Bearer %s", [], "Authorization: Bearer [REDACTED]"),
+        ("Authorization: Bearer %token", [], "Authorization: Bearer [REDACTED]"),
+        ("Authorization: Bearer %%token", [], "Authorization: Bearer [REDACTED]"),
+        ("Authorization: Bearer %2Fsecret", [], "Authorization: Bearer [REDACTED]"),
+        ("configured=%s", ["%s"], "configured=[REDACTED]"),
+    ],
+)
+def test_secret_filter_masks_literal_percent_text_without_arguments(
+    message: str,
+    secrets: list[str],
+    expected: str,
+) -> None:
+    item = record(message)
+
+    SecretFilter(secrets).filter(item)
+
+    assert item.args == ()
+    assert item.getMessage() == expected
+
+
+def test_secret_filter_masks_unconsumed_bearer_after_active_placeholder() -> None:
+    item = record(
+        "state=%s Authorization: Bearer %s progress=100%%",
+        ("ready",),
+    )
+
+    SecretFilter(["%"]).filter(item)
+
+    assert item.msg == (
+        "state=%s Authorization: Bearer [REDACTED] progress=100%%"
+    )
+    assert item.args == ("ready",)
+    assert item.getMessage() == (
+        "state=ready Authorization: Bearer [REDACTED] progress=100%"
+    )
+
+
+def test_secret_filter_preserves_percent_escape_when_formatting_is_active() -> None:
+    item = record("progress=100%% state=%s", ("ready",))
+
+    SecretFilter(["%"]).filter(item)
+
+    assert item.msg == "progress=100%% state=%s"
+    assert item.args == ("ready",)
+    assert item.getMessage() == "progress=100% state=ready"
+
+
 def test_secret_filter_masks_empty_secret_positional_bearer_after_placeholder() -> None:
     item = record(
         "state=%s Authorization: Bearer %s",
@@ -124,6 +174,71 @@ def test_secret_filter_masks_empty_secret_mapping_bearer_after_placeholder() -> 
     assert arguments["credential"] == "unconfigured-mapping-credential"
     assert item.args == {"state": "ready", "credential": "[REDACTED]"}
     assert item.getMessage() == "state=ready Authorization: Bearer [REDACTED]"
+
+
+def test_secret_filter_keeps_positional_char_and_star_formatting_valid() -> None:
+    arguments = (6, 3, "ready", "X")
+    item = record(
+        "state=%*.*s Authorization: Bearer %c",
+        arguments,
+    )
+
+    SecretFilter([]).filter(item)
+
+    assert arguments == (6, 3, "ready", "X")
+    assert item.msg == "state=%*.*s Authorization: Bearer %c"
+    assert item.args == (6, 3, "ready", "*")
+    assert item.getMessage() == "state=   rea Authorization: Bearer *"
+
+
+def test_secret_filter_keeps_mapping_char_formatting_valid_without_mutation() -> None:
+    arguments = {"credential": "X", "count": 4}
+    item = record(
+        "Authorization: Bearer %(credential)c count=%(count)d",
+        arguments,
+    )
+
+    SecretFilter([]).filter(item)
+
+    assert arguments == {"credential": "X", "count": 4}
+    assert item.msg == "Authorization: Bearer %(credential)c count=%(count)d"
+    assert item.args == {"credential": "*", "count": 4}
+    assert item.getMessage() == "Authorization: Bearer * count=4"
+
+
+def test_secret_filter_keeps_configured_secret_char_formatting_valid() -> None:
+    arguments = {"credential": "X", "count": 1}
+    item = record("credential=%(credential)c count=%(count)d", arguments)
+
+    SecretFilter(["X"]).filter(item)
+
+    assert arguments == {"credential": "X", "count": 1}
+    assert item.args == {"credential": "*", "count": 1}
+    assert item.getMessage() == "credential=* count=1"
+
+
+@pytest.mark.parametrize(
+    ("conversion", "argument", "expected"),
+    [
+        ("d", 123, "0"),
+        ("x", 255, "0"),
+        ("f", 1.25, "0.000000"),
+        ("c", "X", "*"),
+        ("s", "secret", "[REDACTED]"),
+        ("r", "secret", "[REDACTED]"),
+        ("a", "secret", "[REDACTED]"),
+    ],
+)
+def test_secret_filter_uses_type_compatible_bearer_sentinels(
+    conversion: str,
+    argument: object,
+    expected: str,
+) -> None:
+    item = record(f"Authorization: Bearer %{conversion}", (argument,))
+
+    SecretFilter([]).filter(item)
+
+    assert item.getMessage() == f"Authorization: Bearer {expected}"
 
 
 @pytest.mark.parametrize(
