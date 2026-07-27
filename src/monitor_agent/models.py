@@ -9,6 +9,19 @@ JSONValue: TypeAlias = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class SpoolStats:
+    pending_count: int
+    pending_bytes: int
+    dead_letter_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionResult:
+    evicted_count: int
+    evicted_bytes: int
+
+
 class CollectorStatus(StrEnum):
     SUCCESS = "success"
     PARTIAL = "partial"
