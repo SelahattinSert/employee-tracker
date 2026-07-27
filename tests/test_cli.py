@@ -212,6 +212,59 @@ def test_transmitting_once_uses_runtime_result_and_closes_transport(
     assert transport.close_calls == 1
 
 
+def test_transmitting_once_closes_exactly_once_when_cycle_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prepare_command(monkeypatch, config(tmp_path))
+    primary = RuntimeError("cycle failed")
+    transport = SimpleNamespace(close_calls=0)
+    runtime = SimpleNamespace(transport=transport)
+
+    def run_cycle(event: str) -> CycleResult:
+        raise primary
+
+    def close() -> None:
+        transport.close_calls += 1
+
+    runtime.run_cycle = run_cycle
+    transport.close = close
+    monkeypatch.setattr(cli, "_create_runtime", lambda value: runtime)
+
+    with pytest.raises(RuntimeError) as error:
+        cli.main(["once"])
+
+    assert error.value is primary
+    assert transport.close_calls == 1
+
+
+def test_transmitting_once_preserves_cycle_error_when_close_also_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prepare_command(monkeypatch, config(tmp_path))
+    primary = RuntimeError("cycle failed")
+    transport = SimpleNamespace(close_calls=0)
+    runtime = SimpleNamespace(transport=transport)
+
+    def run_cycle(event: str) -> CycleResult:
+        raise primary
+
+    def close() -> None:
+        transport.close_calls += 1
+        raise OSError("close failed")
+
+    runtime.run_cycle = run_cycle
+    transport.close = close
+    monkeypatch.setattr(cli, "_create_runtime", lambda value: runtime)
+
+    with pytest.raises(RuntimeError) as error:
+        cli.main(["once"])
+
+    assert error.value is primary
+    assert transport.close_calls == 1
+
+
 def test_invalid_event_fails_cleanly_without_traceback_or_secret(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -430,6 +483,207 @@ def test_validate_paths_sanitizes_probe_creation_failure(
 
     with pytest.raises(ConfigError, match=r"^spool path is not writable$"):
         cli._validate_paths(agent_config)
+
+
+def test_validate_paths_rejects_existing_log_file_that_cannot_be_appended(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = config(tmp_path)
+    assert agent_config.log_path is not None
+    agent_config.log_path.parent.mkdir(parents=True)
+    agent_config.log_path.write_text("existing", encoding="utf-8")
+    real_open = os.open
+
+    def fail_log_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if os.fspath(path) == os.fspath(agent_config.log_path):
+            raise PermissionError("raw private log path")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(cli.os, "open", fail_log_open)
+
+    with pytest.raises(ConfigError, match=r"^log path is not writable$") as error:
+        cli._validate_paths(agent_config)
+
+    assert "raw private log path" not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_validate_paths_rejects_symlink_log_file(
+    tmp_path: Path,
+) -> None:
+    agent_config = config(tmp_path)
+    assert agent_config.log_path is not None
+    agent_config.log_path.parent.mkdir(parents=True)
+    target = tmp_path / "target.log"
+    target.write_text("unchanged", encoding="utf-8")
+    agent_config.log_path.symlink_to(target)
+
+    with pytest.raises(ConfigError, match=r"^log path must identify a file$"):
+        cli._validate_paths(agent_config)
+
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_prepare_config_sanitizes_logging_setup_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = config(tmp_path)
+    monkeypatch.setattr(cli, "load_config", lambda **kwargs: agent_config)
+    monkeypatch.setattr(cli, "_validate_paths", lambda value: None)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda value: (_ for _ in ()).throw(
+            PermissionError("raw private log path from race")
+        ),
+    )
+
+    with pytest.raises(ConfigError, match=r"^log path is not writable$") as error:
+        cli._prepare_config(require_transport=True)
+
+    assert "raw private log path" not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_validate_paths_reports_unlink_cleanup_failure_without_probe_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = replace(config(tmp_path), log_path=None)
+    probe_paths: list[Path] = []
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        probe_paths.append(Path(name))
+        return descriptor, name
+
+    def fail_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        raise PermissionError(f"raw probe path {path}")
+
+    monkeypatch.setattr(cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    try:
+        with pytest.raises(ConfigError, match=r"^spool path is not writable$") as error:
+            cli._validate_paths(agent_config)
+    finally:
+        for probe_path in probe_paths:
+            if probe_path.exists():
+                real_unlink(probe_path)
+
+    assert probe_paths
+    assert all(path.name not in str(error.value) for path in probe_paths)
+    assert error.value.__cause__ is None
+
+
+def test_validate_paths_retries_interrupted_probe_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = replace(config(tmp_path), log_path=None)
+    probe_paths: list[Path] = []
+    unlink_calls = 0
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        probe_paths.append(Path(name))
+        return descriptor, name
+
+    def interrupt_once(path: Path, *, missing_ok: bool = False) -> None:
+        nonlocal unlink_calls
+        unlink_calls += 1
+        if unlink_calls == 1:
+            raise InterruptedError("raw probe path")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(Path, "unlink", interrupt_once)
+
+    cli._validate_paths(agent_config)
+
+    assert unlink_calls == 2
+    assert probe_paths and all(not path.exists() for path in probe_paths)
+
+
+def test_validate_paths_caps_repeated_interrupted_probe_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = replace(config(tmp_path), log_path=None)
+    probe_paths: list[Path] = []
+    unlink_calls = 0
+    real_mkstemp = tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        probe_paths.append(Path(name))
+        return descriptor, name
+
+    def always_interrupted(path: Path, *, missing_ok: bool = False) -> None:
+        nonlocal unlink_calls
+        unlink_calls += 1
+        if unlink_calls > 3:
+            raise RuntimeError("unlink retry was not capped")
+        raise InterruptedError("raw probe path")
+
+    monkeypatch.setattr(cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(Path, "unlink", always_interrupted)
+    try:
+        with pytest.raises(ConfigError, match=r"^spool path is not writable$") as error:
+            cli._validate_paths(agent_config)
+    finally:
+        for probe_path in probe_paths:
+            if probe_path.exists():
+                real_unlink(probe_path)
+
+    assert unlink_calls == 3
+    assert error.value.__cause__ is None
+
+
+def test_validate_paths_attempts_unlink_after_primary_and_close_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent_config = replace(config(tmp_path), log_path=None)
+    probe_paths: list[Path] = []
+    unlinked_paths: list[Path] = []
+    real_mkstemp = tempfile.mkstemp
+    real_close = os.close
+    real_unlink = Path.unlink
+
+    def tracked_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        probe_paths.append(Path(name))
+        return descriptor, name
+
+    def fail_fchmod(descriptor: int, mode: int) -> None:
+        raise PermissionError("raw primary probe failure")
+
+    def close_then_fail(descriptor: int) -> None:
+        real_close(descriptor)
+        raise OSError("raw close failure")
+
+    def tracked_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        unlinked_paths.append(path)
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(cli.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(cli.os, "fchmod", fail_fchmod)
+    monkeypatch.setattr(cli.os, "close", close_then_fail)
+    monkeypatch.setattr(Path, "unlink", tracked_unlink)
+
+    with pytest.raises(ConfigError, match=r"^spool path is not writable$") as error:
+        cli._validate_paths(agent_config)
+
+    assert probe_paths == unlinked_paths
+    assert all(not path.exists() for path in probe_paths)
+    assert error.value.__cause__ is None
 
 
 def test_build_collectors_uses_fixed_order_and_configuration(

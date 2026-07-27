@@ -20,6 +20,19 @@ _BEARER_PATTERN = re.compile(
     r"(authorization\s*:\s*bearer\s+)(?!%)(\S+)",
     flags=re.IGNORECASE,
 )
+_BEARER_PLACEHOLDER_PREFIX = re.compile(
+    r"authorization\s*:\s*bearer\s*$",
+    flags=re.IGNORECASE,
+)
+_PRINTF_PATTERN = re.compile(
+    r"%(?:\((?P<key>[^)]+)\))?"
+    r"(?P<flags>[-#0 +]*)"
+    r"(?P<width>\*|\d*)"
+    r"(?:\.(?P<precision>\*|\d*))?"
+    r"[hlL]?"
+    r"(?P<conversion>[diouxXeEfFgGcrsa%])"
+)
+_NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW", 0))
 _MAX_LOG_BYTES = 10_485_760
 _BACKUP_COUNT = 5
 
@@ -47,17 +60,67 @@ class SecretFilter(logging.Filter):
             redacted = redacted.replace(secret, _REDACTED)
         return _BEARER_PATTERN.sub(rf"\1{_REDACTED}", redacted)
 
+    def _redact_template(self, template: str) -> str:
+        parts: list[str] = []
+        previous_end = 0
+        for match in _PRINTF_PATTERN.finditer(template):
+            parts.append(self._redact(template[previous_end : match.start()]))
+            parts.append(match.group(0))
+            previous_end = match.end()
+        parts.append(self._redact(template[previous_end:]))
+        return "".join(parts)
+
+    @staticmethod
+    def _bearer_placeholders(template: str) -> tuple[set[int], set[str]]:
+        positional: set[int] = set()
+        mapping: set[str] = set()
+        argument_index = 0
+        for match in _PRINTF_PATTERN.finditer(template):
+            if match.group("conversion") == "%":
+                continue
+            key = match.group("key")
+            is_bearer = _BEARER_PLACEHOLDER_PREFIX.search(
+                template[: match.start()]
+            )
+            if key is not None:
+                if is_bearer:
+                    mapping.add(key)
+                continue
+            argument_index += int(match.group("width") == "*")
+            argument_index += int(match.group("precision") == "*")
+            if is_bearer:
+                positional.add(argument_index)
+            argument_index += 1
+        return positional, mapping
+
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
-            record.msg = self._redact(record.msg)
+            positional_bearers, mapping_bearers = self._bearer_placeholders(
+                record.msg
+            )
+            record.msg = self._redact_template(record.msg)
+        else:
+            positional_bearers, mapping_bearers = set(), set()
         if isinstance(record.args, tuple):
             record.args = tuple(
-                self._redact(value) if isinstance(value, str) else value
-                for value in record.args
+                (
+                    _REDACTED
+                    if index in positional_bearers
+                    else self._redact(value)
+                )
+                if isinstance(value, str)
+                else value
+                for index, value in enumerate(record.args)
             )
         elif isinstance(record.args, Mapping):
             record.args = {
-                key: self._redact(value) if isinstance(value, str) else value
+                key: (
+                    _REDACTED
+                    if key in mapping_bearers
+                    else self._redact(value)
+                )
+                if isinstance(value, str)
+                else value
                 for key, value in record.args.items()
             }
         return True
@@ -95,7 +158,7 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
     def _open(self) -> TextIOWrapper:
         descriptor = os.open(
             self.baseFilename,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW,
             0o600,
         )
         try:

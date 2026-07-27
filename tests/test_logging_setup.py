@@ -95,6 +95,85 @@ def test_secret_filter_keeps_deferred_bearer_placeholder_valid() -> None:
     assert item.getMessage() == "Authorization: Bearer [REDACTED]"
 
 
+def test_secret_filter_masks_empty_secret_positional_bearer_after_placeholder() -> None:
+    item = record(
+        "state=%s Authorization: Bearer %s",
+        ("ready", "unconfigured-positional-credential"),
+    )
+
+    SecretFilter([""]).filter(item)
+
+    assert item.msg == "state=%s Authorization: Bearer %s"
+    assert item.args == ("ready", "[REDACTED]")
+    assert item.getMessage() == "state=ready Authorization: Bearer [REDACTED]"
+
+
+def test_secret_filter_masks_empty_secret_mapping_bearer_after_placeholder() -> None:
+    arguments = {
+        "state": "ready",
+        "credential": "unconfigured-mapping-credential",
+    }
+    item = record(
+        "state=%(state)s Authorization: Bearer %(credential)s",
+        arguments,
+    )
+
+    SecretFilter([""]).filter(item)
+
+    assert item.msg == "state=%(state)s Authorization: Bearer %(credential)s"
+    assert arguments["credential"] == "unconfigured-mapping-credential"
+    assert item.args == {"state": "ready", "credential": "[REDACTED]"}
+    assert item.getMessage() == "state=ready Authorization: Bearer [REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("secret", "value", "expected"),
+    [
+        ("%s", "%s", "[REDACTED]"),
+        ("s", "status", "[REDACTED]tatu[REDACTED]"),
+    ],
+)
+def test_secret_filter_never_corrupts_overlapping_positional_format_tokens(
+    secret: str,
+    value: str,
+    expected: str,
+) -> None:
+    item = record(
+        "status=%s Authorization: Bearer %s",
+        (value, "unconfigured-bearer-credential"),
+    )
+
+    SecretFilter([secret]).filter(item)
+
+    assert item.msg == (
+        "[REDACTED]tatu[REDACTED]=%s Authorization: Bearer %s"
+        if secret == "s"
+        else "status=%s Authorization: Bearer %s"
+    )
+    assert item.getMessage() == (
+        f"{'[REDACTED]tatu[REDACTED]' if secret == 's' else 'status'}="
+        f"{expected} Authorization: Bearer [REDACTED]"
+    )
+
+
+def test_secret_filter_never_corrupts_overlapping_mapping_format_tokens() -> None:
+    item = record(
+        "status=%(state)s Authorization: Bearer %(credential)s",
+        {"state": "status", "credential": "unconfigured-bearer-credential"},
+    )
+
+    SecretFilter(["s"]).filter(item)
+
+    assert item.msg == (
+        "[REDACTED]tatu[REDACTED]=%(state)s "
+        "Authorization: Bearer %(credential)s"
+    )
+    assert item.getMessage() == (
+        "[REDACTED]tatu[REDACTED]=[REDACTED]tatu[REDACTED] "
+        "Authorization: Bearer [REDACTED]"
+    )
+
+
 def test_secret_filter_preserves_non_string_message_without_arguments() -> None:
     item = record("placeholder")
     marker = object()
@@ -161,6 +240,26 @@ def test_configure_logging_replaces_its_handler_without_duplicates(
     assert handlers[0] is not first
 
 
+def test_configure_logging_observably_closes_previous_handler(tmp_path: Path) -> None:
+    logger = logging.getLogger("monitor_agent")
+
+    class TrackingHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    previous = TrackingHandler()
+    logger.handlers = [previous]
+
+    configure_logging(config(tmp_path))
+
+    assert previous.close_calls == 1
+
+
 def test_configure_logging_preserves_root_and_unrelated_loggers(tmp_path: Path) -> None:
     root = logging.getLogger()
     unrelated = logging.getLogger("unrelated")
@@ -208,6 +307,20 @@ def test_configure_logging_file_rotation_permissions_and_secret_filter(
     assert json.loads(contents)["message"] == (
         "Authorization: Bearer [REDACTED] token=[REDACTED]"
     )
+
+
+def test_file_logging_does_not_follow_symlink_target(tmp_path: Path) -> None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("platform does not support no-follow file opening")
+    target = tmp_path / "target.log"
+    target.write_text("unchanged", encoding="utf-8")
+    log_path = tmp_path / "agent.log"
+    log_path.symlink_to(target)
+
+    with pytest.raises(OSError):
+        configure_logging(config(tmp_path, MONITOR_LOG_PATH=str(log_path)))
+
+    assert target.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_file_logging_avoids_posix_mode_calls_on_other_platforms(

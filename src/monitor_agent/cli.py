@@ -28,6 +28,7 @@ from monitor_agent.transport import TelemetryTransport
 
 _EVENT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _COLLECTION_FAILURES = {CollectorStatus.FAILED, CollectorStatus.TIMED_OUT}
+_PROBE_UNLINK_ATTEMPTS = 3
 
 
 def _supports_posix_permissions() -> bool:
@@ -121,17 +122,33 @@ def _validate_paths(config: AgentConfig) -> None:
 
     if config.log_path is None:
         return
-    if config.log_path.exists() and not config.log_path.is_file():
+    if config.log_path.is_symlink() or (
+        config.log_path.exists() and not config.log_path.is_file()
+    ):
         raise ConfigError("log path must identify a file")
     _validate_writable_directory(
         config.log_path.parent,
         "log path parent is not writable",
     )
+    if config.log_path.exists():
+        _validate_appendable_file(config.log_path)
+
+
+def _validate_appendable_file(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        raise ConfigError("log path is not writable") from None
+    try:
+        os.close(descriptor)
+    except OSError:
+        raise ConfigError("log path is not writable") from None
 
 
 def _validate_writable_directory(path: Path, message: str) -> None:
     probe_path: Path | None = None
     descriptor = -1
+    failed = False
     try:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         if _supports_posix_permissions():
@@ -143,15 +160,28 @@ def _validate_writable_directory(path: Path, message: str) -> None:
         probe_path = Path(probe_name)
         if _supports_posix_permissions():
             os.fchmod(descriptor, 0o600)
-    except OSError as error:
-        raise ConfigError(message) from error
+    except OSError:
+        failed = True
     finally:
         if descriptor >= 0:
-            with suppress(OSError):
+            try:
                 os.close(descriptor)
+            except OSError:
+                failed = True
         if probe_path is not None:
-            with suppress(OSError):
-                probe_path.unlink()
+            for _ in range(_PROBE_UNLINK_ATTEMPTS):
+                try:
+                    probe_path.unlink()
+                    break
+                except InterruptedError:
+                    continue
+                except OSError:
+                    failed = True
+                    break
+            else:
+                failed = True
+    if failed:
+        raise ConfigError(message) from None
 
 
 def _print_json(value: dict[str, JSONValue]) -> None:
@@ -161,7 +191,10 @@ def _print_json(value: dict[str, JSONValue]) -> None:
 def _prepare_config(*, require_transport: bool) -> AgentConfig:
     config = load_config(require_transport=require_transport)
     _validate_paths(config)
-    configure_logging(config)
+    try:
+        configure_logging(config)
+    except OSError:
+        raise ConfigError("log path is not writable") from None
     return config
 
 
@@ -193,7 +226,11 @@ def _once_command(config: AgentConfig, event: str, *, no_transmit: bool) -> int:
     runtime = _create_runtime(config)
     try:
         result = runtime.run_cycle(event)
-    finally:
+    except BaseException:
+        with suppress(BaseException):
+            runtime.transport.close()
+        raise
+    else:
         runtime.transport.close()
     return 0 if result.delivered else 4
 
