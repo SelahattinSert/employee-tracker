@@ -17,6 +17,14 @@ class DeliveryKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class CycleResult:
+    event_id: str
+    delivered: bool
+    spooled: bool
+    delivery_kind: DeliveryKind | None
+
+
+@dataclass(frozen=True, slots=True)
 class DeliveryResult:
     kind: DeliveryKind
     status_code: int | None
