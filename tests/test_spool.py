@@ -831,14 +831,47 @@ def test_cross_instance_publish_reservation_chooses_deterministic_next_candidate
     assert record.stat().st_nlink == 1
 
 
+@pytest.mark.parametrize(
+    ("now", "expected_suffix", "canonical_and_first_share_guard"),
+    [
+        pytest.param(
+            datetime(2026, 7, 20, 12, 0, tzinfo=UTC),
+            1,
+            False,
+            id="canonical-and-first-candidate-use-distinct-guards",
+        ),
+        pytest.param(
+            datetime(2026, 7, 20, 12, 0, 0, 200, tzinfo=UTC),
+            2,
+            True,
+            id="canonical-and-first-candidate-share-a-guard",
+        ),
+    ],
+)
 def test_cross_instance_dead_letter_reservation_chooses_next_destination(
     tmp_path: Path,
+    now: datetime,
+    expected_suffix: int,
+    canonical_and_first_share_guard: bool,
 ) -> None:
     first = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     second = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
-    record = first.enqueue(payload(event(1)))
+    record = first.enqueue(payload(event(1)), now=now)
     canonical_name = first._dead_letter_name(record, ".rejected")
     reservation_name = first._dead_letter_reservation_name(canonical_name)
+    first_candidate_name = first._numbered_name(canonical_name, 1)
+    canonical_guard = first._artifact_guard_name(reservation_name)
+    first_candidate_guard = first._artifact_guard_name(
+        first._dead_letter_reservation_name(first_candidate_name)
+    )
+    assert (canonical_guard == first_candidate_guard) is canonical_and_first_share_guard
+    if canonical_and_first_share_guard:
+        second_candidate_name = first._numbered_name(canonical_name, 2)
+        second_candidate_guard = first._artifact_guard_name(
+            first._dead_letter_reservation_name(second_candidate_name)
+        )
+        assert canonical_guard != second_candidate_guard
+
     reservation = first._acquire_reservation(first._dead_letter, reservation_name)
     assert reservation is not None
     try:
@@ -846,7 +879,7 @@ def test_cross_instance_dead_letter_reservation_chooses_next_destination(
     finally:
         first._release_reservation(first._dead_letter, reservation_name, reservation)
 
-    assert rejected.name == first._numbered_name(canonical_name, 1)
+    assert rejected.name == first._numbered_name(canonical_name, expected_suffix)
     assert rejected.exists()
 
 
