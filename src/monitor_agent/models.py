@@ -9,6 +9,21 @@ JSONValue: TypeAlias = (
 )
 
 
+class DeliveryKind(StrEnum):
+    SUCCESS = "success"
+    RETRIABLE = "retriable"
+    AUTHENTICATION = "authentication"
+    PERMANENT = "permanent"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryResult:
+    kind: DeliveryKind
+    status_code: int | None
+    attempts: int
+    message: str
+
+
 @dataclass(frozen=True, slots=True)
 class SpoolStats:
     pending_count: int
