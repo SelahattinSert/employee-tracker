@@ -18,6 +18,7 @@ class FakeSession:
     def __init__(self, outcomes: Iterator[object]) -> None:
         self.outcomes = outcomes
         self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.close_calls = 0
 
     def post(self, *args: object, **kwargs: object) -> object:
         self.calls.append((args, kwargs))
@@ -27,7 +28,7 @@ class FakeSession:
         return outcome
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
 
 
 def response(status: int, headers: dict[str, str] | None = None) -> object:
@@ -51,6 +52,16 @@ def telemetry() -> dict[str, str]:
         "machine_id": "machine-123",
         "schema_version": "1.0",
     }
+
+
+def test_close_delegates_to_the_injected_session_once_per_call() -> None:
+    session = FakeSession(iter([]))
+    transport = TelemetryTransport(config(), session=session)  # type: ignore[arg-type]
+
+    transport.close()
+    transport.close()
+
+    assert session.close_calls == 2
 
 
 @pytest.mark.parametrize("status", [200, 299])

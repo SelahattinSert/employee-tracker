@@ -51,6 +51,9 @@ class TelemetryTransport:
         self._sleep = sleep
         self._random_value = random_value
 
+    def close(self) -> None:
+        self._session.close()
+
     def send(self, payload: Mapping[str, JSONValue]) -> DeliveryResult:
         self._validate_payload(payload)
         headers = self._headers(payload)
