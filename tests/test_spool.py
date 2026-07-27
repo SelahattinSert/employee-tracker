@@ -1585,6 +1585,72 @@ def test_windows_guards_preserve_active_stage_and_reclaim_all_stale_artifacts(
     assert fake_msvcrt.locked_count == 0
 
 
+def test_windows_stage_close_failure_cleans_temp_and_releases_its_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    fake_msvcrt = FakeWindowsLocking()
+    original_close = spool._close_locked_descriptor
+    close_attempts = 0
+
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
+
+    def fail_first_stage_close(descriptor: int) -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise OSError("stage close failed")
+        original_close(descriptor)
+
+    monkeypatch.setattr(spool, "_close_locked_descriptor", fail_first_stage_close)
+
+    with pytest.raises(OSError, match="stage close failed"):
+        spool.enqueue(payload(event(1)))
+
+    assert not list(tmp_path.glob(".spool-*.tmp"))
+    assert spool._artifact_guards == {}
+    assert fake_msvcrt.locked_count == 0
+
+
+def test_windows_publish_close_failure_preserves_publish_error_and_releases_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    fake_msvcrt = FakeWindowsLocking()
+    original_close = spool._close_locked_descriptor
+    close_attempts = 0
+
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
+    monkeypatch.setattr(
+        spool,
+        "_publish_noreplace",
+        lambda *args: (_ for _ in ()).throw(OSError("publish failed")),
+    )
+
+    def fail_reservation_close(descriptor: int) -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 2:
+            raise OSError("reservation close failed")
+        original_close(descriptor)
+
+    monkeypatch.setattr(spool, "_close_locked_descriptor", fail_reservation_close)
+
+    with pytest.raises(OSError, match="publish failed"):
+        spool.enqueue(payload(event(1)))
+
+    assert not list(tmp_path.glob(".spool-*.tmp"))
+    assert list(tmp_path.glob(".publish-*.lock"))
+    assert spool._artifact_guards == {}
+    assert fake_msvcrt.locked_count == 0
+
+
 def test_artifact_guard_slots_are_bounded_and_reject_unknown_names() -> None:
     assert Spool._artifact_guard_name(".spool-stage.tmp").endswith("spool")
     assert Spool._artifact_guard_name(".deadmark-stage.tmp").endswith("deadmark")

@@ -76,18 +76,33 @@ class Spool:
             name = self._record_name(payload, timestamp)
             encoded = self._serialize(payload)
             self._prepare()
-            temporary, descriptor = self._write_staged(encoded)
-            if _platform_name() != "posix":  # pragma: no cover - Windows fallback
-                self._close_locked_descriptor(descriptor)
-                descriptor = -1
+            temporary: Path | None = None
+            descriptor = -1
+            guard_held = False
             try:
+                temporary, descriptor = self._write_staged(encoded)
+                guard_held = True
+                if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+                    self._close_locked_descriptor(descriptor)
+                    descriptor = -1
                 destination = self._publish_staged(temporary, name)
             except BaseException:
-                self._unlink_name(self.root, temporary.name)
+                try:
+                    if descriptor >= 0:
+                        self._close_locked_descriptor_with_retry(descriptor)
+                    if temporary is not None:
+                        self._unlink_name(self.root, temporary.name)
+                except BaseException:
+                    pass
+                finally:
+                    if guard_held:
+                        with suppress(BaseException):
+                            self._release_artifact_guard(self.root, ".spool-")
                 raise
-            finally:
+            try:
                 if descriptor >= 0:
-                    self._close_locked_descriptor(descriptor)
+                    self._close_locked_descriptor_with_retry(descriptor)
+            finally:
                 self._release_artifact_guard(self.root, ".spool-")
             self.enforce_retention(now=timestamp)
             return destination
@@ -253,9 +268,16 @@ class Spool:
                 handle.flush()
                 os.fsync(handle.fileno())
         except BaseException:
-            self._close_locked_descriptor(descriptor)
-            self._unlink_if_exists(temporary)
-            self._release_artifact_guard(self.root, ".spool-")
+            try:
+                try:
+                    self._close_locked_descriptor_with_retry(descriptor)
+                finally:
+                    try:
+                        self._unlink_if_exists(temporary)
+                    finally:
+                        self._release_artifact_guard(self.root, ".spool-")
+            except BaseException:
+                pass
             raise
         return temporary, descriptor
 
@@ -277,8 +299,13 @@ class Spool:
                 )
                 continue
             except BaseException:
-                self._close_locked_descriptor(reservation)
-                self._release_artifact_guard(self.root, reservation_name)
+                try:
+                    self._close_locked_descriptor_with_retry(reservation)
+                except BaseException:
+                    pass
+                finally:
+                    with suppress(BaseException):
+                        self._release_artifact_guard(self.root, reservation_name)
                 raise
             self._release_reservation(self.root, reservation_name, reservation)
             return destination
@@ -505,7 +532,7 @@ class Spool:
         finally:
             if source_descriptor >= 0:
                 if source_locked:
-                    self._close_locked_descriptor(source_descriptor)
+                    self._close_locked_descriptor_with_retry(source_descriptor)
                 else:
                     os.close(source_descriptor)
 
@@ -741,7 +768,7 @@ class Spool:
                         self._fsync_directory(self.root)
                 finally:
                     if locked:
-                        self._close_locked_descriptor(descriptor)
+                        self._close_locked_descriptor_with_retry(descriptor)
                     else:
                         os.close(descriptor)
             finally:
@@ -816,7 +843,7 @@ class Spool:
                         self._fsync_directory(self._dead_letter)
                 finally:
                     if locked:
-                        self._close_locked_descriptor(descriptor)
+                        self._close_locked_descriptor_with_retry(descriptor)
                     else:
                         os.close(descriptor)
             finally:
@@ -862,7 +889,7 @@ class Spool:
                     return False
                 locked = True
                 if _platform_name() != "posix":  # pragma: no cover - Windows fallback
-                    self._close_locked_descriptor(descriptor)
+                    self._close_locked_descriptor_with_retry(descriptor)
                     descriptor = -1
                     locked = False
                     try:
@@ -885,7 +912,7 @@ class Spool:
             finally:
                 if descriptor >= 0:
                     if locked:
-                        self._close_locked_descriptor(descriptor)
+                        self._close_locked_descriptor_with_retry(descriptor)
                     else:
                         os.close(descriptor)
         finally:
@@ -935,13 +962,15 @@ class Spool:
             return
         try:
             if _platform_name() != "posix":  # pragma: no cover - Windows fallback
-                self._close_locked_descriptor(descriptor)
-                self._unlink_name(directory, name)
+                try:
+                    self._close_locked_descriptor_with_retry(descriptor)
+                finally:
+                    self._unlink_name(directory, name)
             else:
                 try:
                     self._unlink_name(directory, name)
                 finally:
-                    self._close_locked_descriptor(descriptor)
+                    self._close_locked_descriptor_with_retry(descriptor)
         finally:
             self._release_artifact_guard(directory, name)
 
@@ -1009,7 +1038,7 @@ class Spool:
         finally:
             if key not in self._artifact_guards:
                 if locked:
-                    self._close_locked_descriptor(descriptor)
+                    self._close_locked_descriptor_with_retry(descriptor)
                 else:
                     os.close(descriptor)
 
@@ -1023,7 +1052,15 @@ class Spool:
             self._artifact_guards[key] = (descriptor, depth - 1)
             return
         del self._artifact_guards[key]
-        self._close_locked_descriptor(descriptor)
+        self._close_locked_descriptor_with_retry(descriptor)
+
+    def _close_locked_descriptor_with_retry(self, descriptor: int) -> None:
+        try:
+            self._close_locked_descriptor(descriptor)
+        except BaseException:
+            with suppress(BaseException):
+                self._close_locked_descriptor(descriptor)
+            raise
 
     @staticmethod
     def _lock_descriptor(descriptor: int) -> None:
