@@ -16,26 +16,13 @@ fi
 
 wheel_path=$1
 environment_path=$2
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-project_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 requirements_path="$project_root/requirements.lock"
 service_path="$script_dir/monitor-agent.service"
 readme_path="$project_root/README.md"
 python_command=${MONITOR_AGENT_PYTHON:-python3.11}
 root_prefix=${MONITOR_AGENT_TEST_ROOT:-}
-
-case "$root_prefix" in
-    "")
-        ;;
-    /*)
-        if [ "$root_prefix" = "/" ]; then
-            fail "monitor-agent install: invalid staging root"
-        fi
-        ;;
-    *)
-        fail "monitor-agent install: invalid staging root"
-        ;;
-esac
 
 case "$wheel_path" in
     *.whl)
@@ -47,7 +34,6 @@ case "$wheel_path" in
         fail "monitor-agent install: invalid wheel"
         ;;
 esac
-
 if [ ! -f "$environment_path" ] || [ -L "$environment_path" ]; then
     fail "monitor-agent install: invalid environment file"
 fi
@@ -80,72 +66,291 @@ case "$minor" in
         ;;
 esac
 
+if [ -n "$root_prefix" ]; then
+    if [ ! -d "$root_prefix" ] || [ -L "$root_prefix" ]; then
+        fail "monitor-agent install: invalid staging root"
+    fi
+    canonical_root=$(realpath -e -- "$root_prefix") ||
+        fail "monitor-agent install: invalid staging root"
+    if [ "$canonical_root" = "/" ]; then
+        fail "monitor-agent install: invalid staging root"
+    fi
+    root_prefix=$canonical_root
+fi
+
 install_dir="$root_prefix/opt/monitor-agent"
 opt_parent="$root_prefix/opt"
+etc_parent="$root_prefix/etc"
 config_dir="$root_prefix/etc/monitor-agent"
-config_file="$config_dir/monitor-agent.env"
-state_dir="$root_prefix/var/lib/monitor-agent"
+etc_systemd_dir="$root_prefix/etc/systemd"
 unit_dir="$root_prefix/etc/systemd/system"
+config_file="$config_dir/monitor-agent.env"
+var_parent="$root_prefix/var"
+var_lib_dir="$root_prefix/var/lib"
+state_dir="$root_prefix/var/lib/monitor-agent"
 unit_file="$unit_dir/monitor-agent.service"
 
+if [ -n "$root_prefix" ]; then
+    for target in \
+        "$install_dir" \
+        "$opt_parent" \
+        "$etc_parent" \
+        "$config_dir" \
+        "$etc_systemd_dir" \
+        "$unit_dir" \
+        "$config_file" \
+        "$var_parent" \
+        "$var_lib_dir" \
+        "$state_dir" \
+        "$unit_file"
+    do
+        resolved_target=$(realpath -m -- "$target") ||
+            fail "monitor-agent install: invalid staging root"
+        case "$resolved_target" in
+            "$root_prefix"/*)
+                ;;
+            *)
+                fail "monitor-agent install: invalid staging root"
+                ;;
+        esac
+    done
+fi
+
+managed_dirs=(
+    "$opt_parent"
+    "$etc_parent"
+    "$config_dir"
+    "$etc_systemd_dir"
+    "$unit_dir"
+    "$var_parent"
+    "$var_lib_dir"
+    "$state_dir"
+)
+managed_modes=(0755 0755 0700 0755 0755 0755 0755 0700)
+dir_existed=()
+dir_modes=()
+
+for index in "${!managed_dirs[@]}"; do
+    directory=${managed_dirs[$index]}
+    if [ -L "$directory" ]; then
+        fail "monitor-agent install: invalid install target"
+    fi
+    if [ -d "$directory" ]; then
+        dir_existed[index]=1
+        dir_modes[index]=$(stat -c '%a' -- "$directory") ||
+            fail "monitor-agent install: unable to inspect install target"
+    elif [ -e "$directory" ]; then
+        fail "monitor-agent install: invalid install target"
+    else
+        dir_existed[index]=0
+        dir_modes[index]=
+    fi
+done
+
+for target in "$install_dir" "$config_file" "$unit_file"; do
+    if [ -L "$target" ]; then
+        fail "monitor-agent install: invalid install target"
+    fi
+done
+
+observed_active=0
+observed_enabled=0
+observed_enabled_absent=0
+
+read_active_state() {
+    if service_state=$(systemctl is-active -- monitor-agent.service 2>/dev/null); then
+        service_status=0
+    else
+        service_status=$?
+    fi
+    case "$service_status:$service_state" in
+        0:active)
+            observed_active=1
+            return 0
+            ;;
+        3:inactive)
+            observed_active=0
+            return 0
+            ;;
+        4:not-found)
+            observed_active=0
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+read_enabled_state() {
+    if service_state=$(systemctl is-enabled -- monitor-agent.service 2>/dev/null); then
+        service_status=0
+    else
+        service_status=$?
+    fi
+    case "$service_status:$service_state" in
+        0:enabled)
+            observed_enabled=1
+            observed_enabled_absent=0
+            return 0
+            ;;
+        1:disabled)
+            observed_enabled=0
+            observed_enabled_absent=0
+            return 0
+            ;;
+        1:not-found | 4:not-found)
+            observed_enabled=0
+            observed_enabled_absent=1
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if ! read_active_state || ! read_enabled_state; then
+    fail "monitor-agent install: unable to inspect service state"
+fi
+if [ "$observed_enabled_absent" -eq 1 ] && [ "$observed_active" -eq 1 ]; then
+    fail "monitor-agent install: unable to inspect service state"
+fi
+prior_active=$observed_active
+prior_enabled=$observed_enabled
+prior_absent=$observed_enabled_absent
+
 transaction_dir=
-runtime_detached=0
-runtime_installed=0
-environment_installed=0
-unit_installed=0
-activation_attempted=0
+staged_runtime=
+environment_stage=
+environment_backup=
+unit_stage=
+unit_backup=
 had_runtime=0
 had_environment=0
 had_unit=0
+environment_mutation_armed=0
+unit_mutation_armed=0
+activation_rollback_armed=0
+
+restore_service_state() {
+    service_restore_failed=0
+
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        service_restore_failed=1
+    fi
+    if [ "$prior_absent" -eq 0 ]; then
+        if [ "$prior_enabled" -eq 1 ]; then
+            if ! systemctl enable -- monitor-agent.service >/dev/null 2>&1; then
+                service_restore_failed=1
+            fi
+        elif ! systemctl disable -- monitor-agent.service >/dev/null 2>&1; then
+            service_restore_failed=1
+        fi
+        if [ "$prior_active" -eq 1 ]; then
+            if ! systemctl restart -- monitor-agent.service >/dev/null 2>&1; then
+                service_restore_failed=1
+            fi
+        elif ! systemctl stop -- monitor-agent.service >/dev/null 2>&1; then
+            service_restore_failed=1
+        fi
+    fi
+
+    if ! read_active_state || [ "$observed_active" -ne "$prior_active" ]; then
+        service_restore_failed=1
+    fi
+    if ! read_enabled_state || [ "$observed_enabled" -ne "$prior_enabled" ]; then
+        service_restore_failed=1
+    fi
+    [ "$service_restore_failed" -eq 0 ]
+}
 
 cleanup() {
-    status=$?
+    original_status=$?
     trap - EXIT
+    set +e
+    rollback_failed=0
 
-    if [ "$status" -ne 0 ] && [ -n "$transaction_dir" ]; then
-        if [ "$runtime_installed" -eq 1 ]; then
-            rm -rf -- "$install_dir"
-        fi
-        if [ "$runtime_detached" -eq 1 ]; then
-            mv -- "$transaction_dir/previous-runtime" "$install_dir"
-        fi
-
-        if [ "$environment_installed" -eq 1 ]; then
-            if [ "$had_environment" -eq 1 ]; then
-                cp -p -- "$transaction_dir/previous-environment" "$config_file"
+    if [ "$original_status" -ne 0 ]; then
+        if [ "$environment_mutation_armed" -eq 1 ]; then
+            if [ "$had_environment" -eq 1 ] && [ -f "$environment_backup" ]; then
+                mv -f -- "$environment_backup" "$config_file" || rollback_failed=1
+                environment_backup=
             else
-                rm -f -- "$config_file"
+                rm -f -- "$config_file" || rollback_failed=1
             fi
         fi
-        if [ "$unit_installed" -eq 1 ]; then
-            if [ "$had_unit" -eq 1 ]; then
-                cp -p -- "$transaction_dir/previous-unit" "$unit_file"
+        if [ "$unit_mutation_armed" -eq 1 ]; then
+            if [ "$had_unit" -eq 1 ] && [ -f "$unit_backup" ]; then
+                mv -f -- "$unit_backup" "$unit_file" || rollback_failed=1
+                unit_backup=
             else
-                rm -f -- "$unit_file"
+                rm -f -- "$unit_file" || rollback_failed=1
             fi
         fi
 
-        if [ "$unit_installed" -eq 1 ]; then
-            systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ "$had_runtime" -eq 1 ] &&
+            [ -n "$transaction_dir" ] &&
+            [ -e "$transaction_dir/previous-runtime" ]
+        then
+            rm -rf -- "$install_dir" || rollback_failed=1
+            mv -- "$transaction_dir/previous-runtime" "$install_dir" ||
+                rollback_failed=1
+        elif [ "$had_runtime" -eq 0 ] &&
+            [ -n "$staged_runtime" ] &&
+            [ ! -e "$staged_runtime" ]
+        then
+            rm -rf -- "$install_dir" || rollback_failed=1
         fi
-        if [ "$activation_attempted" -eq 1 ] && [ "$had_runtime" -eq 1 ]; then
-            systemctl restart -- monitor-agent.service >/dev/null 2>&1 || true
+
+        if [ "$activation_rollback_armed" -eq 1 ]; then
+            restore_service_state || rollback_failed=1
         fi
-        printf '%s\n' "monitor-agent install: installation failed" >&2
     fi
 
+    for temporary in \
+        "$environment_stage" \
+        "$environment_backup" \
+        "$unit_stage" \
+        "$unit_backup"
+    do
+        if [ -n "$temporary" ]; then
+            rm -f -- "$temporary" || rollback_failed=1
+        fi
+    done
     if [ -n "$transaction_dir" ]; then
-        rm -rf -- "$transaction_dir"
+        rm -rf -- "$transaction_dir" || rollback_failed=1
     fi
-    exit "$status"
+
+    if [ "$original_status" -ne 0 ]; then
+        for ((index = ${#managed_dirs[@]} - 1; index >= 0; index--)); do
+            directory=${managed_dirs[$index]}
+            if [ "${dir_existed[$index]}" -eq 1 ]; then
+                chmod "${dir_modes[$index]}" -- "$directory" || rollback_failed=1
+            else
+                rm -rf -- "$directory" || rollback_failed=1
+            fi
+        done
+        printf '%s\n' "monitor-agent install: installation failed" >&2
+        if [ "$rollback_failed" -ne 0 ]; then
+            printf '%s\n' "monitor-agent install: rollback failed" >&2
+        fi
+    fi
+    exit "$original_status"
 }
 trap cleanup EXIT
 
-install -d -m 0755 -- "$opt_parent"
-transaction_dir=$(mktemp -d "$opt_parent/.monitor-agent-install.XXXXXX")
+for index in "${!managed_dirs[@]}"; do
+    directory=${managed_dirs[$index]}
+    if [ "${dir_existed[$index]}" -eq 0 ]; then
+        install -d -m "${managed_modes[$index]}" -- "$directory"
+    fi
+done
+chmod 0700 -- "$config_dir" "$state_dir"
+
+transaction_dir=$(mktemp -d -- "$opt_parent/.monitor-agent-install.XXXXXX")
 staged_runtime="$transaction_dir/runtime"
 install -d -m 0755 -- "$staged_runtime"
-
 "$python_command" -m venv "$staged_runtime/venv"
 "$staged_runtime/venv/bin/python" -m pip install \
     --require-hashes -r "$requirements_path"
@@ -155,35 +360,41 @@ if [ -f "$readme_path" ]; then
     install -m 0644 -- "$readme_path" "$staged_runtime/README.md"
 fi
 
-install -d -m 0700 -- "$config_dir"
-install -d -m 0700 -- "$state_dir"
-install -d -m 0755 -- "$unit_dir"
+environment_stage=$(mktemp -- "$config_dir/.monitor-agent.env.stage.XXXXXX")
+install -m 0600 -- "$environment_path" "$environment_stage"
+unit_stage=$(mktemp -- "$unit_dir/.monitor-agent.service.stage.XXXXXX")
+install -m 0644 -- "$service_path" "$unit_stage"
+
+if [ -f "$config_file" ]; then
+    had_environment=1
+    environment_backup=$(mktemp -- "$config_dir/.monitor-agent.env.backup.XXXXXX")
+    cp -p -- "$config_file" "$environment_backup"
+fi
+if [ -f "$unit_file" ]; then
+    had_unit=1
+    unit_backup=$(mktemp -- "$unit_dir/.monitor-agent.service.backup.XXXXXX")
+    cp -p -- "$unit_file" "$unit_backup"
+fi
 
 if [ -e "$install_dir" ]; then
     had_runtime=1
     mv -- "$install_dir" "$transaction_dir/previous-runtime"
-    runtime_detached=1
 fi
-if [ -f "$config_file" ]; then
-    had_environment=1
-    cp -p -- "$config_file" "$transaction_dir/previous-environment"
-fi
-if [ -f "$unit_file" ]; then
-    had_unit=1
-    cp -p -- "$unit_file" "$transaction_dir/previous-unit"
-fi
-
 mv -- "$staged_runtime" "$install_dir"
-runtime_installed=1
-install -m 0600 -- "$environment_path" "$config_file"
-environment_installed=1
-install -m 0644 -- "$service_path" "$unit_file"
-unit_installed=1
 
+environment_mutation_armed=1
+mv -f -- "$environment_stage" "$config_file"
+environment_stage=
+unit_mutation_armed=1
+mv -f -- "$unit_stage" "$unit_file"
+unit_stage=
+
+activation_rollback_armed=1
 systemctl daemon-reload
 systemctl enable -- monitor-agent.service
-activation_attempted=1
 systemctl restart -- monitor-agent.service
-systemctl is-active --quiet -- monitor-agent.service
+if ! read_active_state || [ "$observed_active" -ne 1 ]; then
+    fail "monitor-agent install: service failed to become active"
+fi
 
 printf '%s\n' "monitor-agent install: service installed and active"
