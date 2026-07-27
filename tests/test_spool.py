@@ -97,20 +97,21 @@ def test_enqueue_rejects_naive_now_without_artifacts(tmp_path: Path) -> None:
     assert spool.pending() == []
 
 
-def test_enqueue_cleans_temporary_file_when_replace_fails(
+def test_enqueue_cleans_temporary_file_when_atomic_publish_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
 
-    def fail_replace(source: object, destination: object) -> None:
-        raise OSError("replace failed")
+    def fail_link(source: object, destination: object, **kwargs: object) -> None:
+        raise OSError("publish failed")
 
-    monkeypatch.setattr("monitor_agent.spool.os.replace", fail_replace)
-    with pytest.raises(OSError, match="replace failed"):
+    monkeypatch.setattr("monitor_agent.spool.os.link", fail_link)
+    with pytest.raises(OSError, match="publish failed"):
         spool.enqueue(payload(event(1)))
 
     assert spool.pending() == []
     assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob("*.json"))
 
 
 def test_enqueue_preserves_an_existing_name_with_a_collision_suffix(tmp_path: Path) -> None:
@@ -128,7 +129,7 @@ def test_load_missing_and_reject_missing_without_prior_dead_letter_are_safe(tmp_
     missing = tmp_path / "20260720T120000000000Z_00000000-0000-4000-8000-000000000001.json"
 
     assert spool.load(missing) is None
-    assert spool.reject(missing) == tmp_path / "dead-letter" / f"{missing.stem}.rejected.json"
+    assert spool.reject(missing).name.endswith(".rejected.json")
 
 
 def test_constructor_rejects_a_symlinked_spool_root(tmp_path: Path) -> None:
@@ -305,7 +306,7 @@ def test_directory_fsync_is_skipped_off_posix_and_used_on_posix(
     assert len(fsync_calls) == 2
 
 
-def test_dead_letter_fallback_replace_and_cleanup_are_safe(
+def test_dead_letter_move_failure_keeps_pending_record_and_cleans_reservation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import monitor_agent.spool as spool_module
@@ -313,25 +314,126 @@ def test_dead_letter_fallback_replace_and_cleanup_are_safe(
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     record = spool.enqueue(payload(event(1)))
 
-    def unsupported_link(source: object, destination: object, **kwargs: object) -> None:
-        raise OSError(errno.EPERM, "hard links unavailable")
-
-    monkeypatch.setattr(spool_module.os, "link", unsupported_link)
-    rejected = spool.reject(record)
-    assert rejected.exists()
-    assert not record.exists()
-
-    record = spool.enqueue(payload(event(2)))
-    monkeypatch.setattr(spool_module.os, "link", unsupported_link)
-
-    def failing_replace(source: object, destination: object) -> None:
+    def failing_replace(source: object, destination: object, **kwargs: object) -> None:
         raise OSError("fail")
 
     monkeypatch.setattr(spool_module.os, "replace", failing_replace)
     with pytest.raises(OSError, match="fail"):
         spool.reject(record)
     assert record.exists()
-    assert not list((tmp_path / "dead-letter").glob(f"{record.stem}*.json"))
+    assert not list((tmp_path / "dead-letter").glob(".move-*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["file_fsync", "chmod", "publish"])
+def test_enqueue_never_exposes_partial_pending_records_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    if failure == "file_fsync":
+        monkeypatch.setattr(
+            spool_module.os, "fsync", lambda _: (_ for _ in ()).throw(OSError("fsync"))
+        )
+    elif failure == "chmod":
+        original_chmod = spool_module.os.chmod
+
+        def fail_staged_chmod(path: object, mode: object, *args: object, **kwargs: object) -> None:
+            if Path(path).name.startswith(".spool-"):
+                raise OSError("chmod")
+            original_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(spool_module.os, "chmod", fail_staged_chmod)
+    else:
+        monkeypatch.setattr(
+            spool_module.os,
+            "link",
+            lambda *_, **__: (_ for _ in ()).throw(OSError("publish")),
+        )
+
+    with pytest.raises(OSError):
+        spool.enqueue(payload(event(1)))
+
+    assert spool.pending() == []
+    assert not list(tmp_path.glob("*.json"))
+
+
+def test_reject_uses_replace_and_preserves_committed_destination_after_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    replace_calls: list[tuple[object, object]] = []
+    original_replace = spool_module.os.replace
+
+    def tracking_replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        replace_calls.append((source, destination))
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(spool_module.os, "replace", tracking_replace)
+    monkeypatch.setattr(
+        spool, "_fsync_directory", lambda _: (_ for _ in ()).throw(OSError("dir fsync"))
+    )
+
+    with pytest.raises(OSError, match="dir fsync"):
+        spool.reject(record)
+
+    assert replace_calls
+    assert not record.exists()
+    assert list((tmp_path / "dead-letter").glob("*.rejected.json"))
+
+
+def test_path_operations_reject_hardlinked_records_without_touching_external_target(
+    tmp_path: Path,
+) -> None:
+    spool = Spool(tmp_path / "spool", max_bytes=1_048_576, max_age_sec=3600)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(payload(event(1))), encoding="utf-8")
+    linked = spool.root / "linked.json"
+    try:
+        os.link(outside, linked)
+    except OSError as error:
+        pytest.skip(f"hard links unavailable: {error}")
+
+    original_mode = stat.S_IMODE(outside.stat().st_mode)
+    for operation in (spool.load, spool.ack, spool.reject):
+        with pytest.raises(ValueError, match="not a pending spool record"):
+            operation(linked)
+
+    assert outside.exists()
+    assert stat.S_IMODE(outside.stat().st_mode) == original_mode
+
+
+def test_reject_collision_remains_idempotent_for_the_same_source_record(tmp_path: Path) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    canonical = tmp_path / "dead-letter" / f"{record.stem}.rejected.json"
+    canonical.write_text("unrelated", encoding="utf-8")
+
+    first = spool.reject(record)
+    second = spool.reject(record)
+
+    assert first != canonical
+    assert second == first
+    assert first.name.endswith(".rejected.json")
+    assert canonical.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_reject_disambiguates_an_existing_attributed_destination(tmp_path: Path) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    attributed = tmp_path / "dead-letter" / spool._dead_letter_name(record, ".rejected")
+    attributed.write_text("unrelated", encoding="utf-8")
+
+    rejected = spool.reject(record)
+
+    assert rejected != attributed
+    assert spool.reject(record) == rejected
+    assert json.loads(rejected.read_text(encoding="utf-8"))["event_id"] == event(1)
 
 
 def test_directory_fsync_handles_unavailable_operations(
