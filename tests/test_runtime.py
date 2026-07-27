@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from typing import cast
@@ -13,6 +14,7 @@ from monitor_agent.collectors.base import Collector
 from monitor_agent.config import AgentConfig, load_config
 from monitor_agent.identity import MachineIdentity
 from monitor_agent.models import (
+    CollectionBatch,
     CollectorPayload,
     CycleResult,
     DeliveryKind,
@@ -179,10 +181,14 @@ def test_replay_rejects_permanent_and_continues_after_corrupt_record(
         [delivery(DeliveryKind.PERMANENT, 422), delivery(DeliveryKind.SUCCESS, 200)]
     )
     agent = runtime(tmp_path, transport)
-    first = agent.spool.enqueue(queued_payload(1))
+    first = agent.spool.enqueue(
+        queued_payload(1), now=datetime(2099, 7, 19, tzinfo=UTC)
+    )
     corrupt = tmp_path / "20990720T120000000000Z_corrupt.json"
     corrupt.write_text("{", encoding="utf-8")
-    last = agent.spool.enqueue(queued_payload(2))
+    last = agent.spool.enqueue(
+        queued_payload(2), now=datetime(2099, 7, 21, tzinfo=UTC)
+    )
 
     assert agent.replay() is True
 
@@ -194,6 +200,57 @@ def test_replay_rejects_permanent_and_continues_after_corrupt_record(
         queued_payload(1)["event_id"],
         queued_payload(2)["event_id"],
     ]
+
+
+def test_run_cycle_collects_and_builds_one_payload_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([delivery(DeliveryKind.SUCCESS, 200)])
+    agent = runtime(tmp_path, transport)
+    collected = CollectionBatch(results=(), duration_ms=7)
+    built_payload: dict[str, JSONValue] = {
+        "event_id": "12345678-1234-4678-9234-567812340009",
+        "event": "heartbeat",
+    }
+    collect_calls = 0
+    build_calls = 0
+
+    def tracked_collect_all(
+        collectors: Sequence[Collector],
+        *,
+        max_workers: int,
+        timeout_sec: float,
+    ) -> CollectionBatch:
+        nonlocal collect_calls
+        collect_calls += 1
+        assert collectors == agent.collectors
+        assert max_workers == agent.config.max_collector_workers
+        assert timeout_sec == agent.config.collection_timeout_sec
+        return collected
+
+    def tracked_build_payload(
+        event: str,
+        identity: MachineIdentity,
+        batch: CollectionBatch,
+    ) -> dict[str, JSONValue]:
+        nonlocal build_calls
+        build_calls += 1
+        assert event == "heartbeat"
+        assert identity is agent.identity
+        assert batch is collected
+        return built_payload
+
+    monkeypatch.setattr("monitor_agent.runtime.collect_all", tracked_collect_all)
+    monkeypatch.setattr("monitor_agent.runtime.build_payload", tracked_build_payload)
+
+    result = agent.run_cycle("heartbeat")
+
+    assert collect_calls == 1
+    assert build_calls == 1
+    assert transport.payloads == [built_payload]
+    assert transport.payloads[0] is built_payload
+    assert result.event_id == built_payload["event_id"]
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.AUTHENTICATION, DeliveryKind.RETRIABLE])
