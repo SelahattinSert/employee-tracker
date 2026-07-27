@@ -28,6 +28,7 @@ _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _RENAME_NOREPLACE = 1
 _LOCK_BUSY_ERRORS = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+_ARTIFACT_GUARD_PREFIX = ".artifact-guard-"
 
 
 class _WindowsLockingModule(Protocol):
@@ -64,6 +65,7 @@ class Spool:
         self.max_age_sec = max_age_sec
         self._lock = RLock()
         self._dead_letter = self.root / _DEAD_LETTER
+        self._artifact_guards: dict[tuple[Path, str], tuple[int, int]] = {}
         with self._lock:
             self._prepare()
 
@@ -86,6 +88,7 @@ class Spool:
             finally:
                 if descriptor >= 0:
                     self._close_locked_descriptor(descriptor)
+                self._release_artifact_guard(self.root, ".spool-")
             self.enforce_retention(now=timestamp)
             return destination
 
@@ -230,7 +233,17 @@ class Spool:
         return encoded.encode("utf-8")
 
     def _write_staged(self, encoded: bytes) -> tuple[Path, int]:
-        descriptor, raw_path = tempfile.mkstemp(dir=self.root, prefix=".spool-", suffix=".tmp")
+        if not self._acquire_artifact_guard(
+            self.root, ".spool-", blocking=True
+        ):
+            raise OSError(errno.EAGAIN, "spool artifact guard is busy")
+        try:
+            descriptor, raw_path = tempfile.mkstemp(
+                dir=self.root, prefix=".spool-", suffix=".tmp"
+            )
+        except BaseException:
+            self._release_artifact_guard(self.root, ".spool-")
+            raise
         temporary = Path(raw_path)
         try:
             self._lock_descriptor(descriptor)
@@ -242,6 +255,7 @@ class Spool:
         except BaseException:
             self._close_locked_descriptor(descriptor)
             self._unlink_if_exists(temporary)
+            self._release_artifact_guard(self.root, ".spool-")
             raise
         return temporary, descriptor
 
@@ -264,6 +278,7 @@ class Spool:
                 continue
             except BaseException:
                 self._close_locked_descriptor(reservation)
+                self._release_artifact_guard(self.root, reservation_name)
                 raise
             self._release_reservation(self.root, reservation_name, reservation)
             return destination
@@ -334,7 +349,11 @@ class Spool:
     def _move_to_dead_letter(self, source: Path, suffix: str = "") -> Path:
         source = self._pending_path(source)
         source_descriptor = self._open_record(self.root, source.name)
+        source_locked = False
         try:
+            if _platform_name() == "posix":
+                self._lock_descriptor(source_descriptor)
+                source_locked = True
             self._fchmod_descriptor(source_descriptor, source, 0o600)
             source_digest = self._descriptor_digest(source_descriptor)
             operation_id = self._operation_id(source.name, suffix)
@@ -485,7 +504,10 @@ class Spool:
                 )
         finally:
             if source_descriptor >= 0:
-                os.close(source_descriptor)
+                if source_locked:
+                    self._close_locked_descriptor(source_descriptor)
+                else:
+                    os.close(source_descriptor)
 
     @staticmethod
     def _numbered_name(name: str, number: int) -> str:
@@ -558,43 +580,55 @@ class Spool:
         committed: bool = False,
         replace_existing: bool = False,
     ) -> None:
-        encoded = json.dumps(
-            {
-                "committed": committed,
-                "destination": destination_name,
-                "sha256": source_digest,
-                "source": source_name,
-                "suffix": suffix,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        descriptor, raw_path = tempfile.mkstemp(
-            dir=self._dead_letter, prefix=".deadmark-", suffix=".tmp"
-        )
-        temporary = Path(raw_path)
+        if not self._acquire_artifact_guard(
+            self._dead_letter, ".deadmark-", blocking=True
+        ):
+            raise OSError(errno.EAGAIN, "dead-letter marker guard is busy")
         try:
-            self._fchmod_descriptor(descriptor, temporary, 0o600)
-            handle = os.fdopen(descriptor, "wb", closefd=True)
-            descriptor = -1
-            with handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            if not replace_existing and self._name_exists(
-                self._dead_letter, marker_name
-            ):
-                raise FileExistsError("dead-letter operation marker already exists")
-            self._replace_name(
-                self._dead_letter, temporary.name, self._dead_letter, marker_name
+            encoded = json.dumps(
+                {
+                    "committed": committed,
+                    "destination": destination_name,
+                    "sha256": source_digest,
+                    "source": source_name,
+                    "suffix": suffix,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            descriptor, raw_path = tempfile.mkstemp(
+                dir=self._dead_letter, prefix=".deadmark-", suffix=".tmp"
             )
-            self._fsync_directory(self._dead_letter)
-        except BaseException:
-            if descriptor >= 0:
-                os.close(descriptor)
-            self._unlink_name(self._dead_letter, temporary.name)
-            raise
+            temporary = Path(raw_path)
+            try:
+                self._fchmod_descriptor(descriptor, temporary, 0o600)
+                handle = os.fdopen(descriptor, "wb", closefd=True)
+                descriptor = -1
+                with handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if not replace_existing and self._name_exists(
+                    self._dead_letter, marker_name
+                ):
+                    raise FileExistsError(
+                        "dead-letter operation marker already exists"
+                    )
+                self._replace_name(
+                    self._dead_letter,
+                    temporary.name,
+                    self._dead_letter,
+                    marker_name,
+                )
+                self._fsync_directory(self._dead_letter)
+            except BaseException:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                self._unlink_name(self._dead_letter, temporary.name)
+                raise
+        finally:
+            self._release_artifact_guard(self._dead_letter, ".deadmark-")
 
     def _read_operation_marker(
         self, marker_name: str, source_name: str, suffix: str
@@ -663,95 +697,132 @@ class Spool:
         return digest.hexdigest()
 
     def _recover_pending_links(self) -> None:
-        changed = False
         for hidden in self.root.glob(".spool-*"):
+            if not self._acquire_artifact_guard(
+                self.root, hidden.name, blocking=False
+            ):
+                continue
             try:
-                hidden_stat = os.lstat(hidden)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(hidden_stat.st_mode) or hidden_stat.st_nlink != 2:
-                continue
-            matches = []
-            for candidate in self.root.glob("*.json"):
                 try:
-                    candidate_stat = os.lstat(candidate)
-                except FileNotFoundError:
+                    descriptor = self._open_name(
+                        self.root,
+                        hidden.name,
+                        os.O_RDONLY | _NOFOLLOW | _CLOEXEC,
+                    )
+                except OSError:
                     continue
-                if (
-                    stat.S_ISREG(candidate_stat.st_mode)
-                    and candidate_stat.st_nlink == 2
-                    and (candidate_stat.st_dev, candidate_stat.st_ino)
-                    == (hidden_stat.st_dev, hidden_stat.st_ino)
-                ):
-                    matches.append(candidate)
-            if len(matches) != 1:
-                continue
-            descriptor = self._open_name(
-                self.root, hidden.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC
-            )
-            try:
-                if self._unlink_open_name(self.root, hidden.name, descriptor):
-                    changed = True
+                locked = False
+                try:
+                    if not self._try_lock_descriptor(descriptor):
+                        continue
+                    locked = True
+                    hidden_stat = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(hidden_stat.st_mode)
+                        or hidden_stat.st_nlink != 2
+                    ):
+                        continue
+                    matches = []
+                    for candidate in self.root.glob("*.json"):
+                        try:
+                            candidate_stat = os.lstat(candidate)
+                        except FileNotFoundError:
+                            continue
+                        if (
+                            stat.S_ISREG(candidate_stat.st_mode)
+                            and candidate_stat.st_nlink == 2
+                            and (candidate_stat.st_dev, candidate_stat.st_ino)
+                            == (hidden_stat.st_dev, hidden_stat.st_ino)
+                        ):
+                            matches.append(candidate)
+                    if len(matches) != 1:
+                        continue
+                    if self._unlink_open_name(self.root, hidden.name, descriptor):
+                        self._fsync_directory(self.root)
+                finally:
+                    if locked:
+                        self._close_locked_descriptor(descriptor)
+                    else:
+                        os.close(descriptor)
             finally:
-                os.close(descriptor)
-        if changed:
-            self._fsync_directory(self.root)
+                self._release_artifact_guard(self.root, hidden.name)
 
     def _recover_dead_letter_links(self) -> None:
-        changed = False
         for marker_path in self._dead_letter.glob(".deadop-*.json"):
-            decoded = self._decode_operation_marker(marker_path.name)
-            source_name = decoded.get("source")
-            suffix = decoded.get("suffix")
-            destination_name = decoded.get("destination")
-            expected_digest = decoded.get("sha256")
-            committed = decoded.get("committed")
-            if (
-                not isinstance(source_name, str)
-                or Path(source_name).name != source_name
-                or source_name.startswith(".")
-                or not source_name.endswith(".json")
-                or not isinstance(suffix, str)
-                or marker_path.name
-                != f".deadop-{self._operation_id(source_name, suffix)}.json"
-                or not isinstance(destination_name, str)
-                or Path(destination_name).name != destination_name
-                or destination_name.startswith(".")
-                or not destination_name.endswith(".json")
-                or not isinstance(expected_digest, str)
-                or len(expected_digest) != 64
-                or not isinstance(committed, bool)
-            ):
-                raise ValueError("invalid dead-letter operation marker")
-            source = self.root / source_name
-            destination = self._dead_letter / destination_name
-            try:
-                source_stat = os.lstat(source)
-                destination_stat = os.lstat(destination)
-            except FileNotFoundError:
-                continue
-            if (
-                not stat.S_ISREG(source_stat.st_mode)
-                or not stat.S_ISREG(destination_stat.st_mode)
-                or source_stat.st_nlink != 2
-                or destination_stat.st_nlink != 2
-                or (source_stat.st_dev, source_stat.st_ino)
-                != (destination_stat.st_dev, destination_stat.st_ino)
+            operation_lock_name = f"{marker_path.stem}.lock"
+            if not self._acquire_artifact_guard(
+                self._dead_letter, operation_lock_name, blocking=False
             ):
                 continue
-            descriptor = self._open_name(
-                self.root, source.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC
-            )
             try:
-                if self._descriptor_digest(descriptor) != expected_digest:
-                    raise ValueError("dead-letter recovery source does not match marker")
-                if self._unlink_open_name(self.root, source.name, descriptor):
-                    changed = True
+                decoded = self._decode_operation_marker(marker_path.name)
+                source_name = decoded.get("source")
+                suffix = decoded.get("suffix")
+                destination_name = decoded.get("destination")
+                expected_digest = decoded.get("sha256")
+                committed = decoded.get("committed")
+                if (
+                    not isinstance(source_name, str)
+                    or Path(source_name).name != source_name
+                    or source_name.startswith(".")
+                    or not source_name.endswith(".json")
+                    or not isinstance(suffix, str)
+                    or marker_path.name
+                    != f".deadop-{self._operation_id(source_name, suffix)}.json"
+                    or not isinstance(destination_name, str)
+                    or Path(destination_name).name != destination_name
+                    or destination_name.startswith(".")
+                    or not destination_name.endswith(".json")
+                    or not isinstance(expected_digest, str)
+                    or len(expected_digest) != 64
+                    or not isinstance(committed, bool)
+                ):
+                    raise ValueError("invalid dead-letter operation marker")
+                source = self.root / source_name
+                destination = self._dead_letter / destination_name
+                try:
+                    descriptor = self._open_name(
+                        self.root,
+                        source.name,
+                        os.O_RDONLY | _NOFOLLOW | _CLOEXEC,
+                    )
+                except FileNotFoundError:
+                    continue
+                locked = False
+                try:
+                    if not self._try_lock_descriptor(descriptor):
+                        continue
+                    locked = True
+                    source_stat = os.fstat(descriptor)
+                    try:
+                        destination_stat = os.lstat(destination)
+                    except FileNotFoundError:
+                        continue
+                    if (
+                        not stat.S_ISREG(source_stat.st_mode)
+                        or not stat.S_ISREG(destination_stat.st_mode)
+                        or source_stat.st_nlink != 2
+                        or destination_stat.st_nlink != 2
+                        or (source_stat.st_dev, source_stat.st_ino)
+                        != (destination_stat.st_dev, destination_stat.st_ino)
+                    ):
+                        continue
+                    if self._descriptor_digest(descriptor) != expected_digest:
+                        raise ValueError(
+                            "dead-letter recovery source does not match marker"
+                        )
+                    if self._unlink_open_name(self.root, source.name, descriptor):
+                        self._fsync_directory(self.root)
+                        self._fsync_directory(self._dead_letter)
+                finally:
+                    if locked:
+                        self._close_locked_descriptor(descriptor)
+                    else:
+                        os.close(descriptor)
             finally:
-                os.close(descriptor)
-        if changed:
-            self._fsync_directory(self.root)
-            self._fsync_directory(self._dead_letter)
+                self._release_artifact_guard(
+                    self._dead_letter, operation_lock_name
+                )
 
     def _cleanup_hidden_artifacts(self) -> None:
         root_prefixes = (".spool-", ".publish-")
@@ -763,88 +834,196 @@ class Spool:
             for path in directory.iterdir():
                 if not path.name.startswith(prefixes):
                     continue
-                if path.name.startswith(".deadop-") and path.name.endswith(".json"):
+                if path.name.startswith(".deadop-") and path.name.endswith(
+                    ".json"
+                ):
                     continue
                 self._cleanup_stale_hidden_file(directory, path.name)
 
     def _cleanup_stale_hidden_file(self, directory: Path, name: str) -> bool:
-        if _platform_name() == "nt" and name.startswith(".spool-"):
+        if not self._acquire_artifact_guard(directory, name, blocking=False):
             return False
         try:
-            descriptor = self._open_name(
-                directory, name, os.O_RDWR | _NOFOLLOW | _CLOEXEC
-            )
-        except (FileNotFoundError, OSError):
-            return False
-        locked = False
-        try:
-            record_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(record_stat.st_mode) or record_stat.st_nlink != 1:
-                return False
-            if not self._try_lock_descriptor(descriptor):
-                return False
-            locked = True
-            if _platform_name() != "posix":  # pragma: no cover - Windows fallback
-                self._close_locked_descriptor(descriptor)
-                descriptor = -1
-                locked = False
-                try:
-                    current_stat = os.lstat(directory / name)
-                except FileNotFoundError:
-                    return False
-                if (current_stat.st_dev, current_stat.st_ino) != (
-                    record_stat.st_dev,
-                    record_stat.st_ino,
-                ):
-                    return False
-                (directory / name).unlink()
-                return True
-            return self._unlink_open_name(directory, name, descriptor)
-        finally:
-            if descriptor >= 0:
-                if locked:
-                    self._close_locked_descriptor(descriptor)
-                else:
-                    os.close(descriptor)
-
-    def _acquire_reservation(self, directory: Path, name: str) -> int | None:
-        for _ in range(2):
             try:
                 descriptor = self._open_name(
-                    directory,
-                    name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
-                    0o600,
+                    directory, name, os.O_RDWR | _NOFOLLOW | _CLOEXEC
                 )
-            except FileExistsError:
-                if not self._cleanup_stale_hidden_file(directory, name):
-                    return None
-                continue
+            except (FileNotFoundError, OSError):
+                return False
+            locked = False
             try:
-                self._lock_descriptor(descriptor)
-                self._fchmod_descriptor(descriptor, directory / name, 0o600)
-                return descriptor
-            except BaseException:
-                with suppress(OSError):
-                    self._unlock_descriptor(descriptor)
-                os.close(descriptor)
-                self._unlink_name(directory, name)
-                raise
-        return None
+                record_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(record_stat.st_mode)
+                    or record_stat.st_nlink != 1
+                ):
+                    return False
+                if not self._try_lock_descriptor(descriptor):
+                    return False
+                locked = True
+                if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+                    self._close_locked_descriptor(descriptor)
+                    descriptor = -1
+                    locked = False
+                    try:
+                        current_stat = os.lstat(directory / name)
+                    except FileNotFoundError:
+                        return False
+                    if (
+                        not stat.S_ISREG(current_stat.st_mode)
+                        or (current_stat.st_dev, current_stat.st_ino)
+                        != (record_stat.st_dev, record_stat.st_ino)
+                    ):
+                        return False
+                    (directory / name).unlink()
+                    self._fsync_directory(directory)
+                    return True
+                removed = self._unlink_open_name(directory, name, descriptor)
+                if removed:
+                    self._fsync_directory(directory)
+                return removed
+            finally:
+                if descriptor >= 0:
+                    if locked:
+                        self._close_locked_descriptor(descriptor)
+                    else:
+                        os.close(descriptor)
+        finally:
+            self._release_artifact_guard(directory, name)
+
+    def _acquire_reservation(self, directory: Path, name: str) -> int | None:
+        if not self._acquire_artifact_guard(directory, name, blocking=False):
+            return None
+        acquired = False
+        try:
+            for _ in range(2):
+                try:
+                    descriptor = self._open_name(
+                        directory,
+                        name,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | _NOFOLLOW
+                        | _CLOEXEC,
+                        0o600,
+                    )
+                except FileExistsError:
+                    if not self._cleanup_stale_hidden_file(directory, name):
+                        return None
+                    continue
+                try:
+                    self._lock_descriptor(descriptor)
+                    self._fchmod_descriptor(descriptor, directory / name, 0o600)
+                    acquired = True
+                    return descriptor
+                except BaseException:
+                    with suppress(OSError):
+                        self._unlock_descriptor(descriptor)
+                    os.close(descriptor)
+                    self._unlink_name(directory, name)
+                    raise
+            return None
+        finally:
+            if not acquired:
+                self._release_artifact_guard(directory, name)
 
     def _release_reservation(
         self, directory: Path, name: str, descriptor: int | None
     ) -> None:
         if descriptor is None:
             return
-        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
-            self._close_locked_descriptor(descriptor)
-            self._unlink_name(directory, name)
-            return
         try:
-            self._unlink_name(directory, name)
+            if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+                self._close_locked_descriptor(descriptor)
+                self._unlink_name(directory, name)
+            else:
+                try:
+                    self._unlink_name(directory, name)
+                finally:
+                    self._close_locked_descriptor(descriptor)
         finally:
-            self._close_locked_descriptor(descriptor)
+            self._release_artifact_guard(directory, name)
+
+    @staticmethod
+    def _artifact_guard_name(artifact_name: str) -> str:
+        if artifact_name.startswith(".spool-"):
+            return f"{_ARTIFACT_GUARD_PREFIX}spool"
+        if artifact_name.startswith(".deadmark-"):
+            return f"{_ARTIFACT_GUARD_PREFIX}deadmark"
+        for prefix, kind in (
+            (".publish-", "publish"),
+            (".deadop-", "deadop"),
+            (".deadres-", "deadres"),
+        ):
+            if artifact_name.startswith(prefix):
+                slot = hashlib.sha256(artifact_name.encode("utf-8")).hexdigest()[:2]
+                return f"{_ARTIFACT_GUARD_PREFIX}{kind}-{slot}"
+        raise ValueError("unsupported hidden spool artifact")
+
+    def _acquire_artifact_guard(
+        self, directory: Path, artifact_name: str, *, blocking: bool
+    ) -> bool:
+        guard_name = self._artifact_guard_name(artifact_name)
+        key = (directory.absolute(), guard_name)
+        held = self._artifact_guards.get(key)
+        if held is not None:
+            descriptor, depth = held
+            self._artifact_guards[key] = (descriptor, depth + 1)
+            return True
+
+        descriptor = self._open_name(
+            directory,
+            guard_name,
+            os.O_RDWR | os.O_CREAT | _NOFOLLOW | _CLOEXEC,
+            0o600,
+        )
+        locked = False
+        try:
+            record_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(record_stat.st_mode)
+                or record_stat.st_nlink != 1
+                or not Spool._open_name_matches(
+                    directory, guard_name, descriptor
+                )
+            ):
+                raise ValueError("spool artifact guard must be a regular file")
+            if blocking:
+                self._lock_descriptor(descriptor)
+                locked = True
+            elif self._try_lock_descriptor(descriptor):
+                locked = True
+            else:
+                return False
+            if not Spool._open_name_matches(
+                directory, guard_name, descriptor
+            ):
+                raise ValueError("spool artifact guard changed while locking")
+            if stat.S_IMODE(record_stat.st_mode) != 0o600:
+                self._fchmod_descriptor(
+                    descriptor, directory / guard_name, 0o600
+                )
+            self._artifact_guards[key] = (descriptor, 1)
+            return True
+        finally:
+            if key not in self._artifact_guards:
+                if locked:
+                    self._close_locked_descriptor(descriptor)
+                else:
+                    os.close(descriptor)
+
+    def _release_artifact_guard(
+        self, directory: Path, artifact_name: str
+    ) -> None:
+        guard_name = self._artifact_guard_name(artifact_name)
+        key = (directory.absolute(), guard_name)
+        descriptor, depth = self._artifact_guards[key]
+        if depth > 1:
+            self._artifact_guards[key] = (descriptor, depth - 1)
+            return
+        del self._artifact_guards[key]
+        self._close_locked_descriptor(descriptor)
 
     @staticmethod
     def _lock_descriptor(descriptor: int) -> None:

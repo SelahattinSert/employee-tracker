@@ -7,12 +7,54 @@ import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Condition, Event
 from uuid import UUID
 
 import pytest
 
 from monitor_agent.models import RetentionResult, SpoolStats
 from monitor_agent.spool import Spool
+
+
+class FakeWindowsLocking:
+    LK_LOCK = 1
+    LK_NBLCK = 2
+    LK_UNLCK = 3
+
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._owners: dict[tuple[int, int], int] = {}
+        self.blocking_attempted = Event()
+        self.try_descriptors: list[int] = []
+        self.unlocked_descriptors: list[int] = []
+
+    @property
+    def locked_count(self) -> int:
+        with self._condition:
+            return len(self._owners)
+
+    def locking(self, descriptor: int, mode: int, length: int) -> None:
+        assert length == 1
+        assert os.fstat(descriptor).st_size >= 1
+        assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
+        record_stat = os.fstat(descriptor)
+        identity = (record_stat.st_dev, record_stat.st_ino)
+        with self._condition:
+            if mode == self.LK_UNLCK:
+                if self._owners.get(identity) == descriptor:
+                    del self._owners[identity]
+                self.unlocked_descriptors.append(descriptor)
+                self._condition.notify_all()
+                return
+            if mode == self.LK_NBLCK:
+                self.try_descriptors.append(descriptor)
+                if identity in self._owners:
+                    raise OSError(errno.EACCES, "locked")
+            else:
+                while identity in self._owners:
+                    self.blocking_attempted.set()
+                    self._condition.wait()
+            self._owners[identity] = descriptor
 
 
 def payload(event_id: str, **extra: object) -> dict[str, object]:
@@ -740,10 +782,14 @@ def test_cross_instance_publish_reservation_chooses_deterministic_next_candidate
     reservation_name = first._publish_reservation_name(canonical_name)
     reservation = first._acquire_reservation(first.root, reservation_name)
     assert reservation is not None
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        record = second.enqueue(payload(event(1)), now=now)
+        record = executor.submit(second.enqueue, payload(event(1)), now=now).result(
+            timeout=2
+        )
     finally:
         first._release_reservation(first.root, reservation_name, reservation)
+        executor.shutdown(wait=True)
 
     assert record.name == first._numbered_name(canonical_name, 1)
     assert record.stat().st_nlink == 1
@@ -1288,7 +1334,7 @@ def test_missing_rejection_rejects_a_replaced_destination_with_wrong_content(
         spool.reject(record)
 
 
-def test_windows_conservatively_preserves_an_unlocked_staging_file(
+def test_windows_reclaims_an_unlocked_staging_file_with_its_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import monitor_agent.spool as spool_module
@@ -1296,10 +1342,13 @@ def test_windows_conservatively_preserves_an_unlocked_staging_file(
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     staged = tmp_path / ".spool-ambiguous.tmp"
     staged.write_bytes(b"complete but ownership is unknown")
+    fake_msvcrt = FakeWindowsLocking()
     monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
 
-    assert not spool._cleanup_stale_hidden_file(spool.root, staged.name)
-    assert staged.exists()
+    assert spool._cleanup_stale_hidden_file(spool.root, staged.name)
+    assert not staged.exists()
+    assert fake_msvcrt.locked_count == 0
 
 
 def test_windows_publish_uses_a_rename_that_propagates_destination_collisions(
@@ -1349,3 +1398,249 @@ def test_missing_rejection_returns_its_persisted_unpublished_destination(
 
     assert planned.parent == tmp_path / "dead-letter"
     assert not planned.exists()
+
+
+def test_posix_fallback_recovery_waits_for_the_publisher_to_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    observer = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    link_created = Event()
+    finish_unlink = Event()
+    original_unlink = os.unlink
+    publish_errors: list[BaseException] = []
+    published: list[Path] = []
+
+    monkeypatch.setattr(publisher, "_linux_rename_noreplace", lambda *args: False)
+
+    def pause_after_link(path: object, *args: object, **kwargs: object) -> None:
+        if (
+            isinstance(path, str)
+            and path.startswith(".spool-")
+            and not link_created.is_set()
+        ):
+            link_created.set()
+            if not finish_unlink.wait(timeout=5):
+                raise TimeoutError("publisher unlink was not released")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", pause_after_link)
+
+    def publish() -> None:
+        try:
+            published.append(publisher.enqueue(payload(event(1))))
+        except BaseException as error:
+            publish_errors.append(error)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(publish)
+        assert link_created.wait(timeout=5)
+        hidden = next(tmp_path.glob(".spool-*.tmp"))
+        destination = next(tmp_path.glob("*.json"))
+        try:
+            observer.pending()
+            active_hidden_survived = hidden.exists()
+        finally:
+            finish_unlink.set()
+        future.result(timeout=5)
+
+    assert active_hidden_survived
+    assert publish_errors == []
+    assert published == [destination]
+    assert not hidden.exists()
+    assert destination.stat().st_nlink == 1
+
+
+def test_posix_fallback_recovery_skips_a_locked_pair_then_reclaims_it(
+    tmp_path: Path,
+) -> None:
+    owner = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    observer = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    staged = tmp_path / ".spool-locked.tmp"
+    destination = tmp_path / "20260720T120000000000Z_locked.json"
+    staged.write_text(json.dumps(payload(event(1))), encoding="utf-8")
+    os.link(staged, destination)
+    descriptor = os.open(staged, os.O_RDONLY)
+    owner._lock_descriptor(descriptor)
+
+    try:
+        assert observer.pending() == []
+        assert staged.exists()
+        assert destination.stat().st_nlink == 2
+    finally:
+        owner._close_locked_descriptor(descriptor)
+
+    assert observer.pending() == [destination]
+    assert not staged.exists()
+    assert destination.stat().st_nlink == 1
+
+
+def test_windows_cleanup_cannot_unlink_a_new_owner_in_the_old_close_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    cleaner = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    owner = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    reservation_name = ".publish-handoff.lock"
+    reservation_path = tmp_path / reservation_name
+    reservation_path.write_bytes(b"")
+    stale_identity = (reservation_path.stat().st_dev, reservation_path.stat().st_ino)
+    fake_msvcrt = FakeWindowsLocking()
+    closed_stale_descriptor = Event()
+    let_cleaner_continue = Event()
+    owner_attempted = Event()
+    cleanup_finished = Event()
+    owner_descriptor: list[int | None] = []
+    original_close = cleaner._close_locked_descriptor
+
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
+
+    def pause_after_stale_close(descriptor: int) -> None:
+        descriptor_stat = os.fstat(descriptor)
+        original_close(descriptor)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) == stale_identity:
+            closed_stale_descriptor.set()
+            if not let_cleaner_continue.wait(timeout=5):
+                raise TimeoutError("cleanup gap was not released")
+
+    monkeypatch.setattr(cleaner, "_close_locked_descriptor", pause_after_stale_close)
+
+    def acquire_replacement() -> None:
+        descriptor = owner._acquire_reservation(owner.root, reservation_name)
+        owner_attempted.set()
+        if descriptor is None:
+            assert cleanup_finished.wait(timeout=5)
+            descriptor = owner._acquire_reservation(owner.root, reservation_name)
+        owner_descriptor.append(descriptor)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cleanup_future = executor.submit(
+            cleaner._cleanup_stale_hidden_file, cleaner.root, reservation_name
+        )
+        assert closed_stale_descriptor.wait(timeout=5)
+        owner_future = executor.submit(acquire_replacement)
+        assert owner_attempted.wait(timeout=5)
+        let_cleaner_continue.set()
+        assert cleanup_future.result(timeout=5)
+        cleanup_finished.set()
+        owner_future.result(timeout=5)
+
+    assert owner_descriptor and owner_descriptor[0] is not None
+    assert reservation_path.exists()
+    owner._release_reservation(owner.root, reservation_name, owner_descriptor[0])
+    assert not reservation_path.exists()
+    assert fake_msvcrt.locked_count == 0
+
+
+def test_windows_guards_preserve_active_stage_and_reclaim_all_stale_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    publisher = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    observer = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    fake_msvcrt = FakeWindowsLocking()
+    stage_ready = Event()
+    finish_publish = Event()
+    original_publish = publisher._publish_staged
+
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
+
+    def pause_with_active_stage(temporary: Path, name: str) -> Path:
+        stage_ready.set()
+        if not finish_publish.wait(timeout=5):
+            raise TimeoutError("active stage was not released")
+        return original_publish(temporary, name)
+
+    monkeypatch.setattr(publisher, "_publish_staged", pause_with_active_stage)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(publisher.enqueue, payload(event(1)))
+        assert stage_ready.wait(timeout=5)
+        active_stage = next(tmp_path.glob(".spool-*.tmp"))
+        observer.pending()
+        assert active_stage.exists()
+        finish_publish.set()
+        published = future.result(timeout=5)
+
+    assert published.exists()
+    assert not list(tmp_path.glob(".spool-*.tmp"))
+
+    hidden_artifacts = (
+        (tmp_path, ".spool-crash.tmp"),
+        (tmp_path, ".publish-crash.lock"),
+        (tmp_path / "dead-letter", ".deadmark-crash.tmp"),
+        (tmp_path / "dead-letter", ".deadop-crash.lock"),
+        (tmp_path / "dead-letter", ".deadres-crash.lock"),
+    )
+    for crash_number in range(5):
+        for directory, name in hidden_artifacts:
+            (directory / f"{name}.{crash_number}").write_bytes(b"complete")
+        observer.pending()
+
+    for directory, name in hidden_artifacts:
+        assert not list(directory.glob(f"{name}.*"))
+    assert fake_msvcrt.locked_count == 0
+
+
+def test_artifact_guard_slots_are_bounded_and_reject_unknown_names() -> None:
+    assert Spool._artifact_guard_name(".spool-stage.tmp").endswith("spool")
+    assert Spool._artifact_guard_name(".deadmark-stage.tmp").endswith("deadmark")
+    for prefix, kind in (
+        (".publish-", "publish"),
+        (".deadop-", "deadop"),
+        (".deadres-", "deadres"),
+    ):
+        guard_name = Spool._artifact_guard_name(f"{prefix}operation.lock")
+        assert guard_name.startswith(f".artifact-guard-{kind}-")
+        assert len(guard_name.rsplit("-", 1)[1]) == 2
+
+    with pytest.raises(ValueError, match="unsupported hidden spool artifact"):
+        Spool._artifact_guard_name(".unknown-artifact")
+
+
+def test_artifact_guard_repairs_mode_and_rejects_hardlinked_guard(
+    tmp_path: Path,
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    artifact_name = ".publish-mode.lock"
+    guard = tmp_path / spool._artifact_guard_name(artifact_name)
+    guard.write_bytes(b"")
+    guard.chmod(0o640)
+
+    assert spool._acquire_artifact_guard(
+        spool.root, artifact_name, blocking=False
+    )
+    try:
+        assert stat.S_IMODE(guard.stat().st_mode) == 0o600
+    finally:
+        spool._release_artifact_guard(spool.root, artifact_name)
+
+    outside = tmp_path / "outside-guard"
+    outside.write_bytes(b"")
+    hardlinked_artifact = ".publish-hardlinked.lock"
+    hardlinked_guard = tmp_path / spool._artifact_guard_name(hardlinked_artifact)
+    os.link(outside, hardlinked_guard)
+    with pytest.raises(ValueError, match="guard must be a regular file"):
+        spool._acquire_artifact_guard(
+            spool.root, hardlinked_artifact, blocking=False
+        )
+
+
+def test_artifact_guard_rejects_identity_change_after_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    match_results = iter((True, False))
+    monkeypatch.setattr(
+        Spool,
+        "_open_name_matches",
+        staticmethod(lambda *args: next(match_results)),
+    )
+
+    with pytest.raises(ValueError, match="guard changed while locking"):
+        spool._acquire_artifact_guard(
+            spool.root, ".publish-replaced.lock", blocking=True
+        )
