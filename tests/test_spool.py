@@ -110,7 +110,7 @@ def test_enqueue_cleans_temporary_file_when_atomic_publish_fails(
     ) -> None:
         raise OSError("publish failed")
 
-    monkeypatch.setattr(spool, "_replace_name", fail_replace)
+    monkeypatch.setattr(spool, "_publish_noreplace", fail_replace)
     with pytest.raises(OSError, match="publish failed"):
         spool.enqueue(payload(event(1)))
 
@@ -358,7 +358,7 @@ def test_enqueue_never_exposes_partial_pending_records_before_publish(
     else:
         monkeypatch.setattr(
             spool,
-            "_replace_name",
+            "_publish_noreplace",
             lambda *_, **__: (_ for _ in ()).throw(OSError("publish")),
         )
 
@@ -507,7 +507,11 @@ def test_dead_letter_chmod_uses_a_validated_file_descriptor(
 
     result = spool.load(record) if operation == "corrupt" else spool.reject(record)
 
-    destination = next((tmp_path / "dead-letter").glob("*.json"))
+    destination = next(
+        path
+        for path in (tmp_path / "dead-letter").glob("*.json")
+        if not path.name.startswith(".")
+    )
     assert result is None if operation == "corrupt" else result == destination
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
     assert fchmod_calls
@@ -536,7 +540,7 @@ def test_enqueue_failure_after_reservation_leaves_no_visible_record_and_recovers
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
-    original_replace = spool._replace_name
+    original_publish = spool._publish_noreplace
 
     def fail_pending_publish(
         source_directory: Path,
@@ -546,9 +550,9 @@ def test_enqueue_failure_after_reservation_leaves_no_visible_record_and_recovers
     ) -> None:
         if destination_directory == spool.root and destination_name.endswith(".json"):
             raise OSError("crash after reservation")
-        original_replace(source_directory, source_name, destination_directory, destination_name)
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
-    monkeypatch.setattr(spool, "_replace_name", fail_pending_publish)
+    monkeypatch.setattr(spool, "_publish_noreplace", fail_pending_publish)
 
     with pytest.raises(OSError, match="crash after reservation"):
         spool.enqueue(payload(event(1)))
@@ -596,7 +600,7 @@ def test_dead_letter_record_moves_directly_to_committed_destination(
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     record = spool.enqueue(payload(event(1)))
     record_moves: list[tuple[str, str]] = []
-    original_replace = spool._replace_name
+    original_publish = spool._publish_noreplace
 
     def track_replace(
         source_directory: Path,
@@ -606,9 +610,9 @@ def test_dead_letter_record_moves_directly_to_committed_destination(
     ) -> None:
         if source_directory == spool.root and source_name == record.name:
             record_moves.append((source_name, destination_name))
-        original_replace(source_directory, source_name, destination_directory, destination_name)
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
-    monkeypatch.setattr(spool, "_replace_name", track_replace)
+    monkeypatch.setattr(spool, "_publish_noreplace", track_replace)
 
     rejected = spool.reject(record)
 
@@ -622,7 +626,7 @@ def test_dead_letter_crash_before_direct_replace_replays_persisted_destination(
 ) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     record = spool.enqueue(payload(event(1)))
-    original_replace = spool._replace_name
+    original_publish = spool._publish_noreplace
 
     def fail_record_move(
         source_directory: Path,
@@ -632,9 +636,9 @@ def test_dead_letter_crash_before_direct_replace_replays_persisted_destination(
     ) -> None:
         if source_directory == spool.root and source_name == record.name:
             raise OSError("crash before direct replace")
-        original_replace(source_directory, source_name, destination_directory, destination_name)
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
-    monkeypatch.setattr(spool, "_replace_name", fail_record_move)
+    monkeypatch.setattr(spool, "_publish_noreplace", fail_record_move)
     with pytest.raises(OSError, match="crash before direct replace"):
         spool.reject(record)
 
@@ -644,7 +648,7 @@ def test_dead_letter_crash_before_direct_replace_replays_persisted_destination(
     assert record.exists()
     assert not (tmp_path / "dead-letter" / destination_name).exists()
 
-    monkeypatch.setattr(spool, "_replace_name", original_replace)
+    monkeypatch.setattr(spool, "_publish_noreplace", original_publish)
     rejected = spool.reject(record)
     assert rejected.name == destination_name
     assert not record.exists()
@@ -890,7 +894,7 @@ def test_replayed_dead_letter_marker_respects_active_destination_reservation(
 ) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     record = spool.enqueue(payload(event(1)))
-    original_replace = spool._replace_name
+    original_publish = spool._publish_noreplace
 
     def fail_record_move(
         source_directory: Path,
@@ -900,12 +904,12 @@ def test_replayed_dead_letter_marker_respects_active_destination_reservation(
     ) -> None:
         if source_directory == spool.root and source_name == record.name:
             raise OSError("crash")
-        original_replace(source_directory, source_name, destination_directory, destination_name)
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
-    monkeypatch.setattr(spool, "_replace_name", fail_record_move)
+    monkeypatch.setattr(spool, "_publish_noreplace", fail_record_move)
     with pytest.raises(OSError, match="crash"):
         spool.reject(record)
-    monkeypatch.setattr(spool, "_replace_name", original_replace)
+    monkeypatch.setattr(spool, "_publish_noreplace", original_publish)
 
     marker = next((tmp_path / "dead-letter").glob(".deadop-*.json"))
     destination_name = json.loads(marker.read_text(encoding="utf-8"))["destination"]
@@ -970,3 +974,378 @@ def test_descriptor_helpers_reject_missing_and_hardlinked_names(tmp_path: Path) 
         pytest.skip(f"hard links unavailable: {error}")
     with pytest.raises(ValueError, match="not a pending spool record"):
         spool._open_record(spool.root, hardlink.name)
+
+
+def test_windows_locking_preserves_live_hidden_artifacts_and_recovers_stale_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_NBLCK = 2
+        LK_UNLCK = 3
+
+        def __init__(self) -> None:
+            self.locked_inodes: set[tuple[int, int]] = set()
+            self.try_descriptors: list[int] = []
+            self.unlocked_descriptors: list[int] = []
+
+        def locking(self, descriptor: int, mode: int, length: int) -> None:
+            assert length == 1
+            assert os.fstat(descriptor).st_size >= 1
+            assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
+            record_stat = os.fstat(descriptor)
+            identity = (record_stat.st_dev, record_stat.st_ino)
+            if mode == self.LK_UNLCK:
+                self.locked_inodes.discard(identity)
+                self.unlocked_descriptors.append(descriptor)
+                return
+            if mode == self.LK_NBLCK:
+                self.try_descriptors.append(descriptor)
+                if identity in self.locked_inodes:
+                    raise OSError(errno.EACCES, "locked")
+            self.locked_inodes.add(identity)
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    live = tmp_path / ".publish-live.lock"
+    stale = tmp_path / ".publish-stale.lock"
+    live.write_bytes(b"")
+    stale.write_bytes(b"")
+    owner_descriptor = os.open(live, os.O_RDWR)
+    fake_msvcrt = FakeMsvcrt()
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(spool_module, "_windows_locking", lambda: fake_msvcrt)
+
+    spool._lock_descriptor(owner_descriptor)
+    try:
+        spool.pending()
+    finally:
+        spool._unlock_descriptor(owner_descriptor)
+        os.close(owner_descriptor)
+
+    assert live.exists()
+    assert not stale.exists()
+    assert fake_msvcrt.try_descriptors
+    assert fake_msvcrt.unlocked_descriptors
+    for descriptor in fake_msvcrt.try_descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptor)
+
+
+def test_pending_publish_never_overwrites_a_destination_created_after_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    canonical = tmp_path / spool._record_name(payload(event(1)), now)
+    original_publish = spool._publish_noreplace
+    injected = False
+
+    def race_publish(
+        source_directory: Path,
+        source_name: str,
+        destination_directory: Path,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected
+        if not injected and destination_name == canonical.name:
+            injected = True
+            canonical.write_bytes(b"unrelated")
+        original_publish(
+            source_directory, source_name, destination_directory, destination_name
+        )
+
+    monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
+
+    published = spool.enqueue(payload(event(1)), now=now)
+
+    assert canonical.read_bytes() == b"unrelated"
+    assert published.name == spool._numbered_name(canonical.name, 1)
+    assert json.loads(published.read_text(encoding="utf-8"))["event_id"] == event(1)
+    assert not list(tmp_path.glob(".spool-*.tmp"))
+
+
+def test_dead_letter_publish_reselects_after_an_atomic_collision_and_retries_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    original_publish = spool._publish_noreplace
+    injected_destination: Path | None = None
+
+    def race_publish(
+        source_directory: Path,
+        source_name: str,
+        destination_directory: Path,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected_destination
+        if source_directory == spool.root and injected_destination is None:
+            injected_destination = destination_directory / destination_name
+            injected_destination.write_bytes(b"unrelated")
+        original_publish(
+            source_directory, source_name, destination_directory, destination_name
+        )
+
+    monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
+
+    rejected = spool.reject(record)
+
+    assert injected_destination is not None
+    assert injected_destination.read_bytes() == b"unrelated"
+    assert rejected != injected_destination
+    assert json.loads(rejected.read_text(encoding="utf-8"))["event_id"] == event(1)
+    assert spool.reject(record) == rejected
+
+
+def test_dead_letter_never_accepts_an_identical_uncommitted_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    source_bytes = record.read_bytes()
+    original_publish = spool._publish_noreplace
+    injected_destination: Path | None = None
+
+    def race_publish(
+        source_directory: Path,
+        source_name: str,
+        destination_directory: Path,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected_destination
+        if source_directory == spool.root and injected_destination is None:
+            injected_destination = destination_directory / destination_name
+            injected_destination.write_bytes((source_directory / source_name).read_bytes())
+        original_publish(
+            source_directory, source_name, destination_directory, destination_name
+        )
+
+    monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
+
+    rejected = spool.reject(record)
+
+    assert injected_destination is not None
+    assert rejected != injected_destination
+    assert injected_destination.read_bytes() == source_bytes
+    assert rejected.read_bytes() == source_bytes
+    assert not record.exists()
+    assert spool.reject(record) == rejected
+
+
+def test_posix_link_fallback_recovers_a_pending_publish_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    staged = tmp_path / ".spool-fallback.tmp"
+    destination = tmp_path / "20260720T120000000000Z_fallback.json"
+    staged.write_text(json.dumps(payload(event(1))), encoding="utf-8")
+    original_unlink = os.unlink
+
+    monkeypatch.setattr(spool, "_linux_rename_noreplace", lambda *args: False)
+
+    def crash_after_link(path: object, *args: object, **kwargs: object) -> None:
+        if path == staged.name:
+            raise OSError("crash after link")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", crash_after_link)
+    with pytest.raises(OSError, match="crash after link"):
+        spool._publish_noreplace(spool.root, staged.name, spool.root, destination.name)
+
+    assert staged.stat().st_ino == destination.stat().st_ino
+    assert destination.stat().st_nlink == 2
+
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    recovered = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+
+    assert not staged.exists()
+    assert recovered.pending() == [destination]
+    assert destination.stat().st_nlink == 1
+
+
+def test_posix_link_fallback_recovers_a_dead_letter_publish_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    original_unlink = os.unlink
+
+    monkeypatch.setattr(spool, "_linux_rename_noreplace", lambda *args: False)
+
+    def crash_after_link(path: object, *args: object, **kwargs: object) -> None:
+        if path == record.name:
+            raise OSError("crash after link")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", crash_after_link)
+    with pytest.raises(OSError, match="crash after link"):
+        spool.reject(record)
+
+    marker = next((tmp_path / "dead-letter").glob(".deadop-*.json"))
+    destination = tmp_path / "dead-letter" / json.loads(
+        marker.read_text(encoding="utf-8")
+    )["destination"]
+    assert record.stat().st_ino == destination.stat().st_ino
+    assert destination.stat().st_nlink == 2
+
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    rejected = spool.reject(record)
+
+    assert rejected == destination
+    assert not record.exists()
+    assert destination.stat().st_nlink == 1
+
+
+@pytest.mark.parametrize(
+    ("error_number", "expected"),
+    [
+        (errno.EEXIST, FileExistsError),
+        (errno.ENOSYS, False),
+        (errno.EIO, OSError),
+    ],
+)
+def test_linux_rename_noreplace_maps_kernel_errors_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+    expected: type[OSError] | bool,
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    class FakeRename:
+        def __init__(self) -> None:
+            self.argtypes: list[object] = []
+            self.restype: object = None
+
+        def __call__(self, *args: object) -> int:
+            return -1
+
+    class FakeLibc:
+        def __init__(self) -> None:
+            self.renameat2 = FakeRename()
+
+    monkeypatch.setattr(spool_module, "CDLL", lambda *args, **kwargs: FakeLibc())
+    monkeypatch.setattr(spool_module, "get_errno", lambda: error_number)
+
+    if expected is False:
+        assert not Spool._linux_rename_noreplace(1, "source", 2, "destination")
+    else:
+        with pytest.raises(expected) as caught:
+            Spool._linux_rename_noreplace(1, "source", 2, "destination")
+        assert caught.value.errno == error_number
+
+
+def test_linux_rename_noreplace_falls_back_when_libc_has_no_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    monkeypatch.setattr(spool_module, "CDLL", lambda *args, **kwargs: object())
+
+    assert not Spool._linux_rename_noreplace(1, "source", 2, "destination")
+
+
+def test_dead_letter_marker_rejects_changed_source_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    original_publish = spool._publish_noreplace
+
+    def fail_record_move(
+        source_directory: Path,
+        source_name: str,
+        destination_directory: Path,
+        destination_name: str,
+    ) -> None:
+        if source_directory == spool.root:
+            raise OSError("crash")
+        original_publish(
+            source_directory, source_name, destination_directory, destination_name
+        )
+
+    monkeypatch.setattr(spool, "_publish_noreplace", fail_record_move)
+    with pytest.raises(OSError, match="crash"):
+        spool.reject(record)
+
+    record.write_text(json.dumps(payload(event(2))), encoding="utf-8")
+    monkeypatch.setattr(spool, "_publish_noreplace", original_publish)
+
+    with pytest.raises(ValueError, match="does not match source content"):
+        spool.reject(record)
+
+
+def test_missing_rejection_rejects_a_replaced_destination_with_wrong_content(
+    tmp_path: Path,
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+    rejected = spool.reject(record)
+    rejected.write_text(json.dumps(payload(event(2))), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match operation"):
+        spool.reject(record)
+
+
+def test_windows_conservatively_preserves_an_unlocked_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    staged = tmp_path / ".spool-ambiguous.tmp"
+    staged.write_bytes(b"complete but ownership is unknown")
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+
+    assert not spool._cleanup_stale_hidden_file(spool.root, staged.name)
+    assert staged.exists()
+
+
+def test_windows_publish_uses_a_rename_that_propagates_destination_collisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monitor_agent.spool as spool_module
+
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    source = tmp_path / ".spool-source.tmp"
+    destination = tmp_path / "destination.json"
+    source.write_bytes(b"source")
+    destination.write_bytes(b"existing")
+    monkeypatch.setattr(spool_module, "_platform_name", lambda: "nt")
+
+    def collide(source_path: Path, destination_path: Path) -> None:
+        assert source_path == source
+        assert destination_path == destination
+        raise FileExistsError(errno.EEXIST, "exists", destination_path)
+
+    monkeypatch.setattr(os, "rename", collide)
+
+    with pytest.raises(FileExistsError):
+        spool._publish_noreplace(
+            spool.root, source.name, spool.root, destination.name
+        )
+
+    assert source.read_bytes() == b"source"
+    assert destination.read_bytes() == b"existing"
+
+
+def test_missing_rejection_returns_its_persisted_unpublished_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    record = spool.enqueue(payload(event(1)))
+
+    monkeypatch.setattr(
+        spool,
+        "_publish_noreplace",
+        lambda *args: (_ for _ in ()).throw(OSError("crash before publish")),
+    )
+    with pytest.raises(OSError, match="crash before publish"):
+        spool.reject(record)
+    record.unlink()
+
+    planned = spool.reject(record)
+
+    assert planned.parent == tmp_path / "dead-letter"
+    assert not planned.exists()

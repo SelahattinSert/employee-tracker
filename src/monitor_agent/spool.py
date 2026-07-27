@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import importlib
 import json
 import os
 import stat
+import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
+from ctypes import CDLL, c_char_p, c_int, get_errno
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import cast
+from typing import Protocol, cast
 from uuid import UUID
 
 from monitor_agent.models import JSONValue, RetentionResult, SpoolStats
@@ -23,10 +26,28 @@ _DIRECTORY_FSYNC_ERRORS = {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_RENAME_NOREPLACE = 1
+_LOCK_BUSY_ERRORS = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+
+
+class _WindowsLockingModule(Protocol):
+    LK_LOCK: int
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, descriptor: int, mode: int, length: int) -> None: ...
+
+
+def _platform_name() -> str:
+    return os.name
+
+
+def _windows_locking() -> _WindowsLockingModule:
+    return cast(_WindowsLockingModule, importlib.import_module("msvcrt"))
 
 
 def _supports_directory_fsync() -> bool:
-    return os.name == "posix"
+    return _platform_name() == "posix"
 
 
 class Spool:
@@ -54,8 +75,8 @@ class Spool:
             encoded = self._serialize(payload)
             self._prepare()
             temporary, descriptor = self._write_staged(encoded)
-            if os.name != "posix":  # pragma: no cover - Windows fallback
-                os.close(descriptor)
+            if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+                self._close_locked_descriptor(descriptor)
                 descriptor = -1
             try:
                 destination = self._publish_staged(temporary, name)
@@ -64,7 +85,7 @@ class Spool:
                 raise
             finally:
                 if descriptor >= 0:
-                    os.close(descriptor)
+                    self._close_locked_descriptor(descriptor)
             self.enforce_retention(now=timestamp)
             return destination
 
@@ -162,6 +183,8 @@ class Spool:
 
     def _prepare(self) -> None:
         self._ensure_directories()
+        self._recover_dead_letter_links()
+        self._recover_pending_links()
         self._cleanup_hidden_artifacts()
 
     def _ensure_directories(self) -> None:
@@ -217,7 +240,7 @@ class Spool:
                 handle.flush()
                 os.fsync(handle.fileno())
         except BaseException:
-            os.close(descriptor)
+            self._close_locked_descriptor(descriptor)
             self._unlink_if_exists(temporary)
             raise
         return temporary, descriptor
@@ -229,14 +252,18 @@ class Spool:
             reservation = self._acquire_reservation(self.root, reservation_name)
             if reservation is None:
                 continue
-            if self._name_exists(self.root, destination.name):
-                self._release_reservation(self.root, reservation_name, reservation)
-                continue
             try:
-                self._replace_name(self.root, temporary.name, self.root, destination.name)
+                self._publish_noreplace(
+                    self.root, temporary.name, self.root, destination.name
+                )
                 self._fsync_directory(self.root)
+            except FileExistsError:
+                self._release_reservation(
+                    self.root, reservation_name, reservation
+                )
+                continue
             except BaseException:
-                os.close(reservation)
+                self._close_locked_descriptor(reservation)
                 raise
             self._release_reservation(self.root, reservation_name, reservation)
             return destination
@@ -309,6 +336,7 @@ class Spool:
         source_descriptor = self._open_record(self.root, source.name)
         try:
             self._fchmod_descriptor(source_descriptor, source, 0o600)
+            source_digest = self._descriptor_digest(source_descriptor)
             operation_id = self._operation_id(source.name, suffix)
             operation_lock_name = f".deadop-{operation_id}.lock"
             operation_lock = self._acquire_reservation(
@@ -319,70 +347,139 @@ class Spool:
 
             try:
                 marker_name = f".deadop-{operation_id}.json"
-                destination_name = self._read_operation_marker(
+                marker = self._read_operation_marker(
                     marker_name, source.name, suffix
                 )
                 destination_lock: int | None = None
                 destination_lock_name = ""
-                if destination_name is None:
+                if marker is None:
+                    marker_committed = False
                     destination_name, destination_lock_name, destination_lock = (
                         self._reserve_dead_letter_destination(source, suffix)
                     )
                     try:
                         self._persist_operation_marker(
-                            marker_name, source.name, suffix, destination_name
+                            marker_name,
+                            source.name,
+                            suffix,
+                            destination_name,
+                            source_digest,
                         )
                     except BaseException:
                         self._release_reservation(
                             self._dead_letter, destination_lock_name, destination_lock
                         )
+                        destination_lock = None
                         raise
                 else:
+                    destination_name, marker_digest, marker_committed = marker
+                    if marker_digest != source_digest:
+                        raise ValueError(
+                            "dead-letter operation marker does not match source content"
+                        )
+
+                while True:
                     final_destination = self._dead_letter / destination_name
                     if self._name_exists(self._dead_letter, destination_name):
-                        self._validate_dead_letter_destination(final_destination)
-                        return final_destination
-                    destination_lock_name = self._dead_letter_reservation_name(
-                        destination_name
-                    )
-                    destination_lock = self._acquire_reservation(
-                        self._dead_letter, destination_lock_name
-                    )
+                        if marker_committed and self._destination_matches_digest(
+                            final_destination, source_digest
+                        ):
+                            return final_destination
+                        self._release_reservation(
+                            self._dead_letter,
+                            destination_lock_name,
+                            destination_lock,
+                        )
+                        destination_lock = None
+                        destination_lock_name = ""
+                        (
+                            destination_name,
+                            destination_lock_name,
+                            destination_lock,
+                        ) = self._reserve_dead_letter_destination(source, suffix)
+                        try:
+                            self._persist_operation_marker(
+                                marker_name,
+                                source.name,
+                                suffix,
+                                destination_name,
+                                source_digest,
+                                replace_existing=True,
+                            )
+                        except BaseException:
+                            self._release_reservation(
+                                self._dead_letter,
+                                destination_lock_name,
+                                destination_lock,
+                            )
+                            destination_lock = None
+                            raise
+                        marker_committed = False
+                        continue
+
+                    if destination_lock is None:
+                        destination_lock_name = self._dead_letter_reservation_name(
+                            destination_name
+                        )
+                        destination_lock = self._acquire_reservation(
+                            self._dead_letter, destination_lock_name
+                        )
                     if destination_lock is None:
                         if self._name_exists(self._dead_letter, destination_name):
-                            self._validate_dead_letter_destination(final_destination)
-                            return final_destination
+                            continue
                         raise OSError(
                             errno.EAGAIN, "dead-letter destination is reserved"
                         )
 
-                final_destination = self._dead_letter / destination_name
-                try:
                     if not self._open_name_matches(
                         self.root, source.name, source_descriptor
                     ):
-                        if self._name_exists(self._dead_letter, destination_name):
-                            self._validate_dead_letter_destination(final_destination)
-                            return final_destination
                         raise ValueError("dead-letter source changed before commit")
-                    if self._name_exists(self._dead_letter, destination_name):
-                        self._validate_dead_letter_destination(final_destination)
-                        return final_destination
-                    if os.name != "posix":  # pragma: no cover - Windows fallback
+
+                    if _platform_name() != "posix":  # pragma: no cover - Windows fallback
                         os.close(source_descriptor)
                         source_descriptor = -1
-                    self._replace_name(
-                        self.root, source.name, self._dead_letter, destination_name
-                    )
+                    try:
+                        self._publish_noreplace(
+                            self.root,
+                            source.name,
+                            self._dead_letter,
+                            destination_name,
+                        )
+                    except FileExistsError:
+                        self._release_reservation(
+                            self._dead_letter,
+                            destination_lock_name,
+                            destination_lock,
+                        )
+                        destination_lock = None
+                        destination_lock_name = ""
+                        if source_descriptor < 0:
+                            source_descriptor = self._open_record(
+                                self.root, source.name
+                            )
+                        continue
                     self._fsync_directory(self.root)
                     self._fsync_directory(self._dead_letter)
-                    self._validate_dead_letter_destination(final_destination)
-                    return final_destination
-                finally:
-                    self._release_reservation(
-                        self._dead_letter, destination_lock_name, destination_lock
+                    self._validate_dead_letter_destination(
+                        final_destination, source_digest
                     )
+                    self._persist_operation_marker(
+                        marker_name,
+                        source.name,
+                        suffix,
+                        destination_name,
+                        source_digest,
+                        committed=True,
+                        replace_existing=True,
+                    )
+                    return final_destination
             finally:
+                self._release_reservation(
+                    self._dead_letter,
+                    destination_lock_name,
+                    destination_lock,
+                )
                 self._release_reservation(
                     self._dead_letter, operation_lock_name, operation_lock
                 )
@@ -408,11 +505,12 @@ class Spool:
         suffix = ".rejected"
         operation_id = self._operation_id(source.name, suffix)
         marker_name = f".deadop-{operation_id}.json"
-        destination_name = self._read_operation_marker(marker_name, source.name, suffix)
-        if destination_name is not None:
+        marker = self._read_operation_marker(marker_name, source.name, suffix)
+        if marker is not None:
+            destination_name, expected_digest, _ = marker
             destination = self._dead_letter / destination_name
             if self._name_exists(self._dead_letter, destination_name):
-                self._validate_dead_letter_destination(destination)
+                self._validate_dead_letter_destination(destination, expected_digest)
             return destination
         return self._dead_letter / self._dead_letter_name(source, suffix)
 
@@ -450,11 +548,21 @@ class Spool:
         raise OSError("could not reserve a unique dead-letter destination")
 
     def _persist_operation_marker(
-        self, marker_name: str, source_name: str, suffix: str, destination_name: str
+        self,
+        marker_name: str,
+        source_name: str,
+        suffix: str,
+        destination_name: str,
+        source_digest: str,
+        *,
+        committed: bool = False,
+        replace_existing: bool = False,
     ) -> None:
         encoded = json.dumps(
             {
+                "committed": committed,
                 "destination": destination_name,
+                "sha256": source_digest,
                 "source": source_name,
                 "suffix": suffix,
             },
@@ -474,7 +582,9 @@ class Spool:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            if self._name_exists(self._dead_letter, marker_name):
+            if not replace_existing and self._name_exists(
+                self._dead_letter, marker_name
+            ):
                 raise FileExistsError("dead-letter operation marker already exists")
             self._replace_name(
                 self._dead_letter, temporary.name, self._dead_letter, marker_name
@@ -488,9 +598,29 @@ class Spool:
 
     def _read_operation_marker(
         self, marker_name: str, source_name: str, suffix: str
-    ) -> str | None:
+    ) -> tuple[str, str, bool] | None:
         if not self._name_exists(self._dead_letter, marker_name):
             return None
+        decoded = self._decode_operation_marker(marker_name)
+        if decoded.get("source") != source_name or decoded.get("suffix") != suffix:
+            raise ValueError("dead-letter operation marker does not match source")
+        destination = decoded.get("destination")
+        source_digest = decoded.get("sha256")
+        committed = decoded.get("committed")
+        if (
+            not isinstance(destination, str)
+            or Path(destination).name != destination
+            or destination.startswith(".")
+            or not destination.endswith(".json")
+            or not isinstance(source_digest, str)
+            or len(source_digest) != 64
+            or any(character not in "0123456789abcdef" for character in source_digest)
+            or not isinstance(committed, bool)
+        ):
+            raise ValueError("invalid dead-letter operation destination")
+        return destination, source_digest, committed
+
+    def _decode_operation_marker(self, marker_name: str) -> dict[str, object]:
         descriptor = self._open_record(self._dead_letter, marker_name)
         with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
             try:
@@ -499,21 +629,129 @@ class Spool:
                 raise ValueError("invalid dead-letter operation marker") from error
         if not isinstance(decoded, dict):
             raise ValueError("invalid dead-letter operation marker")
-        if decoded.get("source") != source_name or decoded.get("suffix") != suffix:
-            raise ValueError("dead-letter operation marker does not match source")
-        destination = decoded.get("destination")
-        if (
-            not isinstance(destination, str)
-            or Path(destination).name != destination
-            or destination.startswith(".")
-            or not destination.endswith(".json")
-        ):
-            raise ValueError("invalid dead-letter operation destination")
-        return destination
+        return cast(dict[str, object], decoded)
 
-    def _validate_dead_letter_destination(self, destination: Path) -> None:
+    def _validate_dead_letter_destination(
+        self, destination: Path, expected_digest: str
+    ) -> None:
         descriptor = self._open_record(self._dead_letter, destination.name)
-        os.close(descriptor)
+        try:
+            if self._descriptor_digest(descriptor) != expected_digest:
+                raise ValueError("dead-letter destination does not match operation")
+        finally:
+            os.close(descriptor)
+
+    def _destination_matches_digest(
+        self, destination: Path, expected_digest: str
+    ) -> bool:
+        try:
+            self._validate_dead_letter_destination(destination, expected_digest)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _descriptor_digest(descriptor: int) -> str:
+        original_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+        digest = hashlib.sha256()
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while chunk := os.read(descriptor, 65_536):
+                digest.update(chunk)
+        finally:
+            os.lseek(descriptor, original_offset, os.SEEK_SET)
+        return digest.hexdigest()
+
+    def _recover_pending_links(self) -> None:
+        changed = False
+        for hidden in self.root.glob(".spool-*"):
+            try:
+                hidden_stat = os.lstat(hidden)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(hidden_stat.st_mode) or hidden_stat.st_nlink != 2:
+                continue
+            matches = []
+            for candidate in self.root.glob("*.json"):
+                try:
+                    candidate_stat = os.lstat(candidate)
+                except FileNotFoundError:
+                    continue
+                if (
+                    stat.S_ISREG(candidate_stat.st_mode)
+                    and candidate_stat.st_nlink == 2
+                    and (candidate_stat.st_dev, candidate_stat.st_ino)
+                    == (hidden_stat.st_dev, hidden_stat.st_ino)
+                ):
+                    matches.append(candidate)
+            if len(matches) != 1:
+                continue
+            descriptor = self._open_name(
+                self.root, hidden.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC
+            )
+            try:
+                if self._unlink_open_name(self.root, hidden.name, descriptor):
+                    changed = True
+            finally:
+                os.close(descriptor)
+        if changed:
+            self._fsync_directory(self.root)
+
+    def _recover_dead_letter_links(self) -> None:
+        changed = False
+        for marker_path in self._dead_letter.glob(".deadop-*.json"):
+            decoded = self._decode_operation_marker(marker_path.name)
+            source_name = decoded.get("source")
+            suffix = decoded.get("suffix")
+            destination_name = decoded.get("destination")
+            expected_digest = decoded.get("sha256")
+            committed = decoded.get("committed")
+            if (
+                not isinstance(source_name, str)
+                or Path(source_name).name != source_name
+                or source_name.startswith(".")
+                or not source_name.endswith(".json")
+                or not isinstance(suffix, str)
+                or marker_path.name
+                != f".deadop-{self._operation_id(source_name, suffix)}.json"
+                or not isinstance(destination_name, str)
+                or Path(destination_name).name != destination_name
+                or destination_name.startswith(".")
+                or not destination_name.endswith(".json")
+                or not isinstance(expected_digest, str)
+                or len(expected_digest) != 64
+                or not isinstance(committed, bool)
+            ):
+                raise ValueError("invalid dead-letter operation marker")
+            source = self.root / source_name
+            destination = self._dead_letter / destination_name
+            try:
+                source_stat = os.lstat(source)
+                destination_stat = os.lstat(destination)
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or not stat.S_ISREG(destination_stat.st_mode)
+                or source_stat.st_nlink != 2
+                or destination_stat.st_nlink != 2
+                or (source_stat.st_dev, source_stat.st_ino)
+                != (destination_stat.st_dev, destination_stat.st_ino)
+            ):
+                continue
+            descriptor = self._open_name(
+                self.root, source.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC
+            )
+            try:
+                if self._descriptor_digest(descriptor) != expected_digest:
+                    raise ValueError("dead-letter recovery source does not match marker")
+                if self._unlink_open_name(self.root, source.name, descriptor):
+                    changed = True
+            finally:
+                os.close(descriptor)
+        if changed:
+            self._fsync_directory(self.root)
+            self._fsync_directory(self._dead_letter)
 
     def _cleanup_hidden_artifacts(self) -> None:
         root_prefixes = (".spool-", ".publish-")
@@ -530,21 +768,26 @@ class Spool:
                 self._cleanup_stale_hidden_file(directory, path.name)
 
     def _cleanup_stale_hidden_file(self, directory: Path, name: str) -> bool:
+        if _platform_name() == "nt" and name.startswith(".spool-"):
+            return False
         try:
             descriptor = self._open_name(
-                directory, name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC
+                directory, name, os.O_RDWR | _NOFOLLOW | _CLOEXEC
             )
         except (FileNotFoundError, OSError):
             return False
+        locked = False
         try:
             record_stat = os.fstat(descriptor)
             if not stat.S_ISREG(record_stat.st_mode) or record_stat.st_nlink != 1:
                 return False
             if not self._try_lock_descriptor(descriptor):
                 return False
-            if os.name != "posix":  # pragma: no cover - Windows fallback
-                os.close(descriptor)
+            locked = True
+            if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+                self._close_locked_descriptor(descriptor)
                 descriptor = -1
+                locked = False
                 try:
                     current_stat = os.lstat(directory / name)
                 except FileNotFoundError:
@@ -559,7 +802,10 @@ class Spool:
             return self._unlink_open_name(directory, name, descriptor)
         finally:
             if descriptor >= 0:
-                os.close(descriptor)
+                if locked:
+                    self._close_locked_descriptor(descriptor)
+                else:
+                    os.close(descriptor)
 
     def _acquire_reservation(self, directory: Path, name: str) -> int | None:
         for _ in range(2):
@@ -579,6 +825,8 @@ class Spool:
                 self._fchmod_descriptor(descriptor, directory / name, 0o600)
                 return descriptor
             except BaseException:
+                with suppress(OSError):
+                    self._unlock_descriptor(descriptor)
                 os.close(descriptor)
                 self._unlink_name(directory, name)
                 raise
@@ -589,18 +837,23 @@ class Spool:
     ) -> None:
         if descriptor is None:
             return
-        if os.name != "posix":  # pragma: no cover - Windows fallback
-            os.close(descriptor)
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+            self._close_locked_descriptor(descriptor)
             self._unlink_name(directory, name)
             return
         try:
             self._unlink_name(directory, name)
         finally:
-            os.close(descriptor)
+            self._close_locked_descriptor(descriptor)
 
     @staticmethod
     def _lock_descriptor(descriptor: int) -> None:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() == "nt":  # pragma: no cover - exercised through seam
+            Spool._ensure_lock_byte(descriptor)
+            locking = _windows_locking()
+            locking.locking(descriptor, locking.LK_LOCK, 1)
+            return
+        if _platform_name() != "posix":  # pragma: no cover - conservative fallback
             return
         import fcntl
 
@@ -608,8 +861,18 @@ class Spool:
 
     @staticmethod
     def _try_lock_descriptor(descriptor: int) -> bool:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() == "nt":  # pragma: no cover - exercised through seam
+            Spool._ensure_lock_byte(descriptor)
+            locking = _windows_locking()
+            try:
+                locking.locking(descriptor, locking.LK_NBLCK, 1)
+            except OSError as error:
+                if error.errno in _LOCK_BUSY_ERRORS:
+                    return False
+                raise
             return True
+        if _platform_name() != "posix":  # pragma: no cover - conservative fallback
+            return False
         import fcntl
 
         try:
@@ -619,8 +882,35 @@ class Spool:
         return True
 
     @staticmethod
+    def _unlock_descriptor(descriptor: int) -> None:
+        if _platform_name() == "nt":  # pragma: no cover - exercised through seam
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            locking = _windows_locking()
+            locking.locking(descriptor, locking.LK_UNLCK, 1)
+            return
+        if _platform_name() != "posix":  # pragma: no cover - conservative fallback
+            return
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _ensure_lock_byte(descriptor: int) -> None:
+        if os.fstat(descriptor).st_size == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+
+    @staticmethod
+    def _close_locked_descriptor(descriptor: int) -> None:
+        try:
+            Spool._unlock_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
     def _name_exists(directory: Path, name: str) -> bool:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             return (directory / name).exists()
         descriptor = os.open(directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
         try:
@@ -635,7 +925,7 @@ class Spool:
     @staticmethod
     def _open_name_matches(directory: Path, name: str, opened_descriptor: int) -> bool:
         opened_stat = os.fstat(opened_descriptor)
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             try:
                 current_stat = os.lstat(directory / name)
             except FileNotFoundError:
@@ -663,7 +953,7 @@ class Spool:
     @staticmethod
     def _unlink_open_name(directory: Path, name: str, opened_descriptor: int) -> bool:
         opened_stat = os.fstat(opened_descriptor)
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             try:
                 current_stat = os.lstat(directory / name)
             except FileNotFoundError:
@@ -708,7 +998,7 @@ class Spool:
 
     @staticmethod
     def _open_name(directory: Path, name: str, flags: int, mode: int = 0o600) -> int:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             return os.open(directory / name, flags, mode)
         descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC)
         try:
@@ -716,11 +1006,85 @@ class Spool:
         finally:
             os.close(descriptor)
 
+    def _publish_noreplace(
+        self,
+        source_directory: Path,
+        source_name: str,
+        destination_directory: Path,
+        destination_name: str,
+    ) -> None:
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
+            os.rename(
+                source_directory / source_name,
+                destination_directory / destination_name,
+            )
+            return
+
+        source_fd = os.open(
+            source_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
+        )
+        destination_fd = os.open(
+            destination_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
+        )
+        try:
+            if sys.platform.startswith("linux") and self._linux_rename_noreplace(
+                source_fd, source_name, destination_fd, destination_name
+            ):
+                return
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(source_name, dir_fd=source_fd)
+        finally:
+            os.close(destination_fd)
+            os.close(source_fd)
+
+    @staticmethod
+    def _linux_rename_noreplace(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> bool:
+        libc = CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError:
+            return False
+        renameat2.argtypes = [c_int, c_char_p, c_int, c_char_p, c_int]
+        renameat2.restype = c_int
+        result = renameat2(
+            source_fd,
+            os.fsencode(source_name),
+            destination_fd,
+            os.fsencode(destination_name),
+            _RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return True
+        error_number = get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(
+                error_number, os.strerror(error_number), destination_name
+            )
+        if error_number in {
+            errno.ENOSYS,
+            errno.EINVAL,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }:
+            return False
+        raise OSError(error_number, os.strerror(error_number), source_name)
+
     @staticmethod
     def _replace_name(
         source_directory: Path, source_name: str, destination_directory: Path, destination_name: str
     ) -> None:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             os.replace(source_directory / source_name, destination_directory / destination_name)
             return
         source_fd = os.open(
@@ -739,7 +1103,7 @@ class Spool:
 
     @staticmethod
     def _unlink_name(directory: Path, name: str) -> None:
-        if os.name != "posix":  # pragma: no cover - Windows fallback
+        if _platform_name() != "posix":  # pragma: no cover - Windows fallback
             with suppress(FileNotFoundError):
                 (directory / name).unlink()
             return
