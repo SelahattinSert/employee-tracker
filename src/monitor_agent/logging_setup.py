@@ -183,12 +183,22 @@ class SecretFilter(logging.Filter):
 
         def redact_bearer(match: re.Match[str]) -> str:
             markers = list(_ACTIVE_MARKER_PATTERN.finditer(match.group(2)))
+            argument_markers = [
+                marker
+                for marker in markers
+                if (
+                    active[int(marker.group("index"))].argument_index is not None
+                    or active[int(marker.group("index"))].key is not None
+                )
+            ]
             bearer_conversions.update(
-                int(marker.group("index")) for marker in markers
+                int(marker.group("index")) for marker in argument_markers
             )
-            if not markers:
+            if not argument_markers:
                 return f"{match.group(1)}{_REDACTED}"
-            return match.group(1) + "".join(marker.group(0) for marker in markers)
+            return match.group(1) + "".join(
+                marker.group(0) for marker in argument_markers
+            )
 
         marked = _BEARER_PATTERN.sub(redact_bearer, marked)
         marked = self._redact_secrets_preserving_markers(marked)

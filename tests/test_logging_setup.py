@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -38,13 +38,14 @@ def config(tmp_path: Path, **values: str) -> AgentConfig:
 
 
 def record(message: str, args: object = ()) -> logging.LogRecord:
+    log_args = (args,) if isinstance(args, Mapping) else args
     return logging.LogRecord(
         "monitor_agent.worker",
         logging.INFO,
         __file__,
         1,
         message,
-        args,  # type: ignore[arg-type]
+        log_args,  # type: ignore[arg-type]
         None,
     )
 
@@ -143,6 +144,47 @@ def test_secret_filter_preserves_percent_escape_when_formatting_is_active() -> N
     assert item.msg == "progress=100%% state=%s"
     assert item.args == ("ready",)
     assert item.getMessage() == "progress=100% state=ready"
+
+
+def test_secret_filter_masks_bearer_percent_escape_after_active_placeholder() -> None:
+    item = record(
+        "state=%s Authorization: Bearer %%token",
+        ("ready",),
+    )
+
+    SecretFilter([]).filter(item)
+
+    assert item.msg == "state=%s Authorization: Bearer [REDACTED]"
+    assert item.args == ("ready",)
+    assert item.getMessage() == "state=ready Authorization: Bearer [REDACTED]"
+
+
+def test_secret_filter_discards_bearer_percent_escape_before_placeholder() -> None:
+    item = record(
+        "state=%s Authorization: Bearer %%%s",
+        ("ready", "credential"),
+    )
+
+    SecretFilter([]).filter(item)
+
+    assert item.msg == "state=%s Authorization: Bearer %s"
+    assert item.args == ("ready", "[REDACTED]")
+    assert item.getMessage() == "state=ready Authorization: Bearer [REDACTED]"
+
+
+def test_secret_filter_preserves_unrelated_percent_escape_with_mapping_formatting() -> None:
+    item = record(
+        "progress=100%% state=%(state)s Authorization: Bearer %%token",
+        {"state": "ready"},
+    )
+
+    SecretFilter([]).filter(item)
+
+    assert item.msg == "progress=100%% state=%(state)s Authorization: Bearer [REDACTED]"
+    assert item.args == {"state": "ready"}
+    assert item.getMessage() == (
+        "progress=100% state=ready Authorization: Bearer [REDACTED]"
+    )
 
 
 def test_secret_filter_masks_empty_secret_positional_bearer_after_placeholder() -> None:
