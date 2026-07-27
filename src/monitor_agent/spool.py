@@ -88,10 +88,12 @@ class Spool:
                 destination = self._publish_staged(temporary, name)
             except BaseException:
                 try:
-                    if descriptor >= 0:
-                        self._close_locked_descriptor_with_retry(descriptor)
-                    if temporary is not None:
-                        self._unlink_name(self.root, temporary.name)
+                    try:
+                        if descriptor >= 0:
+                            self._close_locked_descriptor_with_retry(descriptor)
+                    finally:
+                        if temporary is not None:
+                            self._unlink_name(self.root, temporary.name)
                 except BaseException:
                     pass
                 finally:

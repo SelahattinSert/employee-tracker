@@ -161,6 +161,42 @@ def test_enqueue_cleans_temporary_file_when_atomic_publish_fails(
     assert not list(tmp_path.glob("*.json"))
 
 
+def test_enqueue_cleanup_unlinks_temp_when_staged_descriptor_close_retry_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    original_close = spool._close_locked_descriptor
+    staged_descriptor: int | None = None
+    close_attempts = 0
+
+    monkeypatch.setattr(
+        spool,
+        "_publish_staged",
+        lambda *args: (_ for _ in ()).throw(OSError("publish failed")),
+    )
+
+    def fail_staged_close_twice(descriptor: int) -> None:
+        nonlocal staged_descriptor, close_attempts
+        if staged_descriptor is None:
+            staged_descriptor = descriptor
+            close_attempts += 1
+            original_close(descriptor)
+            raise OSError("staged close failed")
+        if descriptor == staged_descriptor:
+            close_attempts += 1
+            raise OSError("staged close retry failed")
+        original_close(descriptor)
+
+    monkeypatch.setattr(spool, "_close_locked_descriptor", fail_staged_close_twice)
+
+    with pytest.raises(OSError, match="publish failed"):
+        spool.enqueue(payload(event(1)))
+
+    assert close_attempts == 2
+    assert not list(tmp_path.glob(".spool-*.tmp"))
+    assert spool._artifact_guards == {}
+
+
 def test_enqueue_preserves_an_existing_name_with_a_collision_suffix(tmp_path: Path) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
