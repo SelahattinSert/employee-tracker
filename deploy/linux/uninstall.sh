@@ -60,5 +60,7 @@ if [ "$purge" -eq 1 ]; then
     rm -rf -- /etc/monitor-agent /var/lib/monitor-agent
 fi
 
-systemctl daemon-reload
+if ! systemctl daemon-reload; then
+    fail "monitor-agent uninstall: unable to reload service manager"
+fi
 printf '%s\n' "monitor-agent uninstall: service removed"

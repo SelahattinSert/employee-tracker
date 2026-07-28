@@ -258,6 +258,15 @@ cleanup_artifacts() {
     [ "$artifact_cleanup_failed" -eq 0 ]
 }
 
+restore_regular_file() {
+    backup_file=$1
+    live_file=$2
+    if [ -d "$live_file" ] && [ ! -L "$live_file" ]; then
+        rmdir -- "$live_file" || return 1
+    fi
+    mv -fT -- "$backup_file" "$live_file"
+}
+
 cleanup() {
     original_status=$?
     trap - EXIT
@@ -266,18 +275,28 @@ cleanup() {
 
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
         if [ "$environment_mutation_armed" -eq 1 ]; then
-            rm -rf -- "$config_file" || rollback_failed=1
             if [ "$had_environment" -eq 1 ] && [ -f "$environment_backup" ]; then
-                mv -fT -- "$environment_backup" "$config_file" ||
+                restore_regular_file "$environment_backup" "$config_file" ||
                     rollback_failed=1
-                environment_backup=
+                if [ "$rollback_failed" -eq 0 ]; then
+                    environment_backup=
+                fi
+            elif [ "$had_environment" -eq 0 ]; then
+                rm -f -- "$config_file" || rollback_failed=1
+            else
+                rollback_failed=1
             fi
         fi
         if [ "$unit_mutation_armed" -eq 1 ]; then
-            rm -rf -- "$unit_file" || rollback_failed=1
             if [ "$had_unit" -eq 1 ] && [ -f "$unit_backup" ]; then
-                mv -fT -- "$unit_backup" "$unit_file" || rollback_failed=1
-                unit_backup=
+                restore_regular_file "$unit_backup" "$unit_file" || rollback_failed=1
+                if [ "$rollback_failed" -eq 0 ]; then
+                    unit_backup=
+                fi
+            elif [ "$had_unit" -eq 0 ]; then
+                rm -f -- "$unit_file" || rollback_failed=1
+            else
+                rollback_failed=1
             fi
         fi
 
@@ -285,9 +304,12 @@ cleanup() {
             [ -n "$transaction_dir" ] &&
             [ -d "$transaction_dir/previous-runtime" ]
         then
-            rm -rf -- "$install_dir" || rollback_failed=1
-            mv -T -- "$transaction_dir/previous-runtime" "$install_dir" ||
+            if rm -rf -- "$install_dir"; then
+                mv -T -- "$transaction_dir/previous-runtime" "$install_dir" ||
+                    rollback_failed=1
+            else
                 rollback_failed=1
+            fi
         elif [ "$had_runtime" -eq 0 ] &&
             [ -n "$staged_runtime" ] &&
             [ ! -e "$staged_runtime" ]
@@ -300,21 +322,26 @@ cleanup() {
         fi
     fi
 
-    cleanup_artifacts || rollback_failed=1
-
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
-        for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
-            if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
-                chmod "${dir_modes[$index]:-}" -- "${managed_mode_dirs[$index]:-}" ||
-                    rollback_failed=1
-            elif [ -n "${managed_cleanup_dirs[$index]:-}" ]; then
-                rm -rf -- "${managed_cleanup_dirs[$index]}" || rollback_failed=1
-            fi
-        done
+        if [ "$rollback_failed" -eq 0 ]; then
+            cleanup_artifacts || rollback_failed=1
+        fi
+        if [ "$rollback_failed" -eq 0 ]; then
+            for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
+                if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
+                    chmod "${dir_modes[$index]:-}" -- "${managed_mode_dirs[$index]:-}" ||
+                        rollback_failed=1
+                elif [ -n "${managed_cleanup_dirs[$index]:-}" ]; then
+                    rm -rf -- "${managed_cleanup_dirs[$index]}" || rollback_failed=1
+                fi
+            done
+        fi
         printf '%s\n' "monitor-agent install: installation failed" >&2
         if [ "$rollback_failed" -ne 0 ]; then
             printf '%s\n' "monitor-agent install: rollback failed" >&2
         fi
+    elif [ "$original_status" -ne 0 ]; then
+        cleanup_artifacts || true
     fi
     exit "$original_status"
 }
@@ -327,7 +354,8 @@ for index in "${!managed_dirs[@]}"; do
     fi
 done
 
-chmod 0700 -- "$config_dir" "$state_dir"
+chmod 0700 -- "$config_dir"
+chmod 0700 -- "$state_dir"
 
 transaction_dir=$(mktemp -d -- "$opt_parent/.monitor-agent-install.XXXXXX")
 staged_runtime="$transaction_dir/runtime"
