@@ -241,18 +241,33 @@ restore_service_state() {
 }
 
 cleanup_artifacts() {
+    quiet=${1:-0}
     artifact_cleanup_failed=0
+    remove_artifact() {
+        if [ "$quiet" -eq 1 ]; then
+            rm -f -- "$1" >/dev/null 2>&1
+        else
+            rm -f -- "$1"
+        fi
+    }
+    remove_transaction() {
+        if [ "$quiet" -eq 1 ]; then
+            rm -rf -- "$1" >/dev/null 2>&1
+        else
+            rm -rf -- "$1"
+        fi
+    }
     for temporary in \
         "$environment_stage" \
         "$environment_backup" \
         "$unit_stage" \
         "$unit_backup"
     do
-        if [ -n "$temporary" ] && ! rm -f -- "$temporary"; then
+        if [ -n "$temporary" ] && ! remove_artifact "$temporary"; then
             artifact_cleanup_failed=1
         fi
     done
-    if [ -n "$transaction_dir" ] && ! rm -rf -- "$transaction_dir"; then
+    if [ -n "$transaction_dir" ] && ! remove_transaction "$transaction_dir"; then
         artifact_cleanup_failed=1
     fi
     [ "$artifact_cleanup_failed" -eq 0 ]
@@ -262,9 +277,9 @@ restore_regular_file() {
     backup_file=$1
     live_file=$2
     if [ -d "$live_file" ] && [ ! -L "$live_file" ]; then
-        rmdir -- "$live_file" || return 1
+        rmdir -- "$live_file" >/dev/null 2>&1 || return 1
     fi
-    mv -fT -- "$backup_file" "$live_file"
+    mv -fT -- "$backup_file" "$live_file" >/dev/null 2>&1
 }
 
 cleanup() {
@@ -276,25 +291,26 @@ cleanup() {
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
         if [ "$environment_mutation_armed" -eq 1 ]; then
             if [ "$had_environment" -eq 1 ] && [ -f "$environment_backup" ]; then
-                restore_regular_file "$environment_backup" "$config_file" ||
-                    rollback_failed=1
-                if [ "$rollback_failed" -eq 0 ]; then
+                if restore_regular_file "$environment_backup" "$config_file"; then
                     environment_backup=
+                else
+                    rollback_failed=1
                 fi
             elif [ "$had_environment" -eq 0 ]; then
-                rm -f -- "$config_file" || rollback_failed=1
+                rm -f -- "$config_file" >/dev/null 2>&1 || rollback_failed=1
             else
                 rollback_failed=1
             fi
         fi
         if [ "$unit_mutation_armed" -eq 1 ]; then
             if [ "$had_unit" -eq 1 ] && [ -f "$unit_backup" ]; then
-                restore_regular_file "$unit_backup" "$unit_file" || rollback_failed=1
-                if [ "$rollback_failed" -eq 0 ]; then
+                if restore_regular_file "$unit_backup" "$unit_file"; then
                     unit_backup=
+                else
+                    rollback_failed=1
                 fi
             elif [ "$had_unit" -eq 0 ]; then
-                rm -f -- "$unit_file" || rollback_failed=1
+                rm -f -- "$unit_file" >/dev/null 2>&1 || rollback_failed=1
             else
                 rollback_failed=1
             fi
@@ -304,8 +320,8 @@ cleanup() {
             [ -n "$transaction_dir" ] &&
             [ -d "$transaction_dir/previous-runtime" ]
         then
-            if rm -rf -- "$install_dir"; then
-                mv -T -- "$transaction_dir/previous-runtime" "$install_dir" ||
+            if rm -rf -- "$install_dir" >/dev/null 2>&1; then
+                mv -T -- "$transaction_dir/previous-runtime" "$install_dir" >/dev/null 2>&1 ||
                     rollback_failed=1
             else
                 rollback_failed=1
@@ -314,7 +330,7 @@ cleanup() {
             [ -n "$staged_runtime" ] &&
             [ ! -e "$staged_runtime" ]
         then
-            rm -rf -- "$install_dir" || rollback_failed=1
+            rm -rf -- "$install_dir" >/dev/null 2>&1 || rollback_failed=1
         fi
 
         if [ "$activation_rollback_armed" -eq 1 ]; then
@@ -324,18 +340,17 @@ cleanup() {
 
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
         if [ "$rollback_failed" -eq 0 ]; then
-            cleanup_artifacts || rollback_failed=1
+            cleanup_artifacts 1 || rollback_failed=1
         fi
-        if [ "$rollback_failed" -eq 0 ]; then
-            for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
-                if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
-                    chmod "${dir_modes[$index]:-}" -- "${managed_mode_dirs[$index]:-}" ||
-                        rollback_failed=1
-                elif [ -n "${managed_cleanup_dirs[$index]:-}" ]; then
-                    rm -rf -- "${managed_cleanup_dirs[$index]}" || rollback_failed=1
-                fi
-            done
-        fi
+        for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
+            if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
+                chmod "${dir_modes[$index]:-}" -- "${managed_mode_dirs[$index]:-}" \
+                    >/dev/null 2>&1 || rollback_failed=1
+            elif [ -d "${managed_cleanup_dirs[$index]:-}" ] &&
+                [ ! -L "${managed_cleanup_dirs[$index]:-}" ]; then
+                rmdir -- "${managed_cleanup_dirs[$index]}" >/dev/null 2>&1 || rollback_failed=1
+            fi
+        done
         printf '%s\n' "monitor-agent install: installation failed" >&2
         if [ "$rollback_failed" -ne 0 ]; then
             printf '%s\n' "monitor-agent install: rollback failed" >&2

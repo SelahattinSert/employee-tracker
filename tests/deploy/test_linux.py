@@ -97,6 +97,11 @@ ALLOWED_RECURSIVE_DELETIONS = [
     ("rm", "-rf", "--", "/etc/monitor-agent", "/var/lib/monitor-agent"),
 ]
 
+ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS = {
+    "if active_state=$(systemctl is-active -- monitor-agent.service 2>/dev/null); then",
+    "if enabled_state=$(systemctl is-enabled -- monitor-agent.service 2>/dev/null); then",
+}
+
 
 def _replace_once(text: str, expected: str, replacement: str) -> str:
     assert text.count(expected) == 1, expected
@@ -236,7 +241,9 @@ def _assert_recursive_deletion_policy(text: str) -> None:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if ("$(" in line or "`" in line) and "rm" in line:
+        if "`" in line:
+            raise ValueError("invalid shell")
+        if "$(" in line and line not in ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS:
             raise ValueError("invalid shell")
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", line):
             _, _, assigned_value = line.partition("=")
@@ -478,6 +485,17 @@ if [ "${FAKE_FAIL_STAGE:-}" = "directory-mode" ] \
     : > "$FAKE_FAILURE_MARKER"
     exit 86
 fi
+if [ "${FAKE_RESTORE_FAILURE:-}" = "directory-mode" ] \
+    && [ "$destination" = "$FAKE_STATE_DIR" ] \
+    && [ -e "$FAKE_FAILURE_MARKER" ] \
+    && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
+    : > "$FAKE_RESTORE_MARKER"
+    if [ "${FAKE_NATIVE_NOISE:-0}" = 1 ]; then
+        printf 'native stdout %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL"
+        printf 'native stderr %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL" >&2
+    fi
+    exit 87
+fi
 exec /usr/bin/chmod "$@"
 """,
         )
@@ -490,6 +508,13 @@ printf ' <%s>' "$@" >> "$FAKE_COMMAND_LOG"
 printf '\n' >> "$FAKE_COMMAND_LOG"
 destination="${!#}"
 source="${@: -2:1}"
+emit_native_failure() {
+    if [ "${FAKE_NATIVE_NOISE:-0}" != 1 ]; then
+        return
+    fi
+    printf 'native stdout %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL"
+    printf 'native stderr %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL" >&2
+}
 stage=
 if [[ "$destination" = */opt/monitor-agent || "$destination" = */monitor-agent ]] \
     && [ "$(basename -- "$source")" = "runtime" ]; then
@@ -529,12 +554,14 @@ case "${FAKE_RESTORE_FAILURE:-}" in
     runtime)
         if [[ "$source" = */previous-runtime ]] && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
             : > "$FAKE_RESTORE_MARKER"
+            emit_native_failure
             exit 88
         fi
         ;;
     environment)
         if [[ "$source" = */.monitor-agent.env.backup.* ]] && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
             : > "$FAKE_RESTORE_MARKER"
+            emit_native_failure
             exit 89
         fi
         ;;
@@ -542,6 +569,7 @@ case "${FAKE_RESTORE_FAILURE:-}" in
         if [[ "$source" = */.monitor-agent.service.backup.* ]] \
             && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
             : > "$FAKE_RESTORE_MARKER"
+            emit_native_failure
             exit 89
         fi
         ;;
@@ -557,6 +585,13 @@ printf 'rm' >> "$FAKE_COMMAND_LOG"
 printf ' <%s>' "$@" >> "$FAKE_COMMAND_LOG"
 printf '\n' >> "$FAKE_COMMAND_LOG"
 cleanup_stage=
+emit_native_failure() {
+    if [ "${FAKE_NATIVE_NOISE:-0}" != 1 ]; then
+        return
+    fi
+    printf 'native stdout %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL"
+    printf 'native stderr %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL" >&2
+}
 case " $* " in
     *".monitor-agent.env.backup."*)
         cleanup_stage=cleanup-environment-backup
@@ -571,7 +606,16 @@ esac
 if [ -n "$cleanup_stage" ] && [ "${FAKE_FAIL_STAGE:-}" = "$cleanup_stage" ] \
     && [ ! -e "$FAKE_FAILURE_MARKER" ]; then
     : > "$FAKE_FAILURE_MARKER"
+    emit_native_failure
     exit 90
+fi
+if [ "${FAKE_RESTORE_FAILURE:-}" = "artifact-removal" ] \
+    && [ "$cleanup_stage" = "cleanup-transaction" ] \
+    && [ -e "$FAKE_FAILURE_MARKER" ] \
+    && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
+    : > "$FAKE_RESTORE_MARKER"
+    emit_native_failure
+    exit 91
 fi
 if [ "${FAKE_SWAP_TRIGGER:-}" = "success-cleanup" ] \
     && [ "$cleanup_stage" = "cleanup-transaction" ] \
@@ -598,6 +642,28 @@ exec /usr/bin/rm "$@"
 """,
         )
         _write_executable(
+            self.fake_bin / "rmdir",
+            """#!/usr/bin/env bash
+set -eu
+printf 'rmdir' >> "$FAKE_COMMAND_LOG"
+printf ' <%s>' "$@" >> "$FAKE_COMMAND_LOG"
+printf '\n' >> "$FAKE_COMMAND_LOG"
+destination="${!#}"
+if [ "${FAKE_RESTORE_FAILURE:-}" = "directory-removal" ] \
+    && [ "$destination" = "$FAKE_DIRECTORY_REMOVAL_TARGET" ] \
+    && [ -e "$FAKE_FAILURE_MARKER" ] \
+    && [ ! -e "$FAKE_RESTORE_MARKER" ]; then
+    : > "$FAKE_RESTORE_MARKER"
+    if [ "${FAKE_NATIVE_NOISE:-0}" = 1 ]; then
+        printf 'native stdout %s %s\\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL"
+        printf 'native stderr %s %s\\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL" >&2
+    fi
+    exit 92
+fi
+exec /usr/bin/rmdir "$@"
+""",
+        )
+        _write_executable(
             self.fake_bin / "systemctl",
             """#!/usr/bin/env bash
 set -eu
@@ -616,6 +682,13 @@ fail_once() {
         return 0
     fi
     return 1
+}
+emit_native_failure() {
+    if [ "${FAKE_NATIVE_NOISE:-0}" != 1 ]; then
+        return
+    fi
+    printf 'native stdout %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL"
+    printf 'native stderr %s %s\n' "$FAKE_ROLLBACK_NOISE_PATH" "$FAKE_NATIVE_SENTINEL" >&2
 }
 swap_path() {
     if [ "${FAKE_SWAP_TRIGGER:-}" = "service-state" ] \
@@ -713,8 +786,11 @@ case "${1-}" in
         save
         ;;
     stop)
-        if [ "${FAKE_FAIL_STAGE:-}" = "rollback-stop" ] \
+        if { [ "${FAKE_FAIL_STAGE:-}" = "rollback-stop" ] \
+                || [ "${FAKE_RESTORE_FAILURE:-}" = "service" ]; } \
             && [ -e "$FAKE_FAILURE_MARKER" ]; then
+            : > "$FAKE_RESTORE_MARKER"
+            emit_native_failure
             exit 82
         fi
         active=0
@@ -774,6 +850,7 @@ esac
             mode_fail_target = str(self.config.parent)
         elif failure == "state-mode":
             mode_fail_target = str(self.state_dir)
+        noise_path = self.tmp_path / "randomized-transaction-path"
         return {
             **os.environ,
             "PATH": f"{self.fake_bin}:/usr/bin:/bin",
@@ -796,6 +873,11 @@ esac
             "FAKE_SWAP_MARKER": str(swap_marker),
             "FAKE_RESTORE_MARKER": str(self.tmp_path / "restore.marker"),
             "FAKE_RESTORE_FAILURE": "",
+            "FAKE_NATIVE_SENTINEL": "native-failure-token",
+            "FAKE_NATIVE_NOISE": "0",
+            "FAKE_ROLLBACK_NOISE_PATH": str(noise_path),
+            "FAKE_DIRECTORY_REMOVAL_TARGET": str(self.state_dir),
+            "FAKE_STATE_DIR": str(self.state_dir),
             "FAKE_PUBLICATION_SWAP": publication_swap,
             "FAKE_DIRECTORY_FAIL_TARGET": directory_fail_target,
             "FAKE_MODE_FAIL_TARGET": mode_fail_target,
@@ -824,6 +906,8 @@ esac
             publication_swap=publication_swap,
         )
         environment["FAKE_RESTORE_FAILURE"] = restore_failure
+        if restore_failure:
+            environment["FAKE_NATIVE_NOISE"] = "1"
         return _run(
             self.linux / "install.sh",
             self.wheel,
@@ -1183,6 +1267,61 @@ def test_failed_rollback_retains_recoverable_artifacts(
 
 
 @pytest.mark.parametrize(
+    "restore_failure",
+    ["runtime", "environment", "unit", "service"],
+)
+def test_failed_restoration_keeps_prior_modes_and_recovery_material(
+    tmp_path: Path,
+    restore_failure: str,
+) -> None:
+    active = restore_failure != "service"
+    harness = Harness(tmp_path, existing=True, active=active, enabled=True)
+    prior_config_mode = stat.S_IMODE(harness.config.parent.stat().st_mode)
+    prior_state_mode = stat.S_IMODE(harness.state_dir.stat().st_mode)
+    result = harness.install(
+        failure="restart",
+        restore_failure=restore_failure,
+    )
+    assert result.returncode != 0
+    assert (tmp_path / "restore.marker").exists()
+    assert stat.S_IMODE(harness.config.parent.stat().st_mode) == prior_config_mode
+    assert stat.S_IMODE(harness.state_dir.stat().st_mode) == prior_state_mode
+    assert len(list((harness.stage / "opt").glob(".monitor-agent-install.*"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "restore_failure", "existing"),
+    [
+        ("restart", "runtime", True),
+        ("restart", "artifact-removal", True),
+        ("restart", "environment", True),
+        ("restart", "unit", True),
+        ("restart", "service", True),
+        ("restart", "directory-mode", True),
+        ("restart", "directory-removal", False),
+    ],
+)
+def test_rollback_failure_output_is_fixed_and_never_leaks_native_diagnostics(
+    tmp_path: Path,
+    failure: str,
+    restore_failure: str,
+    existing: bool,
+) -> None:
+    active = existing and restore_failure != "service"
+    harness = Harness(tmp_path, existing=existing, active=active, enabled=existing)
+    result = harness.install(failure=failure, restore_failure=restore_failure)
+    assert result.returncode != 0
+    assert (tmp_path / "restore.marker").exists()
+    assert result.stdout == ""
+    assert result.stderr == (
+        "monitor-agent install: installation failed\n"
+        "monitor-agent install: rollback failed\n"
+    )
+    assert "native-failure-token" not in result.stdout + result.stderr
+    assert "randomized-transaction-path" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
     ("active", "enabled"),
     [(True, True), (False, True), (True, False), (False, False)],
 )
@@ -1425,6 +1564,11 @@ def test_copied_uninstaller_rejects_invalid_arguments(
         "result=$(rm -r -- /tmp/third)",
         "result=`rm -R -- /tmp/third`",
         "wrapper $(command rm -rf -- /tmp/third)",
+        'result=$(r""m -r -- /tmp/third)',
+        "result=$(outer=$(rm -r -- /tmp/third))",
+        'wrapper "$(rm -r -- /tmp/third)"',
+        "result=`r\"\"m -R -- /tmp/third`",
+        'result=$(tool=r""m; "$tool" -r -- /tmp/third)',
     ],
 )
 def test_recursive_deletion_policy_helper_rejects_mutants(mutant: str) -> None:
