@@ -6,35 +6,8 @@ fail() {
     exit "${2:-1}"
 }
 
-test_mode=${MONITOR_AGENT_TEST_MODE:-}
-requested_root=${MONITOR_AGENT_TEST_ROOT:-}
-
-if [ "$EUID" -eq 0 ]; then
-    if [ -n "$test_mode" ] || [ -n "$requested_root" ]; then
-        fail "monitor-agent install: staging root forbidden for root" 2
-    fi
-    root_prefix=
-    root_anchor=
-elif [ "$test_mode" != 1 ]; then
+if [ "$EUID" -ne 0 ]; then
     fail "monitor-agent install: root privileges required" 2
-else
-    if [ -z "$requested_root" ] ||
-        [ "${requested_root#/}" = "$requested_root" ] ||
-        [ ! -d "$requested_root" ] ||
-        [ -L "$requested_root" ]
-    then
-        fail "monitor-agent install: invalid staging root"
-    fi
-    root_prefix=$(realpath -e -- "$requested_root") ||
-        fail "monitor-agent install: invalid staging root"
-    if [ "$root_prefix" = "/" ] ||
-        [ "$(stat -c '%u' -- "$root_prefix")" -ne "$EUID" ]
-    then
-        fail "monitor-agent install: invalid staging root"
-    fi
-    exec {root_fd}<"$root_prefix" ||
-        fail "monitor-agent install: invalid staging root"
-    root_anchor="/proc/$$/fd/$root_fd"
 fi
 
 if [ "$#" -ne 2 ]; then
@@ -92,17 +65,17 @@ case "$minor" in
         ;;
 esac
 
-install_dir="$root_anchor/opt/monitor-agent"
-opt_parent="$root_anchor/opt"
-etc_parent="$root_anchor/etc"
-config_dir="$root_anchor/etc/monitor-agent"
-etc_systemd_dir="$root_anchor/etc/systemd"
-unit_dir="$root_anchor/etc/systemd/system"
-config_file="$config_dir/monitor-agent.env"
-var_parent="$root_anchor/var"
-var_lib_dir="$root_anchor/var/lib"
-state_dir="$root_anchor/var/lib/monitor-agent"
-unit_file="$unit_dir/monitor-agent.service"
+install_dir=/opt/monitor-agent
+opt_parent=/opt
+etc_parent=/etc
+config_dir=/etc/monitor-agent
+etc_systemd_dir=/etc/systemd
+unit_dir=/etc/systemd/system
+config_file=/etc/monitor-agent/monitor-agent.env
+var_parent=/var
+var_lib_dir=/var/lib
+state_dir=/var/lib/monitor-agent
+unit_file=/etc/systemd/system/monitor-agent.service
 
 managed_dirs=(
     "$opt_parent"
@@ -117,31 +90,21 @@ managed_dirs=(
 managed_modes=(0755 0755 0700 0755 0755 0755 0755 0700)
 dir_existed=()
 dir_modes=()
-dir_fds=()
 
 for index in "${!managed_dirs[@]}"; do
     directory=${managed_dirs[$index]}
     if [ -L "$directory" ]; then
-        if [ "$test_mode" = 1 ]; then
-            fail "monitor-agent install: invalid staging root"
-        fi
         fail "monitor-agent install: invalid install target"
     fi
     if [ -d "$directory" ]; then
         dir_existed[index]=1
         dir_modes[index]=$(stat -c '%a' -- "$directory") ||
             fail "monitor-agent install: unable to inspect install target"
-        if [ "$test_mode" = 1 ]; then
-            exec {directory_fd}<"$directory" ||
-                fail "monitor-agent install: unable to inspect install target"
-            dir_fds[index]=$directory_fd
-        fi
     elif [ -e "$directory" ]; then
         fail "monitor-agent install: invalid install target"
     else
         dir_existed[index]=0
         dir_modes[index]=
-        dir_fds[index]=
     fi
 done
 
@@ -221,61 +184,8 @@ prior_active=$observed_active
 prior_enabled=$observed_enabled
 prior_absent=$observed_enabled_absent
 
-for index in "${!managed_dirs[@]}"; do
-    directory=${managed_dirs[$index]}
-    if [ "${dir_existed[$index]}" -eq 0 ]; then
-        install -d -m "${managed_modes[$index]}" -- "$directory"
-    fi
-    if [ "$test_mode" = 1 ] && [ -z "${dir_fds[$index]}" ]; then
-        exec {directory_fd}<"$directory" ||
-            fail "monitor-agent install: unable to inspect install target"
-        dir_fds[index]=$directory_fd
-    fi
-done
-
 managed_cleanup_dirs=("${managed_dirs[@]}")
 managed_mode_dirs=("${managed_dirs[@]}")
-if [ "$test_mode" = 1 ]; then
-    opt_anchor="/proc/$$/fd/${dir_fds[0]}"
-    etc_anchor="/proc/$$/fd/${dir_fds[1]}"
-    config_anchor="/proc/$$/fd/${dir_fds[2]}"
-    etc_systemd_anchor="/proc/$$/fd/${dir_fds[3]}"
-    unit_anchor="/proc/$$/fd/${dir_fds[4]}"
-    var_anchor="/proc/$$/fd/${dir_fds[5]}"
-    var_lib_anchor="/proc/$$/fd/${dir_fds[6]}"
-    state_anchor="/proc/$$/fd/${dir_fds[7]}"
-
-    managed_cleanup_dirs=(
-        "$root_anchor/opt"
-        "$root_anchor/etc"
-        "$etc_anchor/monitor-agent"
-        "$etc_anchor/systemd"
-        "$etc_systemd_anchor/system"
-        "$root_anchor/var"
-        "$var_anchor/lib"
-        "$var_lib_anchor/monitor-agent"
-    )
-    managed_mode_dirs=(
-        "$opt_anchor"
-        "$etc_anchor"
-        "$config_anchor"
-        "$etc_systemd_anchor"
-        "$unit_anchor"
-        "$var_anchor"
-        "$var_lib_anchor"
-        "$state_anchor"
-    )
-
-    opt_parent=$opt_anchor
-    config_dir=$config_anchor
-    unit_dir=$unit_anchor
-    state_dir=$state_anchor
-    install_dir="$opt_anchor/monitor-agent"
-    config_file="$config_anchor/monitor-agent.env"
-    unit_file="$unit_anchor/monitor-agent.service"
-fi
-
-chmod 0700 -- "$config_dir" "$state_dir"
 
 transaction_dir=
 staged_runtime=
@@ -297,7 +207,14 @@ restore_service_state() {
     if ! systemctl daemon-reload >/dev/null 2>&1; then
         service_restore_failed=1
     fi
-    if [ "$prior_absent" -eq 0 ]; then
+    if [ "$prior_absent" -eq 1 ]; then
+        if ! systemctl stop -- monitor-agent.service >/dev/null 2>&1; then
+            service_restore_failed=1
+        fi
+        if ! systemctl disable -- monitor-agent.service >/dev/null 2>&1; then
+            service_restore_failed=1
+        fi
+    else
         if [ "$prior_enabled" -eq 1 ]; then
             if ! systemctl enable -- monitor-agent.service >/dev/null 2>&1; then
                 service_restore_failed=1
@@ -387,10 +304,10 @@ cleanup() {
 
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
         for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
-            if [ "${dir_existed[$index]}" -eq 1 ]; then
-                chmod "${dir_modes[$index]}" -- "${managed_mode_dirs[$index]}" ||
+            if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
+                chmod "${dir_modes[$index]:-}" -- "${managed_mode_dirs[$index]:-}" ||
                     rollback_failed=1
-            else
+            elif [ -n "${managed_cleanup_dirs[$index]:-}" ]; then
                 rm -rf -- "${managed_cleanup_dirs[$index]}" || rollback_failed=1
             fi
         done
@@ -402,6 +319,15 @@ cleanup() {
     exit "$original_status"
 }
 trap cleanup EXIT
+
+for index in "${!managed_dirs[@]}"; do
+    directory=${managed_dirs[$index]}
+    if [ "${dir_existed[$index]}" -eq 0 ]; then
+        install -d -m "${managed_modes[$index]}" -- "$directory"
+    fi
+done
+
+chmod 0700 -- "$config_dir" "$state_dir"
 
 transaction_dir=$(mktemp -d -- "$opt_parent/.monitor-agent-install.XXXXXX")
 staged_runtime="$transaction_dir/runtime"

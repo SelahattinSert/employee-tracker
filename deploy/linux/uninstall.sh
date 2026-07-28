@@ -6,7 +6,7 @@ fail() {
     exit 2
 }
 
-if [ "$(id -u)" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     fail "monitor-agent uninstall: root privileges required"
 fi
 

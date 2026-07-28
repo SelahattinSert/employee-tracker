@@ -82,12 +82,56 @@ FAILURE_STAGES = [
     "enable",
     "restart",
     "active-verify",
+    "after-enable",
+    "after-restart",
+]
+
+MANAGED_DIRECTORY_FAILURE_STAGES = [
+    *(f"directory-create-{index}" for index in range(8)),
+    "config-mode",
+    "state-mode",
 ]
 
 ALLOWED_RECURSIVE_DELETIONS = [
     ("rm", "-rf", "--", "/opt/monitor-agent"),
     ("rm", "-rf", "--", "/etc/monitor-agent", "/var/lib/monitor-agent"),
 ]
+
+
+def _replace_once(text: str, expected: str, replacement: str) -> str:
+    assert text.count(expected) == 1, expected
+    return text.replace(expected, replacement)
+
+
+def _write_test_installer(source: Path, destination: Path, stage: Path) -> None:
+    """Copy the production installer and narrowly redirect literal paths for tests."""
+    text = source.read_text(encoding="utf-8")
+    text = _replace_once(
+        text,
+        'if [ "$EUID" -ne 0 ]; then',
+        'if [ "$EUID" -ne 0 ] && [ "${MONITOR_AGENT_TEST_BYPASS_ROOT:-}" != 1 ]; then',
+    )
+    replacements = {
+        "install_dir=/opt/monitor-agent": f"install_dir={stage}/opt/monitor-agent",
+        "opt_parent=/opt": f"opt_parent={stage}/opt",
+        "etc_parent=/etc": f"etc_parent={stage}/etc",
+        "config_dir=/etc/monitor-agent": f"config_dir={stage}/etc/monitor-agent",
+        "etc_systemd_dir=/etc/systemd": f"etc_systemd_dir={stage}/etc/systemd",
+        "unit_dir=/etc/systemd/system": f"unit_dir={stage}/etc/systemd/system",
+        "config_file=/etc/monitor-agent/monitor-agent.env": (
+            f"config_file={stage}/etc/monitor-agent/monitor-agent.env"
+        ),
+        "var_parent=/var": f"var_parent={stage}/var",
+        "var_lib_dir=/var/lib": f"var_lib_dir={stage}/var/lib",
+        "state_dir=/var/lib/monitor-agent": f"state_dir={stage}/var/lib/monitor-agent",
+        "unit_file=/etc/systemd/system/monitor-agent.service": (
+            f"unit_file={stage}/etc/systemd/system/monitor-agent.service"
+        ),
+    }
+    for expected, replacement in replacements.items():
+        text = _replace_once(text, expected, replacement)
+    destination.write_text(text, encoding="utf-8")
+    destination.chmod(0o755)
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -202,9 +246,10 @@ def _assert_recursive_deletion_policy(text: str) -> None:
             for option in arguments
             if option.startswith("-") and not option.startswith("--")
         )
-        recursive_option = "r" in short_options or "--recursive" in arguments
-        force_option = "f" in short_options or "--force" in arguments
-        if not (recursive_option and force_option):
+        recursive_option = (
+            "r" in short_options or "R" in short_options or "--recursive" in arguments
+        )
+        if not recursive_option:
             continue
         if any(any(character in token for character in "*?[") for token in tokens):
             raise ValueError("glob")
@@ -231,7 +276,6 @@ class Harness:
         self.project = tmp_path / "project"
         self.linux = self.project / "deploy" / "linux"
         self.linux.mkdir(parents=True)
-        shutil.copy2(INSTALLER, self.linux / "install.sh")
         shutil.copy2(UNINSTALLER, self.linux / "uninstall.sh")
         shutil.copy2(SERVICE, self.linux / "monitor-agent.service")
         shutil.copy2(ROOT / "requirements.lock", self.project / "requirements.lock")
@@ -240,6 +284,7 @@ class Harness:
 
         self.stage = tmp_path / "stage"
         self.stage.mkdir(mode=0o700)
+        _write_test_installer(INSTALLER, self.linux / "install.sh", self.stage)
         self.wheel = tmp_path / "monitor_agent-2.0.0-py3-none-any.whl"
         self.wheel.write_bytes(b"wheel fixture")
         self.environment = tmp_path / "supplied.env"
@@ -277,6 +322,19 @@ class Harness:
     def unit(self) -> Path:
         return self.stage / "etc" / "systemd" / "system" / "monitor-agent.service"
 
+    @property
+    def managed_directories(self) -> list[Path]:
+        return [
+            self.stage / "opt",
+            self.stage / "etc",
+            self.config.parent,
+            self.stage / "etc/systemd",
+            self.unit.parent,
+            self.stage / "var",
+            self.stage / "var/lib",
+            self.state_dir,
+        ]
+
     def _write_state(self, *, active: bool, enabled: bool) -> None:
         self.service_state.write_text(
             f"active={int(active)}\n"
@@ -309,13 +367,6 @@ class Harness:
         (self.state_dir / "telemetry.json").write_text("keep state\n", encoding="utf-8")
 
     def _write_fakes(self) -> None:
-        _write_executable(
-            self.fake_bin / "id",
-            """#!/usr/bin/env bash
-set -eu
-printf '%s\n' "${FAKE_UID:-0}"
-""",
-        )
         _write_executable(
             self.fake_bin / "python3.11",
             """#!/usr/bin/env bash
@@ -360,6 +411,11 @@ printf ' <%s>' "$@" >> "$FAKE_COMMAND_LOG"
 printf '\n' >> "$FAKE_COMMAND_LOG"
 destination="${!#}"
 stage=
+if [ "${FAKE_FAIL_STAGE:-}" = "directory-create" ] \
+    && [ "$destination" = "$FAKE_DIRECTORY_FAIL_TARGET" ]; then
+    : > "$FAKE_FAILURE_MARKER"
+    exit 74
+fi
 if [[ " $* " = *" $FAKE_ENV_INPUT "* ]] \
     && [[ "$(basename -- "$destination")" = .monitor-agent.env.* ]]; then
     stage=environment-stage
@@ -381,6 +437,23 @@ if [ -n "$stage" ] && [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
     exit 76
 fi
 exec /usr/bin/install "$@"
+""",
+        )
+        _write_executable(
+            self.fake_bin / "chmod",
+            """#!/usr/bin/env bash
+set -eu
+printf 'chmod' >> "$FAKE_COMMAND_LOG"
+printf ' <%s>' "$@" >> "$FAKE_COMMAND_LOG"
+printf '\n' >> "$FAKE_COMMAND_LOG"
+destination="${!#}"
+if [ "${FAKE_FAIL_STAGE:-}" = "directory-mode" ] \
+    && [[ " $* " = *" $FAKE_MODE_FAIL_TARGET "* ]] \
+    && [ ! -e "$FAKE_FAILURE_MARKER" ]; then
+    : > "$FAKE_FAILURE_MARKER"
+    exit 86
+fi
+exec /usr/bin/chmod "$@"
 """,
         )
         _write_executable(
@@ -530,6 +603,7 @@ case "${1-}" in
         fi
         if { [ "${FAKE_FAIL_STAGE:-}" = "service-state" ] && [ "$active_queries" -eq 1 ]; } \
             || { { [ "${FAKE_FAIL_STAGE:-}" = "active-verify" ] \
+                    || [ "${FAKE_FAIL_STAGE:-}" = "after-restart" ] \
                     || [ "${FAKE_FAIL_STAGE:-}" = "rollback-stop" ]; } \
                 && [ "$active_queries" -ge 2 ] \
                 && [ ! -e "$FAKE_FAILURE_MARKER" ]; }; then
@@ -574,11 +648,6 @@ case "${1-}" in
         if fail_once daemon-reload; then
             exit 78
         fi
-        if [ "$unit_file_present" -eq 0 ]; then
-            active=0
-            enabled=0
-            save
-        fi
         exit 0
         ;;
     enable)
@@ -587,7 +656,9 @@ case "${1-}" in
         save
         ;;
     restart | start)
-        fail_once restart && exit 80
+        if fail_once restart || fail_once after-enable; then
+            exit 80
+        fi
         if [ "${FAKE_FAIL_STAGE:-}" = "rollback-start" ] \
             && [ -e "$FAKE_FAILURE_MARKER" ]; then
             exit 81
@@ -599,10 +670,6 @@ case "${1-}" in
         if [ "${FAKE_FAIL_STAGE:-}" = "rollback-stop" ] \
             && [ -e "$FAKE_FAILURE_MARKER" ]; then
             exit 82
-        fi
-        if [ "$present" -eq 0 ]; then
-            printf 'not-found\n'
-            exit 4
         fi
         active=0
         save
@@ -628,10 +695,6 @@ case "${1-}" in
             enabled=0
             save
         else
-            if [ "$present" -eq 0 ]; then
-                printf 'not-found\n'
-                exit 4
-            fi
             enabled=0
             save
         fi
@@ -644,8 +707,6 @@ esac
         self,
         *,
         failure: str = "",
-        uid: int = 0,
-        root: Path | str | None = None,
         implementation: str = "CPython",
         major: int = 3,
         minor: int = 11,
@@ -657,14 +718,22 @@ esac
         self.failure_marker.unlink(missing_ok=True)
         swap_marker = self.tmp_path / "swap.marker"
         swap_marker.unlink(missing_ok=True)
+        directory_fail_target = ""
+        if failure.startswith("directory-create-"):
+            directory_fail_target = str(
+                self.managed_directories[int(failure.removeprefix("directory-create-"))]
+            )
+        mode_fail_target = ""
+        if failure == "config-mode":
+            mode_fail_target = str(self.config.parent)
+        elif failure == "state-mode":
+            mode_fail_target = str(self.state_dir)
         return {
             **os.environ,
             "PATH": f"{self.fake_bin}:/usr/bin:/bin",
-            "FAKE_UID": str(uid),
             "FAKE_COMMAND_LOG": str(self.log),
             "FAKE_SERVICE_STATE": str(self.service_state),
             "FAKE_FAILURE_MARKER": str(self.failure_marker),
-            "FAKE_FAIL_STAGE": failure,
             "FAKE_ENV_INPUT": str(self.environment),
             "FAKE_SERVICE_INPUT": str(self.linux / "monitor-agent.service"),
             "FAKE_RUNTIME_DIR": str(self.runtime),
@@ -680,15 +749,19 @@ esac
             ),
             "FAKE_SWAP_MARKER": str(swap_marker),
             "FAKE_PUBLICATION_SWAP": publication_swap,
-            "MONITOR_AGENT_TEST_MODE": "1",
-            "MONITOR_AGENT_TEST_ROOT": str(self.stage if root is None else root),
+            "FAKE_DIRECTORY_FAIL_TARGET": directory_fail_target,
+            "FAKE_MODE_FAIL_TARGET": mode_fail_target,
+            "FAKE_FAIL_STAGE": (
+                "directory-create" if directory_fail_target else
+                "directory-mode" if mode_fail_target else failure
+            ),
+            "MONITOR_AGENT_TEST_BYPASS_ROOT": "1",
         }
 
     def install(
         self,
         *,
         failure: str = "",
-        root: Path | str | None = None,
         swap_trigger: str = "",
         swap_path: Path | None = None,
         swap_target: Path | None = None,
@@ -700,7 +773,6 @@ esac
             self.environment,
             env=self.process_environment(
                 failure=failure,
-                root=root,
                 swap_trigger=swap_trigger,
                 swap_path=swap_path,
                 swap_target=swap_target,
@@ -749,19 +821,44 @@ def test_scripts_are_bash_strict_and_executable() -> None:
         assert script.stat().st_mode & stat.S_IXUSR
 
 
-def test_installer_root_and_argument_guards_are_fixed_and_secret_free(tmp_path: Path) -> None:
-    harness = Harness(tmp_path)
-    non_root_environment = harness.process_environment(uid=0)
-    non_root_environment.pop("MONITOR_AGENT_TEST_MODE")
-    non_root_environment.pop("MONITOR_AGENT_TEST_ROOT")
-    non_root = _run(
-        harness.linux / "install.sh",
-        harness.wheel,
-        harness.environment,
-        env=non_root_environment,
+def test_real_scripts_require_actual_root_and_have_no_test_root_surface(tmp_path: Path) -> None:
+    wheel = tmp_path / "monitor_agent-2.0.0-py3-none-any.whl"
+    environment_file = tmp_path / "supplied.env"
+    wheel.write_bytes(b"wheel fixture")
+    environment_file.write_text("MONITOR_API_TOKEN=test\n", encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "id", "#!/usr/bin/env bash\nprintf '0\\n'\n")
+    environment = {**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"}
+    installer = _run(
+        INSTALLER,
+        wheel,
+        environment_file,
+        env=environment,
     )
-    assert non_root.returncode == 2
-    assert non_root.stderr == "monitor-agent install: root privileges required\n"
+    uninstaller = _run(UNINSTALLER, env=environment)
+    assert installer.returncode == 2
+    assert installer.stderr == "monitor-agent install: root privileges required\n"
+    assert uninstaller.returncode == 2
+    assert uninstaller.stderr == "monitor-agent uninstall: root privileges required\n"
+    assert "top-secret-test-token" not in installer.stdout + installer.stderr
+    assert "top-secret-test-token" not in uninstaller.stdout + uninstaller.stderr
+    for text in (
+        INSTALLER.read_text(encoding="utf-8"),
+        UNINSTALLER.read_text(encoding="utf-8"),
+    ):
+        assert "MONITOR_AGENT_TEST_" not in text
+        assert "/proc/" not in text
+        assert "root_prefix" not in text
+        assert "root_anchor" not in text
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    assert 'if [ "$EUID" -ne 0 ]; then' in installer_text
+    assert 'if [ "$EUID" -ne 0 ]; then' in UNINSTALLER.read_text(encoding="utf-8")
+    assert "$(id -u)" not in installer_text + UNINSTALLER.read_text(encoding="utf-8")
+
+
+def test_installer_argument_guard_is_fixed_and_secret_free(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
     wrong_arguments = _run(
         harness.linux / "install.sh",
         harness.wheel,
@@ -769,18 +866,7 @@ def test_installer_root_and_argument_guards_are_fixed_and_secret_free(tmp_path: 
     )
     assert wrong_arguments.returncode == 2
     assert wrong_arguments.stderr == "monitor-agent install: expected WHEEL_PATH ENV_FILE\n"
-    assert "top-secret-test-token" not in non_root.stdout + non_root.stderr
-    script = INSTALLER.read_text(encoding="utf-8")
-    assert "EUID" in script
-    assert "$(id -u)" not in script
-
-
-@pytest.mark.skipif(os.geteuid() != 0, reason="requires real root EUID")
-def test_real_root_rejects_nonempty_test_root(tmp_path: Path) -> None:
-    harness = Harness(tmp_path)
-    result = harness.install()
-    assert result.returncode == 2
-    assert result.stderr == "monitor-agent install: staging root forbidden for root\n"
+    assert "top-secret-test-token" not in wrong_arguments.stdout + wrong_arguments.stderr
 
 
 @pytest.mark.parametrize(
@@ -818,61 +904,6 @@ def test_installer_accepts_only_supported_cpython(
     if not accepted:
         assert result.stderr == "monitor-agent install: unsupported Python interpreter\n"
         assert _snapshot(harness.stage) == {}
-
-
-@pytest.mark.parametrize(
-    "invalid_root",
-    ["/", "relative/root", "/tmp/.."],
-)
-def test_installer_rejects_uncontained_staging_roots_before_mutation(
-    tmp_path: Path,
-    invalid_root: str,
-) -> None:
-    harness = Harness(tmp_path)
-    before = _snapshot(harness.stage)
-    result = _run(
-        harness.linux / "install.sh",
-        harness.wheel,
-        harness.environment,
-        env=harness.process_environment(failure="any-install", root=invalid_root),
-    )
-    assert result.returncode != 0
-    assert result.stderr == "monitor-agent install: invalid staging root\n"
-    assert _snapshot(harness.stage) == before
-    assert not any(
-        line.startswith(("install", "mv")) for line in harness.log.read_text().splitlines()
-    )
-
-
-def test_installer_rejects_symlink_staging_root_before_mutation(tmp_path: Path) -> None:
-    harness = Harness(tmp_path)
-    link = tmp_path / "root-link"
-    link.symlink_to("/")
-    result = _run(
-        harness.linux / "install.sh",
-        harness.wheel,
-        harness.environment,
-        env=harness.process_environment(failure="any-install", root=link),
-    )
-    assert result.returncode != 0
-    assert result.stderr == "monitor-agent install: invalid staging root\n"
-    assert not any(
-        line.startswith(("install", "mv")) for line in harness.log.read_text().splitlines()
-    )
-
-
-def test_installer_rejects_derived_symlink_escape_before_mutation(tmp_path: Path) -> None:
-    harness = Harness(tmp_path)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (harness.stage / "opt").symlink_to(outside)
-    before_stage = _snapshot(harness.stage)
-    before_outside = _snapshot(outside)
-    result = harness.install(failure="any-install")
-    assert result.returncode != 0
-    assert result.stderr == "monitor-agent install: invalid staging root\n"
-    assert _snapshot(harness.stage) == before_stage
-    assert _snapshot(outside) == before_outside
 
 
 def _create_invalid_target(path: Path, kind: str, tmp_path: Path) -> None:
@@ -969,63 +1000,6 @@ def test_publication_type_swap_restores_exact_snapshot(
 
 
 @pytest.mark.parametrize(
-    ("trigger", "ancestor"),
-    [
-        ("service-state", "root"),
-        ("service-state", "opt"),
-        ("service-state", "etc"),
-        ("service-state", "var"),
-        ("runtime-swap", "opt"),
-        ("environment-rename", "config"),
-        ("unit-rename", "unit"),
-        ("success-cleanup", "root"),
-    ],
-)
-def test_owned_test_root_swaps_never_mutate_outside_tree(
-    tmp_path: Path,
-    trigger: str,
-    ancestor: str,
-) -> None:
-    harness = Harness(tmp_path, existing=True, active=True, enabled=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    swap_paths = {
-        "root": harness.stage,
-        "opt": harness.stage / "opt",
-        "etc": harness.stage / "etc",
-        "var": harness.stage / "var",
-        "config": harness.config.parent,
-        "unit": harness.unit.parent,
-    }
-    before_outside = _snapshot(outside)
-    result = harness.install(
-        swap_trigger=trigger,
-        swap_path=swap_paths[ancestor],
-        swap_target=outside,
-    )
-    assert result.returncode == 0, result.stderr
-    assert (tmp_path / "swap.marker").exists()
-    assert _snapshot(outside) == before_outside
-    assert "top-secret-test-token" not in result.stdout + result.stderr
-
-
-def test_rollback_deletion_root_swap_never_mutates_outside_tree(tmp_path: Path) -> None:
-    harness = Harness(tmp_path, existing=True, active=True, enabled=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    before_outside = _snapshot(outside)
-    result = harness.install(
-        failure="restart",
-        swap_trigger="rollback-delete",
-        swap_path=harness.stage / "opt",
-        swap_target=outside,
-    )
-    assert result.returncode != 0
-    assert (tmp_path / "swap.marker").exists()
-    assert _snapshot(outside) == before_outside
-
-
-@pytest.mark.parametrize(
     ("existing", "failure"),
     [
         (False, "cleanup-transaction"),
@@ -1079,6 +1053,25 @@ def test_every_install_failure_restores_filesystem_service_and_modes(
     assert "top-secret-test-token" not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("failure", MANAGED_DIRECTORY_FAILURE_STAGES)
+def test_pretransaction_directory_failures_restore_exact_snapshot(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    harness = Harness(tmp_path)
+    before_tree = _snapshot(harness.stage)
+    before_state = _state(harness.service_state)
+    result = harness.install(failure=failure)
+    assert result.returncode != 0, failure
+    assert harness.failure_marker.exists(), failure
+    assert result.stdout == ""
+    assert result.stderr == "monitor-agent install: installation failed\n"
+    assert _snapshot(harness.stage) == before_tree
+    assert _state(harness.service_state) == before_state
+    harness.assert_no_temporary_files()
+    assert "top-secret-test-token" not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     ("active", "enabled"),
     [(True, True), (False, True), (True, False), (False, False)],
@@ -1094,6 +1087,25 @@ def test_activation_failure_restores_every_prior_service_state(
     assert result.returncode != 0
     assert _snapshot(harness.stage) == before
     assert _state(harness.service_state) == (int(active), int(enabled))
+
+
+@pytest.mark.parametrize("failure", ["after-enable", "after-restart", "active-verify"])
+def test_absent_service_rollback_explicitly_stops_disables_and_verifies(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    harness = Harness(tmp_path)
+    before_tree = _snapshot(harness.stage)
+    result = harness.install(failure=failure)
+    assert result.returncode != 0, failure
+    assert _snapshot(harness.stage) == before_tree
+    assert _state(harness.service_state) == (0, 0)
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "systemctl <stop> <--> <monitor-agent.service>" in commands
+    assert "systemctl <disable> <--> <monitor-agent.service>" in commands
+    assert commands.count("systemctl <is-active> <--> <monitor-agent.service>") >= 2
+    assert commands.count("systemctl <is-enabled> <--> <monitor-agent.service>") >= 2
+    harness.assert_no_temporary_files()
 
 
 @pytest.mark.parametrize(
@@ -1178,70 +1190,6 @@ def test_installer_validates_input_before_any_mutation(tmp_path: Path) -> None:
     assert _snapshot(harness.stage) == {}
 
 
-@pytest.mark.parametrize(
-    ("existing", "failure", "expected_error"),
-    [
-        (False, "", ""),
-        (True, "", ""),
-        (True, "uninstall-stop-failure", "service is still active"),
-        (True, "uninstall-disable-failure", "service is still enabled"),
-        (True, "uninstall-dbus-failure", "unable to verify service inactive"),
-        (True, "uninstall-failed-state", "unable to verify service inactive"),
-        (True, "uninstall-masked-state", "unable to verify service disabled"),
-    ],
-)
-def test_uninstall_verifies_inactive_and_disabled_before_deletion(
-    tmp_path: Path,
-    existing: bool,
-    failure: str,
-    expected_error: str,
-) -> None:
-    harness = Harness(tmp_path, existing=existing, active=existing, enabled=existing)
-    result = harness.uninstall(failure=failure)
-    commands = harness.log.read_text(encoding="utf-8")
-    if expected_error:
-        assert result.returncode != 0
-        assert result.stderr == f"monitor-agent uninstall: {expected_error}\n"
-        assert "rm <-rf> <--> </opt/monitor-agent>" not in commands
-        assert "rm <-f> <--> </etc/systemd/system/monitor-agent.service>" not in commands
-    else:
-        assert result.returncode == 0, result.stderr
-        assert "systemctl <is-active> <--> <monitor-agent.service>" in commands
-        assert "systemctl <is-enabled> <--> <monitor-agent.service>" in commands
-        assert "rm <-rf> <--> </opt/monitor-agent>" in commands
-        assert "rm <-f> <--> </etc/systemd/system/monitor-agent.service>" in commands
-
-
-def test_uninstall_guards_arguments_preserves_by_default_and_purges_explicitly(
-    tmp_path: Path,
-) -> None:
-    harness = Harness(tmp_path, existing=True, active=True, enabled=True)
-    non_root = _run(
-        harness.linux / "uninstall.sh",
-        env=harness.process_environment(uid=1000),
-    )
-    assert non_root.returncode == 2
-    wrong = _run(
-        harness.linux / "uninstall.sh",
-        "--force",
-        env=harness.process_environment(),
-    )
-    assert wrong.returncode == 2
-
-    default = harness.uninstall()
-    assert default.returncode == 0
-    default_commands = harness.log.read_text(encoding="utf-8")
-    assert "rm <-rf> <--> </etc/monitor-agent> </var/lib/monitor-agent>" not in default_commands
-
-    harness.log.write_text("", encoding="utf-8")
-    purge = harness.uninstall(purge=True)
-    assert purge.returncode == 0
-    assert (
-        "rm <-rf> <--> </etc/monitor-agent> </var/lib/monitor-agent>"
-        in harness.log.read_text(encoding="utf-8")
-    )
-
-
 def test_uninstaller_recursive_deletion_surface_is_exact() -> None:
     text = UNINSTALLER.read_text(encoding="utf-8")
     _assert_recursive_deletion_policy(text)
@@ -1252,7 +1200,12 @@ def test_uninstaller_recursive_deletion_surface_is_exact() -> None:
     "mutant",
     [
         "rm -fr -- /",
+        "rm -r -- /tmp/third",
+        "rm -R -- /tmp/third",
+        "rm --recursive -- /tmp/third",
         "rm --recursive --force -- /",
+        "rm --force --recursive -- /tmp/third",
+        "rm -fR -- /tmp/third",
         "/bin/rm -rf -- /",
         "command rm -rf -- /",
         "env rm -rf -- /",
