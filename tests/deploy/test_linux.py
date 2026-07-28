@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
-import shlex
 import shutil
 import socket
 import stat
@@ -92,15 +90,76 @@ MANAGED_DIRECTORY_FAILURE_STAGES = [
     "state-mode",
 ]
 
-ALLOWED_RECURSIVE_DELETIONS = [
-    ("rm", "-rf", "--", "/opt/monitor-agent"),
-    ("rm", "-rf", "--", "/etc/monitor-agent", "/var/lib/monitor-agent"),
-]
-
-ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS = {
+ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS = (
     "if active_state=$(systemctl is-active -- monitor-agent.service 2>/dev/null); then",
     "if enabled_state=$(systemctl is-enabled -- monitor-agent.service 2>/dev/null); then",
+)
+
+KNOWN_UNINSTALLER_SHELL_GRAMMAR = tuple(
+    """#!/usr/bin/env bash
+set -eu
+fail() {
+printf '%s\\n' "$1" >&2
+exit 2
 }
+if [ "$EUID" -ne 0 ]; then
+fail "monitor-agent uninstall: root privileges required"
+fi
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--purge" ]; }; then
+fail "monitor-agent uninstall: expected no arguments or --purge"
+fi
+purge=0
+if [ "$#" -eq 1 ]; then
+purge=1
+fi
+systemctl disable --now -- monitor-agent.service >/dev/null 2>&1 || true
+if active_state=$(systemctl is-active -- monitor-agent.service 2>/dev/null); then
+active_status=0
+else
+active_status=$?
+fi
+case "$active_status:$active_state" in
+0:active)
+fail "monitor-agent uninstall: service is still active"
+;;
+3:inactive | 4:not-found)
+;;
+*)
+fail "monitor-agent uninstall: unable to verify service inactive"
+;;
+esac
+if enabled_state=$(systemctl is-enabled -- monitor-agent.service 2>/dev/null); then
+enabled_status=0
+else
+enabled_status=$?
+fi
+case "$enabled_status:$enabled_state" in
+0:enabled)
+fail "monitor-agent uninstall: service is still enabled"
+;;
+1:disabled | 1:not-found | 4:not-found)
+;;
+*)
+fail "monitor-agent uninstall: unable to verify service disabled"
+;;
+esac
+rm -rf -- /opt/monitor-agent
+rm -f -- /etc/systemd/system/monitor-agent.service
+if [ "$purge" -eq 1 ]; then
+rm -rf -- /etc/monitor-agent /var/lib/monitor-agent
+fi
+if ! systemctl daemon-reload; then
+fail "monitor-agent uninstall: unable to reload service manager"
+fi
+printf '%s\\n' "monitor-agent uninstall: service removed"
+""".splitlines()
+)
+
+ALLOWED_UNINSTALLER_DELETION_LINES = (
+    "rm -rf -- /opt/monitor-agent",
+    "rm -f -- /etc/systemd/system/monitor-agent.service",
+    "rm -rf -- /etc/monitor-agent /var/lib/monitor-agent",
+)
 
 
 def _replace_once(text: str, expected: str, replacement: str) -> str:
@@ -235,63 +294,25 @@ def _state(path: Path) -> tuple[int, int]:
 def _assert_recursive_deletion_policy(text: str) -> None:
     if "\\\n" in text:
         raise ValueError("continued command")
-
-    recursive: list[tuple[str, ...]] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "`" in line:
-            raise ValueError("invalid shell")
-        if "$(" in line and line not in ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS:
-            raise ValueError("invalid shell")
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", line):
-            _, _, assigned_value = line.partition("=")
-            try:
-                stored_tokens = shlex.split(assigned_value, posix=True)
-            except ValueError as error:
-                raise ValueError("invalid shell") from error
-            stored_words = [
-                word for token in stored_tokens for word in shlex.split(token, posix=True)
-            ]
-            if any(word == "rm" or word.endswith("/rm") for word in stored_words):
-                raise ValueError("stored command")
-        try:
-            tokens = shlex.split(line, posix=True)
-        except ValueError as error:
-            raise ValueError("invalid shell") from error
-        if not tokens:
-            continue
-        if tokens[0].startswith(("$", "${")):
-            raise ValueError("variable command")
-        rm_positions = [
-            index
-            for index, token in enumerate(tokens)
-            if token == "rm" or token.endswith("/rm")
-        ]
-        if not rm_positions:
-            continue
-        rm_index = rm_positions[0]
-        arguments = tokens[rm_index + 1 :]
-        short_options = "".join(
-            option[1:]
-            for option in arguments
-            if option.startswith("-") and not option.startswith("--")
-        )
-        recursive_option = (
-            "r" in short_options or "R" in short_options or "--recursive" in arguments
-        )
-        if not recursive_option:
-            continue
-        if any(any(character in token for character in "*?[") for token in tokens):
-            raise ValueError("glob")
-        command = tuple(tokens)
-        if rm_index != 0 or command not in ALLOWED_RECURSIVE_DELETIONS:
-            raise ValueError("unsafe recursive deletion")
-        recursive.append(command)
-
-    if recursive != ALLOWED_RECURSIVE_DELETIONS:
-        raise ValueError("recursive deletion set changed")
+    lines = tuple(
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+        and (line.strip() == "#!/usr/bin/env bash" or not line.lstrip().startswith("#"))
+    )
+    if any("`" in line for line in lines):
+        raise ValueError("backtick command substitution")
+    substitutions = tuple(line for line in lines if "$(" in line)
+    if substitutions != tuple(ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS):
+        raise ValueError("unexpected command substitution")
+    if any(line not in KNOWN_UNINSTALLER_SHELL_GRAMMAR for line in lines):
+        raise ValueError("unknown shell grammar")
+    if lines != KNOWN_UNINSTALLER_SHELL_GRAMMAR:
+        raise ValueError("shell grammar cardinality changed")
+    if tuple(line for line in lines if line.startswith("rm ")) != (
+        ALLOWED_UNINSTALLER_DELETION_LINES
+    ):
+        raise ValueError("deletion grammar changed")
 
 
 class Harness:
@@ -604,7 +625,8 @@ case " $* " in
         ;;
 esac
 if [ -n "$cleanup_stage" ] && [ "${FAKE_FAIL_STAGE:-}" = "$cleanup_stage" ] \
-    && [ ! -e "$FAKE_FAILURE_MARKER" ]; then
+    && { [ "${FAKE_CLEANUP_NOISE_EVERY_ATTEMPT:-0}" = 1 ] \
+        || [ ! -e "$FAKE_FAILURE_MARKER" ]; }; then
     : > "$FAKE_FAILURE_MARKER"
     emit_native_failure
     exit 90
@@ -897,6 +919,7 @@ esac
         swap_target: Path | None = None,
         publication_swap: str = "",
         restore_failure: str = "",
+        cleanup_noise_every_attempt: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = self.process_environment(
             failure=failure,
@@ -908,6 +931,9 @@ esac
         environment["FAKE_RESTORE_FAILURE"] = restore_failure
         if restore_failure:
             environment["FAKE_NATIVE_NOISE"] = "1"
+        if cleanup_noise_every_attempt:
+            environment["FAKE_NATIVE_NOISE"] = "1"
+            environment["FAKE_CLEANUP_NOISE_EVERY_ATTEMPT"] = "1"
         return _run(
             self.linux / "install.sh",
             self.wheel,
@@ -1157,13 +1183,21 @@ def test_success_cleanup_failure_is_nonzero_secret_free_and_retried(
         active=existing,
         enabled=existing,
     )
-    result = harness.install(failure=failure)
+    result = harness.install(failure=failure, cleanup_noise_every_attempt=True)
     assert result.returncode != 0
     assert harness.failure_marker.exists()
     assert result.stdout == ""
     assert result.stderr == "monitor-agent install: cleanup failed\n"
-    assert "top-secret-test-token" not in result.stdout + result.stderr
-    harness.assert_no_temporary_files()
+    output = result.stdout + result.stderr
+    assert "top-secret-test-token" not in output
+    assert "native-failure-token" not in output
+    assert "randomized-transaction-path" not in output
+    expected_artifact = {
+        "cleanup-environment-backup": ".monitor-agent.env.backup.*",
+        "cleanup-unit-backup": ".monitor-agent.service.backup.*",
+        "cleanup-transaction": ".monitor-agent-install.*",
+    }[failure]
+    assert list(harness.stage.rglob(expected_artifact))
 
 
 @pytest.mark.parametrize("existing", [False, True], ids=["fresh", "upgrade"])
@@ -1552,12 +1586,23 @@ def test_copied_uninstaller_rejects_invalid_arguments(
         "rm --recursive -- /tmp/third",
         "rm --recursive --force -- /",
         "rm --force --recursive -- /tmp/third",
+        "sh -c 'rm -rf -- /tmp/third'",
+        "bash -c 'rm -rf -- /tmp/third'",
+        "eval 'rm -rf -- /tmp/third'",
+        "exec rm -rf -- /tmp/third",
+        "source /tmp/third",
+        ". /tmp/third",
+        "true;rm -rf -- /tmp/third",
+        "result=$(rm -rf -- /tmp/third)",
+        'r""m -rf -- /tmp/third',
+        "r''m -rf -- /tmp/third",
         "rm -fR -- /tmp/third",
         "/bin/rm -rf -- /",
         "command rm -rf -- /",
         "env rm -rf -- /",
         "delete_command='rm -rf -- /'",
         "delete_command=rm\n$delete_command -rf -- /",
+        "delete_command=rm\n\"$delete_command\" -rf -- /tmp/third",
         "rm -rf -- \\\n/",
         "rm -rf -- /opt/*",
         "rm -rf -- /opt/monitor-agent /tmp/third",
@@ -1569,12 +1614,26 @@ def test_copied_uninstaller_rejects_invalid_arguments(
         'wrapper "$(rm -r -- /tmp/third)"',
         "result=`r\"\"m -R -- /tmp/third`",
         'result=$(tool=r""m; "$tool" -r -- /tmp/third)',
+        "$(rm -rf -- /tmp/third)",
     ],
 )
 def test_recursive_deletion_policy_helper_rejects_mutants(mutant: str) -> None:
-    allowed = "\n".join(shlex.join(command) for command in ALLOWED_RECURSIVE_DELETIONS)
     with pytest.raises(ValueError):
-        _assert_recursive_deletion_policy(f"{allowed}\n{mutant}\n")
+        _assert_recursive_deletion_policy(f"{UNINSTALLER.read_text(encoding='utf-8')}\n{mutant}\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        *ALLOWED_UNINSTALLER_COMMAND_SUBSTITUTIONS,
+        *ALLOWED_UNINSTALLER_DELETION_LINES,
+    ],
+)
+def test_recursive_deletion_policy_helper_rejects_duplicate_safe_lines(line: str) -> None:
+    text = UNINSTALLER.read_text(encoding="utf-8")
+    assert text.count(line) == 1
+    with pytest.raises(ValueError):
+        _assert_recursive_deletion_policy(text.replace(line, f"{line}\n{line}"))
 
 
 def test_environment_example_is_exact_and_never_live_configuration() -> None:

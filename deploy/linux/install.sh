@@ -241,21 +241,12 @@ restore_service_state() {
 }
 
 cleanup_artifacts() {
-    quiet=${1:-0}
     artifact_cleanup_failed=0
     remove_artifact() {
-        if [ "$quiet" -eq 1 ]; then
-            rm -f -- "$1" >/dev/null 2>&1
-        else
-            rm -f -- "$1"
-        fi
+        rm -f -- "$1" >/dev/null 2>&1
     }
     remove_transaction() {
-        if [ "$quiet" -eq 1 ]; then
-            rm -rf -- "$1" >/dev/null 2>&1
-        else
-            rm -rf -- "$1"
-        fi
+        rm -rf -- "$1" >/dev/null 2>&1
     }
     for temporary in \
         "$environment_stage" \
@@ -340,7 +331,7 @@ cleanup() {
 
     if [ "$original_status" -ne 0 ] && [ "$installation_committed" -eq 0 ]; then
         if [ "$rollback_failed" -eq 0 ]; then
-            cleanup_artifacts 1 || rollback_failed=1
+            cleanup_artifacts || rollback_failed=1
         fi
         for ((index = ${#managed_cleanup_dirs[@]} - 1; index >= 0; index--)); do
             if [ "${dir_existed[$index]:-0}" -eq 1 ]; then
