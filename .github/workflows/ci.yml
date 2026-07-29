@@ -117,7 +117,11 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest tests/deploy/test_linux.py -q --no-cov
-      - run: bash -n deploy/linux/install.sh deploy/linux/uninstall.sh
+      - name: Parse Linux deployment scripts
+        run: |
+          for script in deploy/linux/install.sh deploy/linux/uninstall.sh; do
+            bash -n "$script" || exit $?
+          done
       - run: shellcheck deploy/linux/install.sh deploy/linux/uninstall.sh
       - run: systemd-analyze verify deploy/linux/monitor-agent.service
 
@@ -135,7 +139,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest tests/deploy/test_windows.py -q --no-cov
       - name: Parse PowerShell deployment scripts
-        shell: pwsh
+        shell: powershell
         run: |
           Get-ChildItem -Path deploy/windows -Filter *.ps1 -File | ForEach-Object {
             $tokens = $null
@@ -167,5 +171,9 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest tests/deploy/test_macos.py -q --no-cov
-      - run: sh -n deploy/macos/install.sh deploy/macos/run-agent.sh deploy/macos/uninstall.sh
+      - name: Parse macOS deployment scripts
+        run: |
+          for script in deploy/macos/install.sh deploy/macos/run-agent.sh deploy/macos/uninstall.sh; do
+            sh -n "$script" || exit $?
+          done
       - run: plutil -lint deploy/macos/com.company.monitor-agent.plist
