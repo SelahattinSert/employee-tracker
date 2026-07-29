@@ -102,9 +102,59 @@ function Assert-SafeManagedPath {
     }
 }
 
+function Get-SafeTreeItems {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = "tree"
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+
+    $RootItem = Get-Item -LiteralPath $Path -Force
+    if (Test-ReparsePoint $RootItem) { Fail "$Label contains a reparse point" }
+
+    $Items = New-Object System.Collections.ArrayList
+    [void]$Items.Add($RootItem)
+    $Pending = New-Object System.Collections.Stack
+    if ($RootItem.PSIsContainer) {
+        $Pending.Push($RootItem.FullName)
+    }
+    while ($Pending.Count -gt 0) {
+        $CurrentPath = [string]$Pending.Pop()
+        foreach ($Child in @(
+            Get-ChildItem -LiteralPath $CurrentPath -Force
+        )) {
+            if (Test-ReparsePoint $Child) {
+                Fail "$Label contains a reparse point"
+            }
+            [void]$Items.Add($Child)
+            if ($Child.PSIsContainer) {
+                $Pending.Push($Child.FullName)
+            }
+        }
+    }
+    return $Items.ToArray()
+}
+
+function Assert-SafeTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = "tree"
+    )
+    $null = @(Get-SafeTreeItems -Path $Path -Label $Label)
+}
+
 function Test-PathCommand {
     param([Parameter(Mandatory = $true)][string]$Name)
     return $null -ne (Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)
+}
+
+function Invoke-IcaclsChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    & icacls.exe $Path @Arguments | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "ACL configuration failed" }
 }
 
 function Set-RestrictedAcl {
@@ -112,22 +162,32 @@ function Set-RestrictedAcl {
         [Parameter(Mandatory = $true)][string]$Path,
         [switch]$Recurse
     )
-    $AclArguments = @(
-        "/reset",
-        "/inheritance:r",
+    $AclTargets = @(Get-SafeTreeItems -Path $Path -Label "ACL tree")
+    $TraversalArguments = @()
+    if ($Recurse) { $TraversalArguments = @("/T", "/C") }
+
+    $ResetArguments = @(
+        "/reset"
+    )
+    $ResetArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $ResetArguments
+
+    $InheritanceArguments = @(
+        "/inheritancelevel:r"
+    )
+    $InheritanceArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $InheritanceArguments
+
+    $GrantArguments = @(
         "/grant:r",
         "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F"
     )
-    if ($Recurse) { $AclArguments += @("/T", "/C") }
-    & icacls.exe $Path @AclArguments | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "ACL configuration failed" }
+    $GrantArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $GrantArguments
 
     $ExpectedSids = @("S-1-5-18", "S-1-5-32-544")
-    $AclTargets = @((Get-Item -LiteralPath $Path -Force))
-    if ($Recurse -and $AclTargets[0].PSIsContainer) {
-        $AclTargets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
-    }
+    $AclTargets = @(Get-SafeTreeItems -Path $Path -Label "ACL tree")
     foreach ($AclTarget in $AclTargets) {
         $ObservedAcl = Get-Acl -LiteralPath $AclTarget.FullName
         if (-not $ObservedAcl.AreAccessRulesProtected) {
@@ -172,10 +232,7 @@ function Get-FileSystemSecuritySnapshot {
 
 function Get-FileSystemSecurityTree {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $Targets = @((Get-Item -LiteralPath $Path -Force))
-    if ($Targets[0].PSIsContainer) {
-        $Targets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
-    }
+    $Targets = @(Get-SafeTreeItems -Path $Path -Label "security snapshot tree")
     $Snapshots = @()
     foreach ($Target in $Targets) {
         $Snapshots += @(Get-FileSystemSecuritySnapshot $Target.FullName)
@@ -292,17 +349,17 @@ function Wait-TaskRunning {
 function Remove-SafePath {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    $Item = Get-Item -LiteralPath $Path -Force
-    if (Test-ReparsePoint $Item) { Fail "refusing to remove reparse point" }
+    Assert-SafeTree -Path $Path -Label "removal tree"
     Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
-function Restore-BackupPath {
+function Copy-SafeTreeItem {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Destination
     )
     $SourceItem = Get-Item -LiteralPath $Source -Force
+    if (Test-ReparsePoint $SourceItem) { Fail "copy tree contains a reparse point" }
     if (-not $SourceItem.PSIsContainer) {
         Copy-Item -LiteralPath $Source -Destination $Destination -Force
         return
@@ -312,10 +369,35 @@ function Restore-BackupPath {
     }
     Assert-SafeDirectory $Destination "rollback destination"
     foreach ($Child in (Get-ChildItem -LiteralPath $Source -Force)) {
-        Restore-BackupPath `
+        if (Test-ReparsePoint $Child) { Fail "copy tree contains a reparse point" }
+        Copy-SafeTreeItem `
             -Source $Child.FullName `
             -Destination (Join-Path $Destination $Child.Name)
     }
+}
+
+function Copy-SafeTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    Assert-SafeTree $Source "copy source tree"
+    if (Test-Path -LiteralPath $Destination) {
+        Assert-SafeTree $Destination "copy destination tree"
+    }
+    Copy-SafeTreeItem -Source $Source -Destination $Destination
+}
+
+function Restore-BackupPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    Assert-SafeTree $Source "rollback source tree"
+    if (Test-Path -LiteralPath $Destination) {
+        Assert-SafeTree $Destination "rollback destination tree"
+    }
+    Copy-SafeTree -Source $Source -Destination $Destination
 }
 
 function Invoke-JournaledMutation {
@@ -576,6 +658,7 @@ try {
     }
     Assert-SafeDirectory $InstallParent "install parent"
     Assert-SafeDirectory $InstallRoot "install root"
+    Assert-SafeTree $InstallRoot "install tree"
     $InstallRootWasPresent = Test-Path -LiteralPath $InstallRoot
     if ($InstallRootWasPresent) {
         $Journal.InstallRoot.SecuritySnapshot =
@@ -593,7 +676,6 @@ try {
             $PriorState.SecuritySnapshots = Get-FileSystemSecurityTree $LivePath
         }
     }
-    $TaskFolder = Connect-TaskScheduler
 
     $FailureCategory = "staging"
     New-Item -ItemType Directory -LiteralPath $RecoveryRoot -Force | Out-Null
@@ -615,6 +697,7 @@ try {
     Copy-Item -LiteralPath $TaskSource -Destination $StageTask -Force
     Copy-Item -LiteralPath $LockPath -Destination $StageLock -Force
     Copy-Item -LiteralPath $WheelPath -Destination $StageWheel -Force
+    Assert-SafeTree $TransactionRoot "staged tree"
     Set-RestrictedAcl $TransactionRoot -Recurse
 
     py "-$PythonVersion" -m venv $StageVenv
@@ -626,8 +709,10 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "wheel installation failed" }
     & $StageLauncher -Command check-config -InstallRoot $TransactionRoot
     if ($LASTEXITCODE -ne 0) { Fail "staged configuration validation failed" }
+    Assert-SafeTree $TransactionRoot "staged tree"
 
     $FailureCategory = "prior-task-capture"
+    $TaskFolder = Connect-TaskScheduler
     $PriorTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
     $PriorTaskWasPresent = $null -ne $PriorTask
     if ($PriorTaskWasPresent) {
@@ -679,7 +764,7 @@ try {
         $PriorState = $Journal.PriorFiles[$Name]
         if ($PriorState.Existed) {
             $BackupPath = Join-Path $BackupRoot $Name
-            Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force
+            Copy-SafeTree -Source $LivePath -Destination $BackupPath
             Set-RestrictedAcl $BackupPath -Recurse
             $PriorState.BackupPrepared = $true
             [void](Invoke-JournaledMutation -Name "remove-prior-file" `
@@ -703,6 +788,7 @@ try {
     foreach ($StateDirectory in @("logs", "spool")) {
         $StatePath = Join-Path $InstallRoot $StateDirectory
         Assert-SafeDirectory $StatePath $StateDirectory
+        Assert-SafeTree $StatePath "$StateDirectory tree"
         if (-not (Test-Path -LiteralPath $StatePath)) {
             $StateDirectoryJournal = @{
                 Attempted = $false

@@ -190,6 +190,107 @@ def test_restricted_acl_verifies_inheritance_is_protected() -> None:
     assert 'Fail "DACL verification failed"' in acl_function
 
 
+def test_restricted_acl_uses_three_checked_supported_operation_forms() -> None:
+    text = _script(INSTALLER)
+    acl_function = _function(text, "Set-RestrictedAcl")
+    checked_call = _function(text, "Invoke-IcaclsChecked")
+
+    reset_arguments = re.search(
+        r"(?ms)\$ResetArguments\s*=\s*@\((.*?)^\s*\)",
+        acl_function,
+    )
+    inheritance_arguments = re.search(
+        r"(?ms)\$InheritanceArguments\s*=\s*@\((.*?)^\s*\)",
+        acl_function,
+    )
+    grant_arguments = re.search(
+        r"(?ms)\$GrantArguments\s*=\s*@\((.*?)^\s*\)",
+        acl_function,
+    )
+    assert reset_arguments is not None
+    assert inheritance_arguments is not None
+    assert grant_arguments is not None
+
+    reset = reset_arguments.group(1)
+    inheritance = inheritance_arguments.group(1)
+    grant = grant_arguments.group(1)
+    assert '"/reset"' in reset
+    assert "/grant" not in reset
+    assert "/inheritance" not in reset
+    assert '"/inheritancelevel:r"' in inheritance
+    assert "/reset" not in inheritance
+    assert "/grant" not in inheritance
+    assert '"/grant:r"' in grant
+    assert "/reset" not in grant
+    assert "/inheritance" not in grant
+    assert '"/inheritance:r"' not in acl_function
+    assert acl_function.count("Invoke-IcaclsChecked") == 3
+    assert "& icacls.exe $Path @Arguments" in checked_call
+    _assert_ordered(
+        checked_call,
+        "& icacls.exe $Path @Arguments",
+        "if ($LASTEXITCODE -ne 0)",
+        'Fail "ACL configuration failed"',
+    )
+    assert "& icacls.exe" not in text.replace(checked_call, "")
+
+
+def test_installer_preflights_safe_trees_without_following_reparse_directories() -> None:
+    text = _script(INSTALLER)
+    tree_walk = _function(text, "Get-SafeTreeItems")
+    acl_function = _function(text, "Set-RestrictedAcl")
+    security_tree = _function(text, "Get-FileSystemSecurityTree")
+    remove_safe_path = _function(text, "Remove-SafePath")
+    restore_backup = _function(text, "Restore-BackupPath")
+    live_flow = text[text.index("try {\n    $Principal") :]
+
+    assert "System.Collections.Stack" in tree_walk
+    assert "Get-ChildItem -LiteralPath $CurrentPath -Force" in tree_walk
+    assert "-Recurse" not in tree_walk
+    _assert_ordered(
+        tree_walk,
+        "$RootItem = Get-Item -LiteralPath $Path -Force",
+        "Test-ReparsePoint $RootItem",
+        "$Pending.Push($RootItem.FullName)",
+    )
+    _assert_ordered(
+        tree_walk,
+        "foreach ($Child in",
+        "Test-ReparsePoint $Child",
+        "$Pending.Push($Child.FullName)",
+    )
+    assert "Get-ChildItem -LiteralPath $Path -Force -Recurse" not in text
+    _assert_ordered(
+        acl_function,
+        "Get-SafeTreeItems",
+        "Invoke-IcaclsChecked",
+    )
+    assert "Get-SafeTreeItems" in security_tree
+    _assert_ordered(
+        remove_safe_path,
+        "Assert-SafeTree",
+        "Remove-Item -LiteralPath $Path -Recurse -Force",
+    )
+    _assert_ordered(
+        restore_backup,
+        "Assert-SafeTree $Source",
+        "Copy-SafeTree",
+    )
+    _assert_ordered(
+        live_flow,
+        'Assert-SafeTree $InstallRoot "install tree"',
+        "Connect-TaskScheduler",
+        "$MutationStarted = $true",
+    )
+    staged_tail = live_flow[live_flow.index("& $StageLauncher -Command check-config") :]
+    _assert_ordered(
+        staged_tail,
+        "& $StageLauncher -Command check-config",
+        'Assert-SafeTree $TransactionRoot "staged tree"',
+        "Connect-TaskScheduler",
+    )
+
+
 def test_installer_uses_locale_independent_task_scheduler_state() -> None:
     text = _script(INSTALLER)
     assert 'New-Object -ComObject "Schedule.Service"' in text
@@ -293,7 +394,7 @@ def test_installer_restores_prior_managed_filesystem_security_metadata() -> None
     _assert_ordered(
         text,
         "$PriorState.SecuritySnapshots = Get-FileSystemSecurityTree $LivePath",
-        "Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force",
+        "Copy-SafeTree -Source $LivePath -Destination $BackupPath",
         "Set-RestrictedAcl $BackupPath",
         "$PriorState.BackupPrepared = $true",
         'Invoke-JournaledMutation -Name "remove-prior-file"',
@@ -410,12 +511,12 @@ def test_installer_protects_each_backup_before_removing_live_data() -> None:
     live_flow = text[text.index("try {\n    $Principal") :]
     acl_function = _function(text, "Set-RestrictedAcl")
     assert '"/T"' in acl_function
-    assert "Get-ChildItem -LiteralPath $Path -Force -Recurse" in acl_function
+    assert "Get-SafeTreeItems" in acl_function
     assert "$Rule.IsInherited" in acl_function
     assert "$ExpectedSids -notcontains $Sid" in acl_function
     _assert_ordered(
         live_flow,
-        "Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force",
+        "Copy-SafeTree -Source $LivePath -Destination $BackupPath",
         "Set-RestrictedAcl $BackupPath",
         "$PriorState.BackupPrepared = $true",
         'Invoke-JournaledMutation -Name "remove-prior-file"',
@@ -478,7 +579,7 @@ def test_uninstaller_uses_same_api_semantics_and_blocks_cleanup_on_task_failures
     assert "Remove-RuntimeArtifacts" in text
     assert "monitor-agent.env" in text
     assert "logs" in text and "spool" in text
-    assert "Remove-Item -LiteralPath $InstallRoot -Recurse -Force" in text
+    assert "Remove-SafePath -Path $InstallRoot -ExpectedDirectory $true" in text
     assert "SilentlyContinue" not in text
     assert "ReparsePoint" in text
     _assert_ordered(
@@ -495,11 +596,24 @@ def test_uninstaller_preflights_root_and_runtime_types_before_task_mutation() ->
     text = _script(UNINSTALLER)
     live_flow = text[text.index("try {\n    $Principal") :]
     preflight = _function(text, "Assert-UninstallTargetsSafe")
+    tree_walk = _function(text, "Get-SafeTreeItems")
+    remove_safe_path = _function(text, "Remove-SafePath")
     assert '"venv"' in preflight
     assert '"run-agent.ps1"' in preflight
     assert '"monitor_agent_task.xml"' in preflight
     assert "$ExpectedDirectory" in text
     assert "$Item.PSIsContainer -ne $ExpectedDirectory" in text
+    assert "System.Collections.Stack" in tree_walk
+    assert "Get-ChildItem -LiteralPath $CurrentPath -Force" in tree_walk
+    assert "-Recurse" not in tree_walk
+    assert 'Assert-SafeTree $InstallRoot "install tree"' in preflight
+    assert 'Assert-SafeTree $VenvPath "venv tree"' in preflight
+    _assert_ordered(
+        remove_safe_path,
+        "Assert-SafeTree",
+        "Remove-Item -LiteralPath $Path -Recurse -Force",
+    )
+    assert text.count("Remove-Item -LiteralPath") == 1
     _assert_ordered(
         live_flow,
         "Assert-UninstallTargetsSafe",
@@ -556,6 +670,7 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     return $global:SecurityState[$Snapshot.Path] -eq $Snapshot.Sddl
 }"""
     fake_connect = """function Connect-TaskScheduler {
+    Add-Content -LiteralPath $global:TaskLogPath -Value "connect"
     return $global:FakeTaskFolder
 }"""
     admin_check = """    $Principal = New-Object Security.Principal.WindowsPrincipal(
@@ -686,7 +801,8 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     [string]$FailureMode,
     [string]$TaskLog,
     [string]$PriorTaskXml,
-    [string]$PriorTaskSddl
+    [string]$PriorTaskSddl,
+    [switch]$Purge
 )
 $ErrorActionPreference = "Stop"
 $global:FailureBoundary = $FailureBoundary
@@ -800,6 +916,9 @@ $global:FakeTaskFolder = $Folder
 if ($Wheel) {
     & $Target -WheelPath $Wheel -EnvironmentFile $EnvironmentFile
 }
+elseif ($Purge) {
+    & $Target -Purge
+}
 else {
     & $Target
 }
@@ -838,6 +957,7 @@ else {
             mode: str = "",
             root_present: bool = True,
             prior_task_present: bool = True,
+            nested_reparse: bool = False,
         ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
             case_name = "-".join(
                 part
@@ -853,6 +973,17 @@ else {
             case_dir.mkdir()
             install_root = case_dir / "MonitorAgent"
             prepare_root(install_root, present=root_present)
+            if nested_reparse:
+                reparse_target = case_dir / "outside-install-tree"
+                reparse_target.mkdir()
+                (reparse_target / "must-survive.txt").write_text(
+                    "outside",
+                    encoding="utf-8",
+                )
+                (install_root / "venv" / "nested-link").symlink_to(
+                    reparse_target,
+                    target_is_directory=True,
+                )
             wheel = case_dir / "monitor_agent.whl"
             wheel.write_bytes(b"wheel")
             environment = case_dir / "monitor-agent.env"
@@ -985,6 +1116,7 @@ else {
             mode: str,
             *,
             unsafe_name: str = "",
+            purge: bool = False,
         ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
             case_name = "-".join(
                 part for part in (mode or "success", unsafe_name) if part
@@ -999,6 +1131,17 @@ else {
             elif unsafe_name == "run-agent.ps1":
                 (install_root / "run-agent.ps1").unlink()
                 (install_root / "run-agent.ps1").mkdir()
+            elif unsafe_name == "nested-reparse":
+                reparse_target = case_dir / "outside-install-tree"
+                reparse_target.mkdir()
+                (reparse_target / "must-survive.txt").write_text(
+                    "outside",
+                    encoding="utf-8",
+                )
+                (install_root / "venv" / "nested-link").symlink_to(
+                    reparse_target,
+                    target_is_directory=True,
+                )
             log = case_dir / "task.log"
             script = case_dir / "uninstall.ps1"
             script.write_text(
@@ -1008,23 +1151,26 @@ else {
                 ),
                 encoding="utf-8",
             )
+            arguments = [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(wrapper),
+                "-Target",
+                str(script),
+                "-FailureMode",
+                mode,
+                "-TaskLog",
+                str(log),
+                "-PriorTaskXml",
+                prior_task_xml,
+                "-PriorTaskSddl",
+                prior_task_sddl,
+            ]
+            if purge:
+                arguments.append("-Purge")
             result = subprocess.run(
-                [
-                    pwsh,
-                    "-NoProfile",
-                    "-File",
-                    str(wrapper),
-                    "-Target",
-                    str(script),
-                    "-FailureMode",
-                    mode,
-                    "-TaskLog",
-                    str(log),
-                    "-PriorTaskXml",
-                    prior_task_xml,
-                    "-PriorTaskSddl",
-                    prior_task_sddl,
-                ],
+                arguments,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -1045,6 +1191,47 @@ else {
             assert unsafe.returncode != 0
             assert unsafe_log == ""
             assert unsafe_root.exists()
+
+        reparse_probe_target = harness_root / "reparse-probe-target"
+        reparse_probe_link = harness_root / "reparse-probe-link"
+        reparse_probe_target.mkdir()
+        try:
+            reparse_probe_link.symlink_to(
+                reparse_probe_target,
+                target_is_directory=True,
+            )
+        except OSError:
+            supports_reparse_fixture = False
+        else:
+            supports_reparse_fixture = True
+            reparse_probe_link.unlink()
+
+        if supports_reparse_fixture:
+            unsafe_install, unsafe_install_root, unsafe_install_log = run_installer(
+                "",
+                nested_reparse=True,
+            )
+            assert unsafe_install.returncode != 0
+            assert unsafe_install_log == ""
+            assert (
+                unsafe_install_root.parent
+                / "outside-install-tree"
+                / "must-survive.txt"
+            ).exists()
+
+            unsafe_purge, unsafe_purge_root, unsafe_purge_log = run_uninstaller(
+                "",
+                unsafe_name="nested-reparse",
+                purge=True,
+            )
+            assert unsafe_purge.returncode != 0
+            assert unsafe_purge_log == ""
+            assert unsafe_purge_root.exists()
+            assert (
+                unsafe_purge_root.parent
+                / "outside-install-tree"
+                / "must-survive.txt"
+            ).exists()
 
         removed, removed_root, _removed_log = run_uninstaller("")
         assert removed.returncode == 0, removed.stderr or removed.stdout

@@ -31,11 +31,56 @@ function Assert-SafeManagedPath {
     return $true
 }
 
+function Get-SafeTreeItems {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = "tree"
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+
+    $RootItem = Get-Item -LiteralPath $Path -Force
+    if (Test-ReparsePoint $RootItem) { Fail "$Label contains a reparse point" }
+
+    $Items = New-Object System.Collections.ArrayList
+    [void]$Items.Add($RootItem)
+    $Pending = New-Object System.Collections.Stack
+    if ($RootItem.PSIsContainer) {
+        $Pending.Push($RootItem.FullName)
+    }
+    while ($Pending.Count -gt 0) {
+        $CurrentPath = [string]$Pending.Pop()
+        foreach ($Child in @(
+            Get-ChildItem -LiteralPath $CurrentPath -Force
+        )) {
+            if (Test-ReparsePoint $Child) {
+                Fail "$Label contains a reparse point"
+            }
+            [void]$Items.Add($Child)
+            if ($Child.PSIsContainer) {
+                $Pending.Push($Child.FullName)
+            }
+        }
+    }
+    return $Items.ToArray()
+}
+
+function Assert-SafeTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = "tree"
+    )
+    $null = @(Get-SafeTreeItems -Path $Path -Label $Label)
+}
+
 function Assert-UninstallTargetsSafe {
     if (-not (Test-Path -LiteralPath $InstallRoot)) { return }
     [void](Assert-SafeManagedPath -Path $InstallRoot -ExpectedDirectory $true)
+    Assert-SafeTree $InstallRoot "install tree"
+    $VenvPath = Join-Path $InstallRoot "venv"
+    if (Assert-SafeManagedPath -Path $VenvPath -ExpectedDirectory $true) {
+        Assert-SafeTree $VenvPath "venv tree"
+    }
     $RuntimeTargets = @(
-        @{ Name = "venv"; ExpectedDirectory = $true },
         @{ Name = "run-agent.ps1"; ExpectedDirectory = $false },
         @{ Name = "monitor_agent_task.xml"; ExpectedDirectory = $false }
     )
@@ -89,6 +134,7 @@ function Remove-SafePath {
     if (Assert-SafeManagedPath `
         -Path $Path `
         -ExpectedDirectory $ExpectedDirectory) {
+        Assert-SafeTree -Path $Path -Label "removal tree"
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
 }
@@ -137,7 +183,7 @@ try {
     }
     Assert-UninstallTargetsSafe
     if ($Purge) {
-        Remove-Item -LiteralPath $InstallRoot -Recurse -Force
+        Remove-SafePath -Path $InstallRoot -ExpectedDirectory $true
         Write-Host "monitor-agent uninstall: installation purged"
         exit 0
     }
