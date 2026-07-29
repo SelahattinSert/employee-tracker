@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -146,6 +148,55 @@ def test_launcher_strictly_parses_known_environment_and_runs_entry_point() -> No
     assert "exit $LASTEXITCODE" in text
 
 
+def test_launcher_isolates_staged_path_validation_after_strict_live_path_checks() -> None:
+    text = _script(LAUNCHER)
+    live_path_check = _function(text, "Assert-LivePathConfiguration")
+    staged_override = _function(text, "Set-PathValidationOverride")
+    parsed_flow = text[text.index("Clear-KnownEnvironment\n") :]
+
+    assert "[string]$PathValidationRoot" in text
+    assert '$ExpectedSpoolPath = "C:\\ProgramData\\MonitorAgent\\spool"' in (
+        live_path_check
+    )
+    assert (
+        '$ExpectedLogPath = "C:\\ProgramData\\MonitorAgent\\logs\\monitor-agent.log"'
+        in live_path_check
+    )
+    assert '-cne $ExpectedSpoolPath' in live_path_check
+    assert '-cne $ExpectedLogPath' in live_path_check
+    assert '$SeenEnvironmentKeys.Contains("MONITOR_SPOOL_PATH")' in live_path_check
+    assert '$SeenEnvironmentKeys.Contains("MONITOR_LOG_PATH")' in live_path_check
+
+    assert '$Command -ne "check-config"' in staged_override
+    assert '$PSBoundParameters.ContainsKey("PathValidationRoot")' in text
+    assert '$ExpectedValidationRoot = Join-Path $InstallRoot "path-validation"' in (
+        staged_override
+    )
+    assert (
+        '$ExpectedTransactionRoot = '
+        '"C:\\ProgramData\\.monitor-agent-recovery\\transaction"'
+        in staged_override
+    )
+    assert "$NormalizedTransactionRoot" in staged_override
+    assert "[System.IO.Path]::GetFullPath" in staged_override
+    assert "Test-ReparsePoint" in staged_override
+    assert (
+        '[Environment]::SetEnvironmentVariable("MONITOR_SPOOL_PATH",'
+        in staged_override
+    )
+    assert (
+        '[Environment]::SetEnvironmentVariable("MONITOR_LOG_PATH",'
+        in staged_override
+    )
+    _assert_ordered(
+        parsed_flow,
+        '[Environment]::SetEnvironmentVariable($Parts[0], $Parts[1], "Process")',
+        "Assert-LivePathConfiguration",
+        "Set-PathValidationOverride",
+        "& $AgentPath $Command",
+    )
+
+
 def test_installer_stages_validates_and_uses_hash_locked_python_versions() -> None:
     text = _script(INSTALLER)
     assert '[ValidateSet("3.11", "3.12", "3.13", "3.14")]' in text
@@ -173,6 +224,33 @@ def test_installer_stages_validates_and_uses_hash_locked_python_versions() -> No
     assert "Invoke-Rollback" in text
     assert "logs" in text and "spool" in text
     assert "Administrator" in text
+
+
+def test_installer_isolates_staged_validation_then_checks_live_paths_before_task() -> None:
+    text = _script(INSTALLER)
+    live_flow = text[text.index("try {\n    $Principal") :]
+    stage_validation = (
+        "& $StageLauncher -Command check-config -InstallRoot $TransactionRoot "
+        "-PathValidationRoot $StagePathValidationRoot"
+    )
+    live_validation = "& $LiveLauncher -Command check-config"
+
+    assert (
+        '$StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"'
+        in live_flow
+    )
+    _assert_ordered(
+        live_flow,
+        '$StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"',
+        stage_validation,
+        "$MutationStarted = $true",
+        'Invoke-JournaledMutation -Name "create-state-directory"',
+        'Assert-SafeTree $StatePath "$StateDirectory tree"',
+        live_validation,
+        'Invoke-JournaledMutation -Name "register-task"',
+    )
+    live_validation_call = live_flow[live_flow.index(live_validation) :]
+    assert "-PathValidationRoot" not in live_validation_call.splitlines()[0]
 
 
 def test_installer_preflights_every_required_windows_command() -> None:
@@ -673,6 +751,62 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     Add-Content -LiteralPath $global:TaskLogPath -Value "connect"
     return $global:FakeTaskFolder
 }"""
+    fake_launcher_validation = """function Invoke-TestLauncherValidation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Launcher,
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [string]$PathValidationRoot
+    )
+    if ($Command -ne "check-config") { throw "unexpected launcher command" }
+    if ($PSBoundParameters.ContainsKey("PathValidationRoot")) {
+        $ExpectedRoot = Join-Path $InstallRoot "path-validation"
+        if (-not [string]::Equals(
+                [System.IO.Path]::GetFullPath($PathValidationRoot),
+                [System.IO.Path]::GetFullPath($ExpectedRoot),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "staged path validation escaped the transaction"
+        }
+        if (-not [string]::Equals(
+                [System.IO.Path]::GetFullPath($InstallRoot),
+                [System.IO.Path]::GetFullPath($TransactionRoot),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "staged launcher did not use the transaction root"
+        }
+        if (-not $global:InstallRootInitiallyPresent -and
+            (Test-Path -LiteralPath $global:ExpectedInstallRoot)) {
+            throw "staged validation touched the live install root"
+        }
+        Add-Content -LiteralPath $global:TaskLogPath -Value (
+            "staged-check:" + $PathValidationRoot
+        )
+        if (-not $global:InstallRootInitiallyPresent) {
+            Add-Content -LiteralPath $global:TaskLogPath -Value "staged-no-live-state"
+        }
+        $global:LASTEXITCODE = 0
+        return
+    }
+
+    if (-not [string]::Equals(
+            [System.IO.Path]::GetFullPath($InstallRoot),
+            [System.IO.Path]::GetFullPath($global:ExpectedInstallRoot),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "live launcher did not use the live install root"
+    }
+    foreach ($StateName in @("logs", "spool")) {
+        if (-not (Test-Path -LiteralPath (
+                Join-Path $InstallRoot $StateName
+            ) -PathType Container)) {
+            throw "live validation ran before state publication"
+        }
+    }
+    Add-Content -LiteralPath $global:TaskLogPath -Value "live-check"
+    if ($global:FailureMode -eq "live-check-fail") { throw "injected" }
+    $global:LASTEXITCODE = 0
+}"""
     admin_check = """    $Principal = New-Object Security.Principal.WindowsPrincipal(
         [Security.Principal.WindowsIdentity]::GetCurrent()
     )
@@ -690,7 +824,7 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     staged_commands_start = '    py "-$PythonVersion" -m venv $StageVenv\n'
     staged_commands_end = (
         '    if ($LASTEXITCODE -ne 0) { '
-        'Fail "staged configuration validation failed" }\n'
+        'Fail "wheel installation failed" }\n'
     )
     staged_replacement = """    New-Item -ItemType Directory -LiteralPath (
         Join-Path $StageVenv "Scripts"
@@ -706,7 +840,10 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
         harness_root = Path(temporary_directory)
         transformed_install = installer.replace(
             '$InstallRoot = "C:\\ProgramData\\MonitorAgent"',
-            "$InstallRoot = __TEST_INSTALL_ROOT__",
+            "$InstallRoot = __TEST_INSTALL_ROOT__\n"
+            "$global:ExpectedInstallRoot = $InstallRoot\n"
+            "$global:InstallRootInitiallyPresent = "
+            "Test-Path -LiteralPath $InstallRoot",
         )
         transformed_install = transformed_install.replace(
             "$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path",
@@ -751,6 +888,10 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
             "Connect-TaskScheduler",
             fake_connect,
         )
+        transformed_install = transformed_install.replace(
+            "function Fail {",
+            fake_launcher_validation + "\n\nfunction Fail {",
+        )
         remove_safe_path = _function(transformed_install, "Remove-SafePath")
         transformed_install = transformed_install.replace(
             remove_safe_path,
@@ -768,6 +909,19 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
             transformed_install[:stage_start]
             + staged_replacement
             + transformed_install[stage_end:]
+        )
+        transformed_install = transformed_install.replace(
+            "& $StageLauncher -Command check-config "
+            "-InstallRoot $TransactionRoot "
+            "-PathValidationRoot $StagePathValidationRoot",
+            "Invoke-TestLauncherValidation -Launcher $StageLauncher "
+            "-Command check-config -InstallRoot $TransactionRoot "
+            "-PathValidationRoot $StagePathValidationRoot",
+        )
+        transformed_install = transformed_install.replace(
+            "& $LiveLauncher -Command check-config",
+            "Invoke-TestLauncherValidation -Launcher $LiveLauncher "
+            "-Command check-config -InstallRoot $InstallRoot",
         )
         transformed_install = transformed_install.replace(
             "    $State.Attempted = $true\n    $Result = & $Action",
@@ -988,7 +1142,10 @@ else {
             wheel.write_bytes(b"wheel")
             environment = case_dir / "monitor-agent.env"
             environment.write_text(
-                "MONITOR_API_TOKEN=never-print-this-value\n",
+                "MONITOR_API_TOKEN=never-print-this-value\n"
+                "MONITOR_SPOOL_PATH=C:\\ProgramData\\MonitorAgent\\spool\n"
+                "MONITOR_LOG_PATH="
+                "C:\\ProgramData\\MonitorAgent\\logs\\monitor-agent.log\n",
                 encoding="utf-8",
             )
             log = case_dir / "task.log"
@@ -1094,6 +1251,23 @@ else {
         assert (absent_root / "venv" / "prior.txt").exists()
         assert absent_log.count("register:") == 1
         assert f"register-sddl:{prior_task_sddl_b64}" not in absent_log
+
+        live_check_failure, absent_live_root, live_check_log = run_installer(
+            "",
+            mode="live-check-fail",
+            root_present=False,
+            prior_task_present=False,
+        )
+        assert live_check_failure.returncode != 0
+        assert "never-print-this-value" not in (
+            live_check_failure.stdout + live_check_failure.stderr
+        )
+        assert not absent_live_root.exists()
+        assert not (absent_live_root.parent / ".monitor-agent-recovery").exists()
+        assert "staged-no-live-state" in live_check_log
+        assert "staged-check:" in live_check_log
+        assert "live-check" in live_check_log
+        assert "register:" not in live_check_log
 
         cleanup_failed, cleanup_root, cleanup_log = run_installer(
             "",
@@ -1282,39 +1456,153 @@ def test_powershell_parser_and_environment_runtime_are_skipped_without_pwsh() ->
         assert result.returncode == 0, result.stderr or result.stdout
 
     with tempfile.TemporaryDirectory() as temporary_directory:
-        install_root = Path(temporary_directory) / "MonitorAgent"
+        install_root = Path(temporary_directory) / "Monitor Agent With Spaces"
         config = install_root / "monitor-agent.env"
-        agent = install_root / "venv" / "Scripts" / "monitor-agent.exe"
-        agent.parent.mkdir(parents=True)
-        # A regular but non-executable placeholder is enough: successful parsing
-        # reaches invocation, while malformed files fail before it is considered.
-        agent.write_bytes(b"not-an-executable")
+        expected_agent = install_root / "venv" / "Scripts" / "monitor-agent.exe"
+        expected_agent.parent.mkdir(parents=True)
+        expected_agent.write_bytes(b"regular-file-placeholder")
+        capture = Path(temporary_directory) / "captured environment.json"
+        fake_agent = Path(temporary_directory) / "fake monitor agent.ps1"
+        fake_agent.write_text(
+            """param([string]$Command)
+$Captured = @{
+    Command = $Command
+    Collector = $env:MONITOR_COLLECTOR_URI
+    Token = $env:MONITOR_API_TOKEN
+    CaBundle = $env:MONITOR_CA_BUNDLE
+    Spool = $env:MONITOR_SPOOL_PATH
+    Log = $env:MONITOR_LOG_PATH
+}
+$Captured | ConvertTo-Json -Compress | Set-Content `
+    -LiteralPath $env:MONITOR_TEST_CAPTURE -Encoding UTF8
+exit 0
+""",
+            encoding="utf-8",
+        )
+        transformed_launcher = Path(temporary_directory) / "run agent transformed.ps1"
+        transformed_launcher.write_text(
+            _script(LAUNCHER)
+            .replace(
+                '$AgentPath = Join-Path $InstallRoot "venv\\Scripts\\monitor-agent.exe"',
+                f"$AgentPath = {_ps_literal(fake_agent)}",
+            )
+            .replace(
+                '"C:\\ProgramData\\.monitor-agent-recovery\\transaction"',
+                _ps_literal(install_root),
+            ),
+            encoding="utf-8",
+        )
 
-        def run_launcher(contents: str) -> subprocess.CompletedProcess[str]:
+        def run_launcher(
+            contents: str,
+            command: str = "check-config",
+            path_validation_root: Path | str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(contents, encoding="utf-8")
+            capture.unlink(missing_ok=True)
+            arguments = [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(transformed_launcher),
+                "-Command",
+                command,
+                "-InstallRoot",
+                str(install_root),
+            ]
+            if path_validation_root is not None:
+                arguments.extend(["-PathValidationRoot", str(path_validation_root)])
+            launcher_environment = {
+                **dict(os.environ),
+                "MONITOR_TEST_CAPTURE": str(capture),
+            }
             return subprocess.run(
-                [
-                    pwsh,
-                    "-NoProfile",
-                    "-File",
-                    str(LAUNCHER),
-                    "-Command",
-                    "check-config",
-                    "-InstallRoot",
-                    str(install_root),
-                ],
+                arguments,
                 check=False,
                 capture_output=True,
                 text=True,
+                env=launcher_environment,
             )
 
-        valid = run_launcher(
+        fixed_configuration = (
             "MONITOR_COLLECTOR_URI=https://collector.internal/api/v1/telemetry\n"
-            "MONITOR_API_TOKEN=token=with=equals\n"
+            "MONITOR_API_TOKEN=never-print-token=with=equals\n"
+            "MONITOR_CA_BUNDLE=C:\\certificates\\private-ca.pem\n"
+            "MONITOR_SPOOL_PATH=C:\\ProgramData\\MonitorAgent\\spool\n"
+            "MONITOR_LOG_PATH=C:\\ProgramData\\MonitorAgent\\logs\\monitor-agent.log\n"
         )
-        assert "Invalid Monitor Agent environment entry" not in valid.stderr
-        assert "token=with=equals" not in valid.stderr
+        validation_root = install_root / "path-validation"
+        valid = run_launcher(
+            fixed_configuration,
+            path_validation_root=validation_root,
+        )
+        assert valid.returncode == 0, valid.stderr or valid.stdout
+        assert "never-print-token" not in valid.stdout + valid.stderr
+        captured = json.loads(capture.read_text(encoding="utf-8-sig"))
+        assert captured == {
+            "Command": "check-config",
+            "Collector": "https://collector.internal/api/v1/telemetry",
+            "Token": "never-print-token=with=equals",
+            "CaBundle": r"C:\certificates\private-ca.pem",
+            "Spool": str(validation_root / "spool"),
+            "Log": str(validation_root / "logs" / "monitor-agent.log"),
+        }
+
+        for command in ("check-config", "run", "health"):
+            ordinary = run_launcher(fixed_configuration, command=command)
+            assert ordinary.returncode == 0, ordinary.stderr or ordinary.stdout
+            ordinary_capture = json.loads(capture.read_text(encoding="utf-8-sig"))
+            assert ordinary_capture["Command"] == command
+            assert ordinary_capture["Spool"] == r"C:\ProgramData\MonitorAgent\spool"
+            assert ordinary_capture["Log"] == (
+                r"C:\ProgramData\MonitorAgent\logs\monitor-agent.log"
+            )
+
+        for command in ("run", "health"):
+            misuse = run_launcher(
+                fixed_configuration,
+                command=command,
+                path_validation_root=validation_root,
+            )
+            assert misuse.returncode != 0
+            assert not capture.exists()
+            assert "never-print-token" not in misuse.stdout + misuse.stderr
+
+        non_transaction = run_launcher(
+            fixed_configuration,
+            path_validation_root=Path(temporary_directory) / "outside",
+        )
+        assert non_transaction.returncode != 0
+        assert not capture.exists()
+
+        empty_root = run_launcher(
+            fixed_configuration,
+            path_validation_root="",
+        )
+        assert empty_root.returncode != 0
+        assert not capture.exists()
+
+        validation_root.write_text("unsafe-file", encoding="utf-8")
+        unsafe = run_launcher(
+            fixed_configuration,
+            path_validation_root=validation_root,
+        )
+        assert unsafe.returncode != 0
+        assert not capture.exists()
+        validation_root.unlink()
+
+        bypass_attempt = run_launcher(
+            fixed_configuration.replace(
+                r"MONITOR_SPOOL_PATH=C:\ProgramData\MonitorAgent\spool",
+                r"MONITOR_SPOOL_PATH=C:\arbitrary\outside",
+            ),
+            path_validation_root=validation_root,
+        )
+        assert bypass_attempt.returncode != 0
+        assert not capture.exists()
+        assert "never-print-token" not in bypass_attempt.stdout + bypass_attempt.stderr
+
         for invalid_contents in (
             "UNEXPECTED_SETTING=value\n",
             "MONITOR_API_TOKEN=first\nMONITOR_API_TOKEN=second\n",

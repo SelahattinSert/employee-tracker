@@ -1,10 +1,12 @@
 param(
     [ValidateSet("run", "check-config", "health")]
     [string]$Command = "run",
-    [string]$InstallRoot = "C:\ProgramData\MonitorAgent"
+    [string]$InstallRoot = "C:\ProgramData\MonitorAgent",
+    [string]$PathValidationRoot
 )
 
 $ErrorActionPreference = "Stop"
+$PathValidationRequested = $PSBoundParameters.ContainsKey("PathValidationRoot")
 $ConfigPath = Join-Path $InstallRoot "monitor-agent.env"
 $AgentPath = Join-Path $InstallRoot "venv\Scripts\monitor-agent.exe"
 $KnownEnvironmentKeys = @(
@@ -49,6 +51,84 @@ function Clear-KnownEnvironment {
     }
 }
 
+function Assert-LivePathConfiguration {
+    $ExpectedSpoolPath = "C:\ProgramData\MonitorAgent\spool"
+    $ExpectedLogPath = "C:\ProgramData\MonitorAgent\logs\monitor-agent.log"
+    if (-not $SeenEnvironmentKeys.Contains("MONITOR_SPOOL_PATH") -or
+        -not $SeenEnvironmentKeys.Contains("MONITOR_LOG_PATH") -or
+        [Environment]::GetEnvironmentVariable(
+            "MONITOR_SPOOL_PATH",
+            "Process"
+        ) -cne $ExpectedSpoolPath -or
+        [Environment]::GetEnvironmentVariable(
+            "MONITOR_LOG_PATH",
+            "Process"
+        ) -cne $ExpectedLogPath) {
+        throw "Invalid Monitor Agent environment entry"
+    }
+}
+
+function Set-PathValidationOverride {
+    if (-not $PathValidationRequested) { return }
+    if ($Command -ne "check-config") {
+        throw "Path validation override is only available for check-config"
+    }
+    if ([string]::IsNullOrWhiteSpace($PathValidationRoot)) {
+        throw "Invalid path validation root"
+    }
+
+    $ExpectedTransactionRoot = "C:\ProgramData\.monitor-agent-recovery\transaction"
+    $ExpectedValidationRoot = Join-Path $InstallRoot "path-validation"
+    try {
+        $NormalizedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+        $NormalizedTransactionRoot =
+            [System.IO.Path]::GetFullPath($ExpectedTransactionRoot)
+        $NormalizedExpectedRoot =
+            [System.IO.Path]::GetFullPath($ExpectedValidationRoot)
+        $NormalizedValidationRoot =
+            [System.IO.Path]::GetFullPath($PathValidationRoot)
+    }
+    catch {
+        throw "Invalid path validation root"
+    }
+    if ([string]::Equals(
+            $NormalizedInstallRoot,
+            $NormalizedTransactionRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -eq $false -or -not [string]::Equals(
+            $NormalizedValidationRoot,
+            $NormalizedExpectedRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Invalid path validation root"
+    }
+
+    $InstallRootItem = Get-Item -LiteralPath $InstallRoot -Force
+    if (-not $InstallRootItem.PSIsContainer -or
+        (Test-ReparsePoint $InstallRootItem)) {
+        throw "Invalid path validation root"
+    }
+    if (Test-Path -LiteralPath $PathValidationRoot) {
+        $ValidationRootItem = Get-Item -LiteralPath $PathValidationRoot -Force
+        if (-not $ValidationRootItem.PSIsContainer -or
+            (Test-ReparsePoint $ValidationRootItem)) {
+            throw "Invalid path validation root"
+        }
+    }
+
+    $ValidationSpoolPath = Join-Path $PathValidationRoot "spool"
+    $ValidationLogDirectory = Join-Path $PathValidationRoot "logs"
+    $ValidationLogPath = Join-Path $ValidationLogDirectory "monitor-agent.log"
+    [Environment]::SetEnvironmentVariable("MONITOR_SPOOL_PATH",
+        $ValidationSpoolPath,
+        "Process"
+    )
+    [Environment]::SetEnvironmentVariable("MONITOR_LOG_PATH",
+        $ValidationLogPath,
+        "Process"
+    )
+}
+
 if (-not (Test-RegularFile $ConfigPath)) {
     throw "Monitor Agent configuration is missing"
 }
@@ -78,5 +158,7 @@ foreach ($Line in Get-Content -LiteralPath $ConfigPath -Encoding UTF8) {
     [Environment]::SetEnvironmentVariable($Parts[0], $Parts[1], "Process")
 }
 
+Assert-LivePathConfiguration
+Set-PathValidationOverride
 & $AgentPath $Command
 exit $LASTEXITCODE

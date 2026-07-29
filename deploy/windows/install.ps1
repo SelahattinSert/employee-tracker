@@ -692,6 +692,7 @@ try {
     $StageLock = Join-Path $TransactionRoot "requirements.lock"
     $StageWheel = Join-Path $TransactionRoot (Split-Path -Leaf $WheelPath)
     $StagePython = Join-Path $StageVenv "Scripts\python.exe"
+    $StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"
     Copy-Item -LiteralPath $EnvironmentFile -Destination $StageConfig -Force
     Copy-Item -LiteralPath $LauncherSource -Destination $StageLauncher -Force
     Copy-Item -LiteralPath $TaskSource -Destination $StageTask -Force
@@ -707,7 +708,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "locked dependency installation failed" }
     & $StagePython -m pip install --no-deps --force-reinstall $StageWheel
     if ($LASTEXITCODE -ne 0) { Fail "wheel installation failed" }
-    & $StageLauncher -Command check-config -InstallRoot $TransactionRoot
+    & $StageLauncher -Command check-config -InstallRoot $TransactionRoot -PathValidationRoot $StagePathValidationRoot
     if ($LASTEXITCODE -ne 0) { Fail "staged configuration validation failed" }
     Assert-SafeTree $TransactionRoot "staged tree"
 
@@ -788,7 +789,7 @@ try {
     foreach ($StateDirectory in @("logs", "spool")) {
         $StatePath = Join-Path $InstallRoot $StateDirectory
         Assert-SafeDirectory $StatePath $StateDirectory
-        Assert-SafeTree $StatePath "$StateDirectory tree"
+        Assert-SafeTree $StatePath "existing $StateDirectory tree"
         if (-not (Test-Path -LiteralPath $StatePath)) {
             $StateDirectoryJournal = @{
                 Attempted = $false
@@ -799,10 +800,17 @@ try {
             [void](Invoke-JournaledMutation -Name "create-state-directory" `
                 -State $StateDirectoryJournal -Action {
                     New-Item -ItemType Directory -LiteralPath $StatePath -Force |
-                        Out-Null
+                    Out-Null
                 })
         }
+        Assert-SafeDirectory $StatePath $StateDirectory
+        Assert-SafeTree $StatePath "$StateDirectory tree"
     }
+
+    $FailureCategory = "live-configuration-validation"
+    $LiveLauncher = Join-Path $InstallRoot "run-agent.ps1"
+    & $LiveLauncher -Command check-config
+    if ($LASTEXITCODE -ne 0) { Fail "live configuration validation failed" }
 
     $FailureCategory = "replacement-registration"
     $ReplacementTaskXml = [System.IO.File]::ReadAllText(
