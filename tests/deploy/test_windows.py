@@ -138,8 +138,10 @@ def test_launcher_strictly_parses_known_environment_and_runs_entry_point() -> No
     assert not re.search(r"(?m)^\s*\.\s+\$", text)
     assert "$Trimmed.StartsWith(\"#\")" in text
     assert '$Trimmed.Split("=", 2)' in text
-    assert "$KnownEnvironmentKeys -notcontains $Parts[0]" in text
+    assert '$Parts[0] -cnotmatch "^[A-Z][A-Z0-9_]+$"' in text
+    assert "$KnownEnvironmentKeys -cnotcontains $Parts[0]" in text
     assert "$SeenEnvironmentKeys.Contains($Parts[0])" in text
+    assert "[System.StringComparer]::Ordinal" in text
     assert "IndexOf([char]0)" in text
     assert "Clear-KnownEnvironment" in text
     assert "Test-RegularFile" in text
@@ -1603,11 +1605,21 @@ exit 0
         assert not capture.exists()
         assert "never-print-token" not in bypass_attempt.stdout + bypass_attempt.stderr
 
-        for invalid_contents in (
-            "UNEXPECTED_SETTING=value\n",
-            "MONITOR_API_TOKEN=first\nMONITOR_API_TOKEN=second\n",
-            " MONITOR_API_TOKEN=value\n",
+        for invalid_contents, rejected_secret in (
+            ("UNEXPECTED_SETTING=value\n", None),
+            ("MONITOR_API_TOKEN=first\nMONITOR_API_TOKEN=second\n", "first"),
+            (" MONITOR_API_TOKEN=value\n", "value"),
+            ("monitor_api_token=lowercase-secret\n", "lowercase-secret"),
+            ("Monitor_Api_Token=mixed-case-secret\n", "mixed-case-secret"),
+            (
+                "MONITOR_API_TOKEN=first-casing-secret\n"
+                "monitor_api_token=second-casing-secret\n",
+                "first-casing-secret",
+            ),
         ):
             invalid = run_launcher(invalid_contents)
             assert invalid.returncode != 0
             assert "Invalid Monitor Agent environment entry" in invalid.stderr
+            assert not capture.exists()
+            if rejected_secret is not None:
+                assert rejected_secret not in invalid.stdout + invalid.stderr

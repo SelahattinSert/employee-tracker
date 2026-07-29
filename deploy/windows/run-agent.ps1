@@ -137,7 +137,9 @@ if (-not (Test-RegularFile $AgentPath)) {
 }
 
 Clear-KnownEnvironment
-$SeenEnvironmentKeys = New-Object -TypeName "System.Collections.Generic.HashSet[string]"
+$SeenEnvironmentKeys = New-Object `
+    -TypeName "System.Collections.Generic.HashSet[string]" `
+    -ArgumentList ([System.StringComparer]::Ordinal)
 foreach ($Line in Get-Content -LiteralPath $ConfigPath -Encoding UTF8) {
     if ($Line.IndexOf([char]0) -ge 0) {
         throw "Invalid Monitor Agent environment entry"
@@ -149,8 +151,8 @@ foreach ($Line in Get-Content -LiteralPath $ConfigPath -Encoding UTF8) {
     $TrimmedParts = $Trimmed.Split("=", 2)
     $Parts = $Line.Split("=", 2)
     if ($TrimmedParts.Count -ne 2 -or $Parts.Count -ne 2 -or $Parts[0] -ne $Parts[0].Trim() -or
-        $Parts[0] -notmatch "^[A-Z][A-Z0-9_]+$" -or
-        $KnownEnvironmentKeys -notcontains $Parts[0] -or
+        $Parts[0] -cnotmatch "^[A-Z][A-Z0-9_]+$" -or
+        $KnownEnvironmentKeys -cnotcontains $Parts[0] -or
         $SeenEnvironmentKeys.Contains($Parts[0])) {
         throw "Invalid Monitor Agent environment entry"
     }
