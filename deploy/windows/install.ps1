@@ -11,11 +11,36 @@ $ErrorActionPreference = "Stop"
 $TaskName = "MonitorAgent"
 $InstallRoot = "C:\ProgramData\MonitorAgent"
 $InstallParent = Split-Path -Parent $InstallRoot
+$RecoveryRoot = Join-Path $InstallParent ".monitor-agent-recovery"
+$TransactionRoot = Join-Path $RecoveryRoot "transaction"
+$BackupRoot = Join-Path $RecoveryRoot "backup"
+$PriorTaskXmlPath = Join-Path $BackupRoot "registered-task.xml"
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $ScriptRoot)
 $LockPath = Join-Path $ProjectRoot "requirements.lock"
 $LauncherSource = Join-Path $ScriptRoot "run-agent.ps1"
 $TaskSource = Join-Path $ScriptRoot "monitor_agent_task.xml"
+$TaskNotFoundHResult = -2147024894
+$TaskStateQueued = 2
+$TaskStateReady = 3
+$TaskStateRunning = 4
+$TaskCreateOrUpdate = 6
+$TaskLogonServiceAccount = 5
+$ReadinessAttempts = 20
+$ReadinessDelayMilliseconds = 250
+$ManagedNames = @("venv", "monitor-agent.env", "run-agent.ps1", "monitor_agent_task.xml")
+$FailureCategory = "preflight"
+$MutationStarted = $false
+$DeploymentCommitted = $false
+$Succeeded = $false
+$InstallRootWasPresent = $false
+$PriorTask = $null
+$PriorTaskXml = $null
+$PriorTaskState = 0
+$PriorTaskWasPresent = $false
+$PriorTaskWasRunning = $false
+$PriorTaskWasActive = $false
+$TaskFolder = $null
 
 function Fail {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -47,6 +72,22 @@ function Assert-SafeDirectory {
     }
 }
 
+function Assert-SafeManagedPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $Item = Get-Item -LiteralPath $Path -Force
+    if (Test-ReparsePoint $Item) { Fail "managed target is unsafe" }
+    if ($Name -eq "venv" -and -not $Item.PSIsContainer) {
+        Fail "managed target type is unsafe"
+    }
+    if ($Name -ne "venv" -and $Item.PSIsContainer) {
+        Fail "managed target type is unsafe"
+    }
+}
+
 function Test-PathCommand {
     param([Parameter(Mandatory = $true)][string]$Name)
     return $null -ne (Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)
@@ -59,38 +100,89 @@ function Set-RestrictedAcl {
         "/inheritance:r",
         "/grant:r",
         "*S-1-5-18:(OI)(CI)F",
-        "*S-1-5-32-544:(OI)(CI)F"
+        "*S-1-5-32-544:(OI)(CI)F",
+        "/T",
+        "/C"
     )
     & icacls.exe $Path @AclArguments | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "ACL configuration failed" }
+
     $ExpectedSids = @("S-1-5-18", "S-1-5-32-544")
-    $ObservedSids = New-Object -TypeName "System.Collections.Generic.HashSet[string]"
-    foreach ($Rule in (Get-Acl -LiteralPath $Path).Access) {
-        $Sid = $Rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-        $HasFullControl = (($Rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)
-        if ($Rule.IsInherited -or $ExpectedSids -notcontains $Sid -or
-            $Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-            -not $HasFullControl) {
-            Fail "DACL verification failed"
+    $AclTargets = @((Get-Item -LiteralPath $Path -Force))
+    if ($AclTargets[0].PSIsContainer) {
+        $AclTargets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
+    }
+    foreach ($AclTarget in $AclTargets) {
+        $ObservedSids = New-Object -TypeName "System.Collections.Generic.HashSet[string]"
+        foreach ($Rule in (Get-Acl -LiteralPath $AclTarget.FullName).Access) {
+            $Sid = $Rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]
+            ).Value
+            $HasFullControl = (
+                ($Rule.FileSystemRights -band
+                    [Security.AccessControl.FileSystemRights]::FullControl) -eq
+                [Security.AccessControl.FileSystemRights]::FullControl
+            )
+            if ($Rule.IsInherited -or $ExpectedSids -notcontains $Sid -or
+                $Rule.AccessControlType -ne
+                    [Security.AccessControl.AccessControlType]::Allow -or
+                -not $HasFullControl) {
+                Fail "DACL verification failed"
+            }
+            [void]$ObservedSids.Add($Sid)
         }
-        [void]$ObservedSids.Add($Sid)
-    }
-    foreach ($ExpectedSid in $ExpectedSids) {
-        if (-not $ObservedSids.Contains($ExpectedSid)) { Fail "DACL verification failed" }
+        foreach ($ExpectedSid in $ExpectedSids) {
+            if (-not $ObservedSids.Contains($ExpectedSid)) {
+                Fail "DACL verification failed"
+            }
+        }
     }
 }
 
-function Get-TaskNotFound {
-    param([Parameter(Mandatory = $true)][string]$Output)
-    return $Output -match "(?i)(cannot find|does not exist)"
+function Connect-TaskScheduler {
+    try {
+        $TaskService = New-Object -ComObject "Schedule.Service"
+        $TaskService.Connect()
+        return $TaskService.GetFolder("\")
+    }
+    catch {
+        Fail "task scheduler connection failed"
+    }
 }
 
-function Test-TaskExists {
-    $TaskOutput = (& schtasks.exe /Query /TN MonitorAgent 2>&1 | Out-String)
-    $TaskExitCode = $LASTEXITCODE
-    if ($TaskExitCode -eq 0) { return $true }
-    if ($TaskExitCode -eq 1 -and (Get-TaskNotFound $TaskOutput)) { return $false }
-    Fail "unable to query task"
+function Get-RegisteredTask {
+    param(
+        [Parameter(Mandatory = $true)]$Folder,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    try {
+        return $Folder.GetTask($Name)
+    }
+    catch [Runtime.InteropServices.COMException] {
+        if ($_.Exception.HResult -eq $TaskNotFoundHResult) { return $null }
+        Fail "task query failed"
+    }
+    catch {
+        Fail "task query failed"
+    }
+}
+
+function Wait-TaskRunning {
+    param(
+        [Parameter(Mandatory = $true)]$Folder,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    for ($Attempt = 0; $Attempt -lt $ReadinessAttempts; $Attempt++) {
+        Start-Sleep -Milliseconds $ReadinessDelayMilliseconds
+        $RegisteredTask = Get-RegisteredTask -Folder $Folder -Name $Name
+        if ($null -eq $RegisteredTask) { return $false }
+        if ([int]$RegisteredTask.State -eq $TaskStateRunning) { return $true }
+        if ([int]$RegisteredTask.State -ne $TaskStateQueued -and
+            [int]$RegisteredTask.State -ne $TaskStateReady) {
+            return $false
+        }
+    }
+    return $false
 }
 
 function Remove-SafePath {
@@ -101,101 +193,283 @@ function Remove-SafePath {
     Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
+function Restore-BackupPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $SourceItem = Get-Item -LiteralPath $Source -Force
+    if (-not $SourceItem.PSIsContainer) {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -LiteralPath $Destination -Force | Out-Null
+    }
+    Assert-SafeDirectory $Destination "rollback destination"
+    foreach ($Child in (Get-ChildItem -LiteralPath $Source -Force)) {
+        Restore-BackupPath `
+            -Source $Child.FullName `
+            -Destination (Join-Path $Destination $Child.Name)
+    }
+}
+
+function Invoke-JournaledMutation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+    $State.Attempted = $true
+    $Result = & $Action
+    $State.Completed = $true
+    return $Result
+}
+
+function Resolve-AmbiguousJournal {
+    if (-not $InstallRootWasPresent -and $Journal.InstallRoot.Attempted -and
+        -not $Journal.InstallRoot.Completed -and
+        (Test-Path -LiteralPath $InstallRoot)) {
+        $Journal.InstallRoot.Completed = $true
+    }
+    foreach ($Name in $ManagedNames) {
+        $LivePath = Join-Path $InstallRoot $Name
+        $PriorState = $Journal.PriorFiles[$Name]
+        if ($PriorState.BackupPrepared -and $PriorState.Removal.Attempted -and
+            -not $PriorState.Removal.Completed -and
+            -not (Test-Path -LiteralPath $LivePath)) {
+            $PriorState.Removal.Completed = $true
+        }
+
+        $PublishedState = $Journal.PublishedFiles[$Name]
+        $StagePath = Join-Path $TransactionRoot $Name
+        if ($PublishedState.Attempted -and -not $PublishedState.Completed -and
+            -not (Test-Path -LiteralPath $StagePath) -and
+            (Test-Path -LiteralPath $LivePath)) {
+            $PublishedState.Completed = $true
+        }
+    }
+    foreach ($StateDirectoryJournal in $Journal.StateDirectories.Values) {
+        if ($StateDirectoryJournal.Attempted -and
+            -not $StateDirectoryJournal.Completed -and
+            (Test-Path -LiteralPath $StateDirectoryJournal.Path)) {
+            $StateDirectoryJournal.Completed = $true
+        }
+    }
+}
+
+function Test-RollbackState {
+    foreach ($Name in $ManagedNames) {
+        $LivePath = Join-Path $InstallRoot $Name
+        $PriorState = $Journal.PriorFiles[$Name]
+        if ($PriorState.Existed -and -not (Test-Path -LiteralPath $LivePath)) {
+            return $false
+        }
+        if (-not $PriorState.Existed -and (Test-Path -LiteralPath $LivePath)) {
+            return $false
+        }
+    }
+    foreach ($StateDirectoryJournal in $Journal.StateDirectories.Values) {
+        if ($StateDirectoryJournal.Completed -and
+            (Test-Path -LiteralPath $StateDirectoryJournal.Path)) {
+            return $false
+        }
+    }
+    if (-not $InstallRootWasPresent -and $Journal.InstallRoot.Attempted -and
+        (Test-Path -LiteralPath $InstallRoot)) {
+        return $false
+    }
+
+    $ObservedTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+    if ($PriorTaskWasPresent) {
+        if ($null -eq $ObservedTask) { return $false }
+        $ObservedRunning = [int]$ObservedTask.State -eq $TaskStateRunning
+        if ($ObservedRunning -ne $PriorTaskWasActive) { return $false }
+    }
+    elseif ($null -ne $ObservedTask) {
+        return $false
+    }
+    return $true
+}
+
 function Invoke-Rollback {
     $RollbackFailed = $false
-    try {
-        if (Test-TaskExists) {
-            & schtasks.exe /Delete /TN MonitorAgent /F | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "task deletion failed" }
-            if (Test-TaskExists) { throw "task deletion verification failed" }
+
+    if ($Journal.TaskRegistration.Attempted) {
+        try {
+            $CurrentTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+            if ($null -ne $CurrentTask) {
+                if ([int]$CurrentTask.State -eq $TaskStateRunning -or
+                    [int]$CurrentTask.State -eq $TaskStateQueued) {
+                    $CurrentTask.Stop(0)
+                }
+                $TaskFolder.DeleteTask($TaskName, 0)
+            }
         }
+        catch { $RollbackFailed = $true }
+    }
+
+    foreach ($Name in $ManagedNames) {
+        $LivePath = Join-Path $InstallRoot $Name
+        $PriorState = $Journal.PriorFiles[$Name]
+        $PublishedState = $Journal.PublishedFiles[$Name]
+        if ($PublishedState.Completed) {
+            try {
+                Remove-SafePath $LivePath
+            }
+            catch { $RollbackFailed = $true }
+        }
+        if ($PriorState.BackupPrepared -and $PriorState.Removal.Attempted) {
+            try {
+                $BackupPath = Join-Path $BackupRoot $Name
+                Restore-BackupPath -Source $BackupPath -Destination $LivePath
+                Set-RestrictedAcl $LivePath
+            }
+            catch { $RollbackFailed = $true }
+        }
+    }
+
+    foreach ($StateDirectoryJournal in $Journal.StateDirectories.Values) {
+        if ($StateDirectoryJournal.Completed) {
+            try {
+                Remove-SafePath $StateDirectoryJournal.Path
+            }
+            catch { $RollbackFailed = $true }
+        }
+    }
+
+    if (-not $InstallRootWasPresent -and $Journal.InstallRoot.Attempted) {
+        try {
+            if (Test-Path -LiteralPath $InstallRoot) {
+                $RemainingItems = @(Get-ChildItem -LiteralPath $InstallRoot -Force)
+                if ($RemainingItems.Count -eq 0) {
+                    Remove-SafePath $InstallRoot
+                }
+            }
+        }
+        catch { $RollbackFailed = $true }
+    }
+
+    if ($PriorTaskWasPresent) {
+        if ($Journal.TaskRegistration.Attempted) {
+            try {
+                $RestoredTaskXml = [System.IO.File]::ReadAllText($PriorTaskXmlPath)
+                [void]$TaskFolder.RegisterTask(
+                    $TaskName,
+                    $RestoredTaskXml,
+                    $TaskCreateOrUpdate,
+                    "SYSTEM",
+                    $null,
+                    $TaskLogonServiceAccount,
+                    $null
+                )
+            }
+            catch { $RollbackFailed = $true }
+        }
+        if ($PriorTaskWasActive -and
+            ($Journal.PriorTaskStop.Attempted -or
+                $Journal.TaskRegistration.Attempted)) {
+            try {
+                $RestoredTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+                if ($null -eq $RestoredTask) { throw "task restoration failed" }
+                if ([int]$RestoredTask.State -ne $TaskStateRunning) {
+                    [void]$RestoredTask.Run($null)
+                    if (-not (Wait-TaskRunning -Folder $TaskFolder -Name $TaskName)) {
+                        throw "task restart failed"
+                    }
+                }
+            }
+            catch { $RollbackFailed = $true }
+        }
+    }
+
+    try {
+        if (-not (Test-RollbackState)) { $RollbackFailed = $true }
     }
     catch { $RollbackFailed = $true }
 
-    foreach ($Name in $ManagedNames) {
+    if (-not $RollbackFailed) {
         try {
-            $LivePath = Join-Path $InstallRoot $Name
-            if (Test-Path -LiteralPath $LivePath) { Remove-SafePath $LivePath }
-            $BackupPath = Join-Path $BackupRoot $Name
-            if (Test-Path -LiteralPath $BackupPath) {
-                Move-Item -LiteralPath $BackupPath -Destination $LivePath
-            }
-        }
-        catch { $RollbackFailed = $true }
-    }
-    if (-not $InstallRootWasPresent) {
-        try { Remove-SafePath $InstallRoot }
-        catch { $RollbackFailed = $true }
-    }
-
-    if ($TaskWasPresent) {
-        try {
-            $BackupTask = Join-Path $InstallRoot "monitor_agent_task.xml"
-            if (-not (Test-RegularFile $BackupTask)) { throw "backup task is absent" }
-            & schtasks.exe /Create /TN MonitorAgent /XML $BackupTask /F | Out-Null
-            if ($LASTEXITCODE -ne 0 -or -not (Test-TaskExists)) {
-                throw "task restoration failed"
-            }
-            if ($TaskWasRunning) {
-                & schtasks.exe /Run /TN MonitorAgent | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "task restart failed" }
-                $RestoredTaskDetails = (& schtasks.exe /Query /TN MonitorAgent /FO LIST /V 2>&1 | Out-String)
-                if ($LASTEXITCODE -ne 0 -or $RestoredTaskDetails -notmatch "Running") {
-                    throw "task state verification failed"
-                }
-            }
+            Remove-SafePath $TransactionRoot
+            Remove-SafePath $BackupRoot
+            Remove-SafePath $RecoveryRoot
         }
         catch { $RollbackFailed = $true }
     }
     return -not $RollbackFailed
 }
 
-$Principal = New-Object Security.Principal.WindowsPrincipal(
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-)
-if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Fail "Administrator privileges required"
+$Journal = @{
+    InstallRoot = @{ Attempted = $false; Completed = $false }
+    PriorTaskStop = @{ Attempted = $false; Completed = $false }
+    TaskRegistration = @{ Attempted = $false; Completed = $false }
+    TaskStart = @{ Attempted = $false; Completed = $false }
+    PriorFiles = @{}
+    PublishedFiles = @{}
+    StateDirectories = @{}
 }
-
-Assert-RegularFile $WheelPath "wheel"
-if ([System.IO.Path]::GetExtension($WheelPath) -ine ".whl") {
-    Fail "wheel must have a .whl suffix"
+foreach ($Name in $ManagedNames) {
+    $Journal.PriorFiles[$Name] = @{
+        Existed = $false
+        BackupPrepared = $false
+        Removal = @{ Attempted = $false; Completed = $false }
+    }
+    $Journal.PublishedFiles[$Name] = @{ Attempted = $false; Completed = $false }
 }
-Assert-RegularFile $EnvironmentFile "environment file"
-Assert-RegularFile $LockPath "lock file"
-Assert-RegularFile $LauncherSource "launcher template"
-Assert-RegularFile $TaskSource "task template"
-if (-not (Test-PathCommand "py") -or -not (Test-PathCommand "schtasks.exe") -or
-    -not (Test-PathCommand "icacls.exe")) {
-    Fail "required Windows command is unavailable"
-}
-Assert-SafeDirectory $InstallParent "install parent"
-Assert-SafeDirectory $InstallRoot "install root"
-
-$TransactionRoot = Join-Path $InstallParent (".monitor-agent-transaction-" + [guid]::NewGuid())
-$BackupRoot = Join-Path $InstallParent (".monitor-agent-rollback-" + [guid]::NewGuid())
-$StageVenv = Join-Path $TransactionRoot "venv"
-$StageConfig = Join-Path $TransactionRoot "monitor-agent.env"
-$StageLauncher = Join-Path $TransactionRoot "run-agent.ps1"
-$StageTask = Join-Path $TransactionRoot "monitor_agent_task.xml"
-$StageLock = Join-Path $TransactionRoot "requirements.lock"
-$StageWheel = Join-Path $TransactionRoot (Split-Path -Leaf $WheelPath)
-$StagePython = Join-Path $StageVenv "Scripts\python.exe"
-$ManagedNames = @("venv", "monitor-agent.env", "run-agent.ps1", "monitor_agent_task.xml")
-$MutationStarted = $false
-$Succeeded = $false
-$TaskWasPresent = $false
-$TaskWasRunning = $false
-$InstallRootWasPresent = Test-Path -LiteralPath $InstallRoot
 
 try {
+    $Principal = New-Object Security.Principal.WindowsPrincipal(
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    )
+    if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Fail "Administrator privileges required"
+    }
+
+    Assert-RegularFile $WheelPath "wheel"
+    if ([System.IO.Path]::GetExtension($WheelPath) -ine ".whl") {
+        Fail "wheel must have a .whl suffix"
+    }
+    Assert-RegularFile $EnvironmentFile "environment file"
+    Assert-RegularFile $LockPath "lock file"
+    Assert-RegularFile $LauncherSource "launcher template"
+    Assert-RegularFile $TaskSource "task template"
+    if (-not (Test-PathCommand "py") -or -not (Test-PathCommand "icacls.exe")) {
+        Fail "required Windows command is unavailable"
+    }
+    Assert-SafeDirectory $InstallParent "install parent"
+    Assert-SafeDirectory $InstallRoot "install root"
+    $InstallRootWasPresent = Test-Path -LiteralPath $InstallRoot
+    if (Test-Path -LiteralPath $RecoveryRoot) {
+        Fail "recovery-required at C:\ProgramData\.monitor-agent-recovery"
+    }
+    foreach ($Name in $ManagedNames) {
+        $LivePath = Join-Path $InstallRoot $Name
+        Assert-SafeManagedPath $LivePath $Name
+        $Journal.PriorFiles[$Name].Existed = Test-Path -LiteralPath $LivePath
+    }
+    $TaskFolder = Connect-TaskScheduler
+
+    $FailureCategory = "staging"
+    New-Item -ItemType Directory -LiteralPath $RecoveryRoot -Force | Out-Null
+    Set-RestrictedAcl $RecoveryRoot
     New-Item -ItemType Directory -LiteralPath $TransactionRoot -Force | Out-Null
     Set-RestrictedAcl $TransactionRoot
+    New-Item -ItemType Directory -LiteralPath $BackupRoot -Force | Out-Null
+    Set-RestrictedAcl $BackupRoot
+
+    $StageVenv = Join-Path $TransactionRoot "venv"
+    $StageConfig = Join-Path $TransactionRoot "monitor-agent.env"
+    $StageLauncher = Join-Path $TransactionRoot "run-agent.ps1"
+    $StageTask = Join-Path $TransactionRoot "monitor_agent_task.xml"
+    $StageLock = Join-Path $TransactionRoot "requirements.lock"
+    $StageWheel = Join-Path $TransactionRoot (Split-Path -Leaf $WheelPath)
+    $StagePython = Join-Path $StageVenv "Scripts\python.exe"
     Copy-Item -LiteralPath $EnvironmentFile -Destination $StageConfig -Force
     Copy-Item -LiteralPath $LauncherSource -Destination $StageLauncher -Force
     Copy-Item -LiteralPath $TaskSource -Destination $StageTask -Force
     Copy-Item -LiteralPath $LockPath -Destination $StageLock -Force
     Copy-Item -LiteralPath $WheelPath -Destination $StageWheel -Force
+    Set-RestrictedAcl $TransactionRoot
 
     py "-$PythonVersion" -m venv $StageVenv
     if ($LASTEXITCODE -ne 0) { Fail "virtual environment creation failed" }
@@ -207,65 +481,157 @@ try {
     & $StageLauncher -Command check-config -InstallRoot $TransactionRoot
     if ($LASTEXITCODE -ne 0) { Fail "staged configuration validation failed" }
 
-    $TaskWasPresent = Test-TaskExists
-    if ($TaskWasPresent) {
-        $TaskDetails = (& schtasks.exe /Query /TN $TaskName /FO LIST /V 2>$null | Out-String)
-        if ($LASTEXITCODE -ne 0) { Fail "unable to inspect existing task" }
-        $TaskWasRunning = $TaskDetails -match "Running"
+    $FailureCategory = "prior-task-capture"
+    $PriorTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+    $PriorTaskWasPresent = $null -ne $PriorTask
+    if ($PriorTaskWasPresent) {
+        $PriorTaskXml = $PriorTask.Xml
+        $PriorTaskState = [int]$PriorTask.State
+        $PriorTaskWasRunning = $PriorTaskState -eq $TaskStateRunning
+        $PriorTaskWasActive = (
+            $PriorTaskState -eq $TaskStateRunning -or
+            $PriorTaskState -eq $TaskStateQueued
+        )
+        $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($PriorTaskXmlPath, $PriorTaskXml, $Utf8WithoutBom)
+        Set-RestrictedAcl $PriorTaskXmlPath
     }
 
     $MutationStarted = $true
-    New-Item -ItemType Directory -LiteralPath $BackupRoot -Force | Out-Null
-    Set-RestrictedAcl $BackupRoot
-    if (-not (Test-Path -LiteralPath $InstallRoot)) {
-        New-Item -ItemType Directory -LiteralPath $InstallRoot -Force | Out-Null
-    }
-    Assert-SafeDirectory $InstallRoot "install root"
-    if ($TaskWasPresent -and $TaskWasRunning) {
-        & schtasks.exe /End /TN $TaskName | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail "unable to stop existing task" }
-    }
-    foreach ($Name in $ManagedNames) {
-        $LivePath = Join-Path $InstallRoot $Name
-        if (Test-Path -LiteralPath $LivePath) {
-            $LiveItem = Get-Item -LiteralPath $LivePath -Force
-            if (Test-ReparsePoint $LiveItem) { Fail "managed target is unsafe" }
-            Move-Item -LiteralPath $LivePath -Destination (Join-Path $BackupRoot $Name)
+    if ($PriorTaskWasPresent -and $PriorTaskWasActive) {
+        $FailureCategory = "prior-task-stop"
+        [void](Invoke-JournaledMutation -Name "prior-task-stop" `
+            -State $Journal.PriorTaskStop -Action {
+                $PriorTask.Stop(0)
+            })
+        $StoppedTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+        if ($null -eq $StoppedTask -or
+            [int]$StoppedTask.State -eq $TaskStateRunning -or
+            [int]$StoppedTask.State -eq $TaskStateQueued) {
+            Fail "prior task stop verification failed"
         }
     }
-    foreach ($Name in $ManagedNames) {
-        Move-Item -LiteralPath (Join-Path $TransactionRoot $Name) -Destination (Join-Path $InstallRoot $Name)
+
+    $FailureCategory = "live-files"
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        [void](Invoke-JournaledMutation -Name "install-root" `
+            -State $Journal.InstallRoot -Action {
+                New-Item -ItemType Directory -LiteralPath $InstallRoot -Force |
+                    Out-Null
+            })
+        Set-RestrictedAcl $InstallRoot
     }
+    Assert-SafeDirectory $InstallRoot "install root"
+
+    foreach ($Name in $ManagedNames) {
+        $LivePath = Join-Path $InstallRoot $Name
+        $PriorState = $Journal.PriorFiles[$Name]
+        if ($PriorState.Existed) {
+            $BackupPath = Join-Path $BackupRoot $Name
+            Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force
+            Set-RestrictedAcl $BackupPath
+            $PriorState.BackupPrepared = $true
+            [void](Invoke-JournaledMutation -Name "remove-prior-file" `
+                -State $PriorState.Removal -Action {
+                    Remove-SafePath $LivePath
+                })
+        }
+    }
+
+    foreach ($Name in $ManagedNames) {
+        $StagePath = Join-Path $TransactionRoot $Name
+        $LivePath = Join-Path $InstallRoot $Name
+        $PublishedState = $Journal.PublishedFiles[$Name]
+        [void](Invoke-JournaledMutation -Name "publish-file" `
+            -State $PublishedState -Action {
+                Move-Item -LiteralPath $StagePath -Destination $LivePath
+            })
+        Set-RestrictedAcl $LivePath
+    }
+
     foreach ($StateDirectory in @("logs", "spool")) {
         $StatePath = Join-Path $InstallRoot $StateDirectory
         Assert-SafeDirectory $StatePath $StateDirectory
         if (-not (Test-Path -LiteralPath $StatePath)) {
-            New-Item -ItemType Directory -LiteralPath $StatePath -Force | Out-Null
+            $StateDirectoryJournal = @{
+                Attempted = $false
+                Completed = $false
+                Path = $StatePath
+            }
+            $Journal.StateDirectories[$StateDirectory] = $StateDirectoryJournal
+            [void](Invoke-JournaledMutation -Name "create-state-directory" `
+                -State $StateDirectoryJournal -Action {
+                    New-Item -ItemType Directory -LiteralPath $StatePath -Force |
+                        Out-Null
+                })
         }
     }
-    Set-RestrictedAcl $InstallRoot
-    foreach ($Name in $ManagedNames) { Set-RestrictedAcl (Join-Path $InstallRoot $Name) }
 
-    & schtasks.exe /Create /TN MonitorAgent /XML (Join-Path $InstallRoot "monitor_agent_task.xml") /F | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "task registration failed" }
-    & schtasks.exe /Run /TN MonitorAgent | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "task start failed" }
-    if (-not (Test-TaskExists)) { Fail "task registration verification failed" }
+    $FailureCategory = "replacement-registration"
+    $ReplacementTaskXml = [System.IO.File]::ReadAllText(
+        (Join-Path $InstallRoot "monitor_agent_task.xml")
+    )
+    $ReplacementTask = Invoke-JournaledMutation -Name "register-task" `
+        -State $Journal.TaskRegistration -Action {
+            $TaskFolder.RegisterTask(
+                $TaskName,
+                $ReplacementTaskXml,
+                $TaskCreateOrUpdate,
+                "SYSTEM",
+                $null,
+                $TaskLogonServiceAccount,
+                $null
+            )
+        }
+    if ($null -eq $ReplacementTask) { Fail "task registration failed" }
+
+    $FailureCategory = "replacement-start"
+    $RunningTask = Invoke-JournaledMutation -Name "start-task" `
+        -State $Journal.TaskStart -Action {
+            $ReplacementTask.Run($null)
+        }
+    if ($null -eq $RunningTask) { Fail "task start failed" }
+
+    $FailureCategory = "replacement-readiness"
+    if (-not (Wait-TaskRunning -Folder $TaskFolder -Name $TaskName)) {
+        Fail "replacement task readiness failed"
+    }
+
+    $DeploymentCommitted = $true
+    $FailureCategory = "cleanup"
+    Remove-SafePath $TransactionRoot
+    Remove-SafePath $BackupRoot
+    Remove-SafePath $RecoveryRoot
     $Succeeded = $true
 }
 catch {
+    if ($DeploymentCommitted) {
+        Write-Error ("monitor-agent install: deployment committed; " +
+            "recovery cleanup required at C:\ProgramData\.monitor-agent-recovery")
+        exit 1
+    }
+
+    $RollbackComplete = $false
     if ($MutationStarted) {
-        $null = Invoke-Rollback
+        Resolve-AmbiguousJournal
+        $RollbackComplete = Invoke-Rollback
     }
-    throw "monitor-agent install: deployment failed; recovery artifacts retained"
-}
-finally {
-    if ($Succeeded -and (Test-Path -LiteralPath $TransactionRoot)) {
-        Remove-SafePath $TransactionRoot
+    else {
+        try {
+            Remove-SafePath $RecoveryRoot
+            $RollbackComplete = -not (Test-Path -LiteralPath $RecoveryRoot)
+        }
+        catch { $RollbackComplete = $false }
     }
-    if ($Succeeded -and (Test-Path -LiteralPath $BackupRoot)) {
-        Remove-SafePath $BackupRoot
+
+    if ($RollbackComplete) {
+        Write-Error "monitor-agent install: deployment failed ($FailureCategory); rollback complete"
     }
+    else {
+        Write-Error ("monitor-agent install: deployment failed ($FailureCategory); " +
+            "recovery-required at C:\ProgramData\.monitor-agent-recovery")
+    }
+    exit 1
 }
 
 if ($Succeeded) { Write-Host "monitor-agent install: task deployed" }

@@ -3,6 +3,9 @@ param([switch]$Purge)
 $ErrorActionPreference = "Stop"
 $TaskName = "MonitorAgent"
 $InstallRoot = "C:\ProgramData\MonitorAgent"
+$TaskNotFoundHResult = -2147024894
+$TaskStateQueued = 2
+$TaskStateRunning = 4
 
 function Fail {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -22,17 +25,39 @@ function Assert-SafeManagedPath {
     return $true
 }
 
-function Test-TaskExists {
-    $TaskOutput = (& schtasks.exe /Query /TN MonitorAgent 2>&1 | Out-String)
-    if ($LASTEXITCODE -eq 0) { return $true }
-    if ($LASTEXITCODE -eq 1 -and $TaskOutput -match "(?i)(cannot find|does not exist)") {
-        return $false
+function Connect-TaskScheduler {
+    try {
+        $TaskService = New-Object -ComObject "Schedule.Service"
+        $TaskService.Connect()
+        return $TaskService.GetFolder("\")
     }
-    Fail "unable to query task"
+    catch {
+        Fail "task scheduler connection failed"
+    }
+}
+
+function Get-RegisteredTask {
+    param(
+        [Parameter(Mandatory = $true)]$Folder,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    try {
+        return $Folder.GetTask($Name)
+    }
+    catch [Runtime.InteropServices.COMException] {
+        if ($_.Exception.HResult -eq $TaskNotFoundHResult) { return $null }
+        Fail "task query failed"
+    }
+    catch {
+        Fail "task query failed"
+    }
 }
 
 function Verify-TaskAbsent {
-    if (Test-TaskExists) { Fail "task is still registered" }
+    param([Parameter(Mandatory = $true)]$Folder)
+    if ($null -ne (Get-RegisteredTask -Folder $Folder -Name $TaskName)) {
+        Fail "task is still registered"
+    }
 }
 
 function Remove-SafePath {
@@ -55,21 +80,23 @@ try {
     if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         Fail "Administrator privileges required"
     }
-    if ($null -eq (Get-Command schtasks.exe -CommandType Application -ErrorAction Ignore)) {
-        Fail "schtasks.exe is unavailable"
-    }
 
-    if (Test-TaskExists) {
-        $TaskDetails = (& schtasks.exe /Query /TN MonitorAgent /FO LIST /V 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) { Fail "unable to inspect task" }
-        if ($TaskDetails -match "Running") {
-            & schtasks.exe /End /TN MonitorAgent | Out-Null
-            if ($LASTEXITCODE -ne 0) { Fail "unable to stop task" }
+    $TaskFolder = Connect-TaskScheduler
+    $RegisteredTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+    if ($null -ne $RegisteredTask) {
+        if ([int]$RegisteredTask.State -eq $TaskStateRunning -or
+            [int]$RegisteredTask.State -eq $TaskStateQueued) {
+            $RegisteredTask.Stop(0)
+            $StoppedTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
+            if ($null -eq $StoppedTask -or
+                [int]$StoppedTask.State -eq $TaskStateRunning -or
+                [int]$StoppedTask.State -eq $TaskStateQueued) {
+                Fail "unable to stop task"
+            }
         }
-        & schtasks.exe /Delete /TN MonitorAgent /F | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail "unable to delete task" }
+        $TaskFolder.DeleteTask($TaskName, 0)
     }
-    Verify-TaskAbsent
+    Verify-TaskAbsent -Folder $TaskFolder
 
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         Write-Host "monitor-agent uninstall: task absent; no runtime files found"
