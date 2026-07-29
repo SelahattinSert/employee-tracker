@@ -170,15 +170,26 @@ fi
 if [ -d "$install_root" ]; then prior_install_root=1; else prior_install_root=0; fi
 if [ -d "$log_root" ]; then prior_log_root=1; else prior_log_root=0; fi
 if [ -d "$spool_root" ]; then prior_spool_root=1; else prior_spool_root=0; fi
+if [ -d "$install_root/venv" ]; then prior_venv=1; else prior_venv=0; fi
+if [ -f "$install_root/run-agent.sh" ]; then prior_launcher=1; else prior_launcher=0; fi
+if [ -f "$install_root/monitor-agent.env" ]; then prior_environment=1; else prior_environment=0; fi
+if [ -f "$plist_target" ]; then prior_plist=1; else prior_plist=0; fi
 
 transaction_dir=
 backup_root=
 staged_root=
 staged_plist=
-had_plist=0
 mutation_started=0
 daemon_state_mutated=0
 committed=0
+venv_backup_completed=0
+launcher_backup_completed=0
+environment_backup_completed=0
+plist_backup_completed=0
+venv_publication_completed=0
+launcher_publication_completed=0
+environment_publication_completed=0
+plist_publication_completed=0
 
 restore_launchdaemon() {
     restore_failed=0
@@ -213,26 +224,59 @@ stop_current_launchdaemon() {
     return 0
 }
 
+restore_component() {
+    restore_live=$1
+    restore_backup=$2
+    restore_prior=$3
+    restore_backup_completed=$4
+    restore_publication_completed=$5
+    restore_component_failed=0
+
+    if [ "$restore_backup_completed" -eq 1 ]; then
+        if [ "$restore_publication_completed" -eq 1 ]; then
+            if [ -e "$restore_live" ] || [ -L "$restore_live" ]; then
+                rm -rf "$restore_live" >/dev/null 2>&1 ||
+                    restore_component_failed=1
+            fi
+        elif [ -e "$restore_live" ] || [ -L "$restore_live" ]; then
+            restore_component_failed=1
+        fi
+        if [ "$restore_component_failed" -eq 0 ]; then
+            mv "$restore_backup" "$restore_live" >/dev/null 2>&1 ||
+                restore_component_failed=1
+        fi
+    elif [ "$restore_publication_completed" -eq 1 ]; then
+        if [ "$restore_prior" -eq 0 ]; then
+            rm -rf "$restore_live" >/dev/null 2>&1 ||
+                restore_component_failed=1
+        else
+            restore_component_failed=1
+        fi
+    fi
+
+    [ "$restore_component_failed" -eq 0 ]
+}
+
 rollback() {
     rollback_failed=0
     if [ "$mutation_started" -eq 1 ]; then
         stop_current_launchdaemon || rollback_failed=1
-        for component in venv run-agent.sh monitor-agent.env; do
-            live_component="$install_root/$component"
-            backup_component="$backup_root/$component"
-            if [ -e "$backup_component" ]; then
-                rm -rf "$live_component" >/dev/null 2>&1 || rollback_failed=1
-                mv "$backup_component" "$live_component" >/dev/null 2>&1 || rollback_failed=1
-            elif [ -e "$live_component" ]; then
-                rm -rf "$live_component" >/dev/null 2>&1 || rollback_failed=1
-            fi
-        done
-        if [ -e "$backup_root/com.company.monitor-agent.plist" ]; then
-            rm -f "$plist_target" >/dev/null 2>&1 || rollback_failed=1
-            mv "$backup_root/com.company.monitor-agent.plist" "$plist_target" >/dev/null 2>&1 || rollback_failed=1
-        elif [ "$had_plist" -eq 0 ]; then
-            rm -f "$plist_target" >/dev/null 2>&1 || rollback_failed=1
-        fi
+        restore_component \
+            "$install_root/venv" "$backup_root/venv" \
+            "$prior_venv" "$venv_backup_completed" \
+            "$venv_publication_completed" || rollback_failed=1
+        restore_component \
+            "$install_root/run-agent.sh" "$backup_root/run-agent.sh" \
+            "$prior_launcher" "$launcher_backup_completed" \
+            "$launcher_publication_completed" || rollback_failed=1
+        restore_component \
+            "$install_root/monitor-agent.env" "$backup_root/monitor-agent.env" \
+            "$prior_environment" "$environment_backup_completed" \
+            "$environment_publication_completed" || rollback_failed=1
+        restore_component \
+            "$plist_target" "$backup_root/com.company.monitor-agent.plist" \
+            "$prior_plist" "$plist_backup_completed" \
+            "$plist_publication_completed" || rollback_failed=1
         restore_launchdaemon || rollback_failed=1
         if [ "$prior_spool_root" -eq 0 ] && [ -d "$spool_root" ] &&
             [ ! -L "$spool_root" ]; then
@@ -268,7 +312,10 @@ cleanup() {
         printf '%s\n' "monitor-agent install: installation failed" >&2
     fi
     if [ "$original_status" -eq 0 ] && [ -n "$transaction_dir" ]; then
-        rm -rf "$transaction_dir" >/dev/null 2>&1 || exit 1
+        if ! rm -rf "$transaction_dir" >/dev/null 2>&1; then
+            printf '%s\n' "monitor-agent install: cleanup incomplete; recovery retained at $transaction_dir" >&2
+            exit 1
+        fi
     fi
     exit "$original_status"
 }
@@ -316,22 +363,33 @@ fi
 ensure_secure_directory "$install_root"
 ensure_secure_directory "$log_root"
 ensure_secure_directory "$spool_root"
-for component in venv run-agent.sh monitor-agent.env; do
-    if [ -e "$install_root/$component" ] || [ -L "$install_root/$component" ]; then
-        if [ -L "$install_root/$component" ]; then
-            fail "monitor-agent install: unsafe deployment target"
-        fi
-        mv "$install_root/$component" "$backup_root/$component" || fail "monitor-agent install: publish failed"
-    fi
-done
-if [ -e "$plist_target" ]; then
+if [ "$prior_venv" -eq 1 ]; then
+    mv "$install_root/venv" "$backup_root/venv" ||
+        fail "monitor-agent install: publish failed"
+    venv_backup_completed=1
+fi
+if [ "$prior_launcher" -eq 1 ]; then
+    mv "$install_root/run-agent.sh" "$backup_root/run-agent.sh" ||
+        fail "monitor-agent install: publish failed"
+    launcher_backup_completed=1
+fi
+if [ "$prior_environment" -eq 1 ]; then
+    mv "$install_root/monitor-agent.env" "$backup_root/monitor-agent.env" ||
+        fail "monitor-agent install: publish failed"
+    environment_backup_completed=1
+fi
+if [ "$prior_plist" -eq 1 ]; then
     mv "$plist_target" "$backup_root/com.company.monitor-agent.plist" || fail "monitor-agent install: publish failed"
-    had_plist=1
+    plist_backup_completed=1
 fi
 mv "$staged_root/venv" "$install_root/venv" || fail "monitor-agent install: publish failed"
+venv_publication_completed=1
 mv "$staged_root/run-agent.sh" "$install_root/run-agent.sh" || fail "monitor-agent install: publish failed"
+launcher_publication_completed=1
 mv "$staged_root/monitor-agent.env" "$install_root/monitor-agent.env" || fail "monitor-agent install: publish failed"
+environment_publication_completed=1
 mv "$staged_plist" "$plist_target" || fail "monitor-agent install: publish failed"
+plist_publication_completed=1
 verify_owner_mode "$install_root/run-agent.sh" 700
 verify_owner_mode "$install_root/monitor-agent.env" 600
 verify_owner_mode "$plist_target" 644

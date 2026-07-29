@@ -130,7 +130,6 @@ def _deployment_harness(
     for expected, replacement in replacements.items():
         installer_text = _replace_once(installer_text, expected, replacement)
     installer.write_text(installer_text, encoding="utf-8")
-    installer.chmod(0o755)
     uninstaller = macos / "uninstall.sh"
     uninstaller_text = uninstaller.read_text(encoding="utf-8")
     for expected, replacement in {
@@ -142,7 +141,6 @@ def _deployment_harness(
     }.items():
         uninstaller_text = _replace_once(uninstaller_text, expected, replacement)
     uninstaller.write_text(uninstaller_text, encoding="utf-8")
-    uninstaller.chmod(0o755)
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -150,6 +148,26 @@ def _deployment_harness(
     _write_executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")
     _write_executable(fake_bin / "chmod", "#!/bin/sh\nexec /usr/bin/chmod \"$@\"\n")
     _write_executable(fake_bin / "install", "#!/bin/sh\nexec /usr/bin/install \"$@\"\n")
+    _write_executable(
+        fake_bin / "mv",
+        "#!/bin/sh\n"
+        'if [ -n "${FAIL_MV_SOURCE:-}" ] && [ "$1" = "$FAIL_MV_SOURCE" ]; then\n'
+        "  exit 1\n"
+        "fi\n"
+        'exec /usr/bin/mv "$@"\n',
+    )
+    _write_executable(
+        fake_bin / "rm",
+        "#!/bin/sh\n"
+        "rm_target=\n"
+        'for rm_argument in "$@"; do rm_target=$rm_argument; done\n'
+        'if [ "${FAIL_RM_TRANSACTION:-0}" = 1 ]; then\n'
+        '  case "$rm_target" in\n'
+        '    "$TRANSACTION_PARENT"/.monitor-agent-transaction.*) exit 1 ;;\n'
+        "  esac\n"
+        "fi\n"
+        'exec /usr/bin/rm "$@"\n',
+    )
     _write_executable(
         fake_bin / "stat",
         "#!/bin/sh\n"
@@ -213,6 +231,7 @@ def _deployment_harness(
             "LAUNCHD_STATE": str(state),
             "LAUNCHD_RUNNING": str(running),
             "LAUNCHD_FAIL_ONCE": str(tmp_path / "launchd-failed-once"),
+            "TRANSACTION_PARENT": str(app_parent),
         }
     )
     return installer, uninstaller, install_root, env, log_root
@@ -333,11 +352,14 @@ def test_installer_has_transactional_preflight_and_locked_installation() -> None
     assert "|| true" not in text
     assert '"$launchd_running" -ne 1' in text
     assert text.index('launchctl bootout "system/$launchd_label"') < text.index(
-        'mv "$install_root/$component" "$backup_root/$component"'
+        'mv "$install_root/venv" "$backup_root/venv"'
     )
     assert text.index("stop_current_launchdaemon || rollback_failed=1") < text.index(
-        "for component in venv run-agent.sh monitor-agent.env; do"
+        "restore_component \\"
     )
+    for component in ("venv", "launcher", "environment", "plist"):
+        assert f"{component}_backup_completed=0" in text
+        assert f"{component}_publication_completed=0" in text
 
 
 def test_uninstaller_is_state_aware_and_preserves_data_by_default() -> None:
@@ -374,7 +396,9 @@ def test_shell_scripts_pass_posix_syntax_and_no_insecure_modes() -> None:
     )
     assert result.returncode == 0, result.stderr
     for path in (LAUNCHER, INSTALLER, UNINSTALLER):
-        assert stat.S_IMODE(path.stat().st_mode) & 0o022 == 0
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode & stat.S_IXUSR
+        assert mode & 0o022 == 0
 
 
 def test_installer_stage_failure_does_not_mutate_live_files(tmp_path: Path) -> None:
@@ -410,6 +434,47 @@ def test_installer_activation_failure_rolls_back_prior_runtime_and_launchd(
     assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == "old launcher"
     assert plist.read_text(encoding="utf-8") == "old plist"
     assert (tmp_path / "launchd-state").read_text(encoding="utf-8") == "1\n"
+
+
+@pytest.mark.parametrize("failed_backup", ["run-agent.sh", "plist"])
+def test_installer_backup_rename_failure_preserves_every_prior_artifact_and_daemon(
+    tmp_path: Path, failed_backup: str
+) -> None:
+    installer, _, install_root, env, _ = _deployment_harness(tmp_path, loaded=True)
+    (install_root / "venv").mkdir(parents=True)
+    (install_root / "venv" / "old").write_text("old venv", encoding="utf-8")
+    (install_root / "run-agent.sh").write_text("old launcher", encoding="utf-8")
+    (install_root / "monitor-agent.env").write_text(
+        "MONITOR_API_TOKEN=old secret\n", encoding="utf-8"
+    )
+    plist = (
+        tmp_path
+        / "managed"
+        / "Library"
+        / "LaunchDaemons"
+        / "com.company.monitor-agent.plist"
+    )
+    plist.write_text("old plist", encoding="utf-8")
+    env["FAIL_MV_SOURCE"] = str(
+        install_root / "run-agent.sh" if failed_backup == "run-agent.sh" else plist
+    )
+
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert (install_root / "venv" / "old").read_text(encoding="utf-8") == "old venv"
+    assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == "old launcher"
+    assert (install_root / "monitor-agent.env").read_text(
+        encoding="utf-8"
+    ) == "MONITOR_API_TOKEN=old secret\n"
+    assert plist.read_text(encoding="utf-8") == "old plist"
+    assert (tmp_path / "launchd-state").read_text(encoding="utf-8") == "1\n"
+    assert (tmp_path / "launchd-running").read_text(encoding="utf-8") == "1\n"
 
 
 def test_installer_restores_a_prior_loaded_but_stopped_daemon(tmp_path: Path) -> None:
@@ -469,10 +534,28 @@ def test_installer_rejects_loaded_daemon_without_a_managed_plist(tmp_path: Path)
     assert not list(install_root.parent.glob(".monitor-agent-transaction.*"))
 
 
-def test_installer_success_preserves_logs_and_spool_and_cleans_transaction(tmp_path: Path) -> None:
-    installer, _, install_root, env, log_root = _deployment_harness(tmp_path)
+def test_installer_successful_upgrade_replaces_runtime_preserves_data_and_cleans_transaction(
+    tmp_path: Path,
+) -> None:
+    installer, _, install_root, env, log_root = _deployment_harness(
+        tmp_path, loaded=True
+    )
+    (install_root / "venv").mkdir(parents=True)
+    (install_root / "venv" / "old").write_text("old venv", encoding="utf-8")
+    (install_root / "run-agent.sh").write_text("old launcher", encoding="utf-8")
+    (install_root / "monitor-agent.env").write_text(
+        "MONITOR_API_TOKEN=old secret\n", encoding="utf-8"
+    )
+    plist = (
+        tmp_path
+        / "managed"
+        / "Library"
+        / "LaunchDaemons"
+        / "com.company.monitor-agent.plist"
+    )
+    plist.write_text("old plist", encoding="utf-8")
     spool = install_root / "spool"
-    spool.mkdir(parents=True)
+    spool.mkdir()
     (spool / "queued.json").write_text("queued", encoding="utf-8")
     log_root.mkdir(parents=True)
     (log_root / "agent.log").write_text("prior log", encoding="utf-8")
@@ -481,7 +564,40 @@ def test_installer_success_preserves_logs_and_spool_and_cleans_transaction(tmp_p
     assert (spool / "queued.json").read_text(encoding="utf-8") == "queued"
     assert (log_root / "agent.log").read_text(encoding="utf-8") == "prior log"
     assert (install_root / "venv" / "bin" / "monitor-agent").is_file()
+    assert not (install_root / "venv" / "old").exists()
+    assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == _script(
+        LAUNCHER
+    )
+    assert (install_root / "monitor-agent.env").read_text(
+        encoding="utf-8"
+    ) == "MONITOR_API_TOKEN=new secret=value\n"
+    assert plist.read_bytes() == PLIST.read_bytes()
+    assert (tmp_path / "launchd-state").read_text(encoding="utf-8") == "1\n"
+    assert (tmp_path / "launchd-running").read_text(encoding="utf-8") == "1\n"
     assert not list(install_root.parent.glob(".monitor-agent-transaction.*"))
+
+
+def test_installer_success_cleanup_failure_names_retained_recovery(
+    tmp_path: Path,
+) -> None:
+    installer, _, install_root, env, _ = _deployment_harness(tmp_path)
+    env["FAIL_RM_TRANSACTION"] = "1"
+
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
+
+    transactions = list(install_root.parent.glob(".monitor-agent-transaction.*"))
+    assert result.returncode != 0
+    assert len(transactions) == 1
+    assert result.stderr == (
+        "monitor-agent install: cleanup incomplete; recovery retained at "
+        f"{transactions[0]}\n"
+    )
+    assert "new secret=value" not in result.stderr
 
 
 def test_uninstaller_handles_absence_unexpected_state_default_and_purge(tmp_path: Path) -> None:
