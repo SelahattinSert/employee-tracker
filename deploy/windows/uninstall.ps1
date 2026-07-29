@@ -18,11 +18,32 @@ function Test-ReparsePoint {
 }
 
 function Assert-SafeManagedPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][bool]$ExpectedDirectory
+    )
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     $Item = Get-Item -LiteralPath $Path -Force
     if (Test-ReparsePoint $Item) { Fail "managed target is unsafe" }
+    if ($Item.PSIsContainer -ne $ExpectedDirectory) {
+        Fail "managed target type is unsafe"
+    }
     return $true
+}
+
+function Assert-UninstallTargetsSafe {
+    if (-not (Test-Path -LiteralPath $InstallRoot)) { return }
+    [void](Assert-SafeManagedPath -Path $InstallRoot -ExpectedDirectory $true)
+    $RuntimeTargets = @(
+        @{ Name = "venv"; ExpectedDirectory = $true },
+        @{ Name = "run-agent.ps1"; ExpectedDirectory = $false },
+        @{ Name = "monitor_agent_task.xml"; ExpectedDirectory = $false }
+    )
+    foreach ($RuntimeTarget in $RuntimeTargets) {
+        [void](Assert-SafeManagedPath `
+            -Path (Join-Path $InstallRoot $RuntimeTarget.Name) `
+            -ExpectedDirectory $RuntimeTarget.ExpectedDirectory)
+    }
 }
 
 function Connect-TaskScheduler {
@@ -61,16 +82,27 @@ function Verify-TaskAbsent {
 }
 
 function Remove-SafePath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if (Assert-SafeManagedPath $Path) {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][bool]$ExpectedDirectory
+    )
+    if (Assert-SafeManagedPath `
+        -Path $Path `
+        -ExpectedDirectory $ExpectedDirectory) {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
 }
 
 function Remove-RuntimeArtifacts {
-    foreach ($Name in @("venv", "run-agent.ps1", "monitor_agent_task.xml")) {
-        Remove-SafePath (Join-Path $InstallRoot $Name)
-    }
+    Remove-SafePath `
+        -Path (Join-Path $InstallRoot "venv") `
+        -ExpectedDirectory $true
+    Remove-SafePath `
+        -Path (Join-Path $InstallRoot "run-agent.ps1") `
+        -ExpectedDirectory $false
+    Remove-SafePath `
+        -Path (Join-Path $InstallRoot "monitor_agent_task.xml") `
+        -ExpectedDirectory $false
 }
 
 try {
@@ -81,6 +113,7 @@ try {
         Fail "Administrator privileges required"
     }
 
+    Assert-UninstallTargetsSafe
     $TaskFolder = Connect-TaskScheduler
     $RegisteredTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
     if ($null -ne $RegisteredTask) {
@@ -102,10 +135,7 @@ try {
         Write-Host "monitor-agent uninstall: task absent; no runtime files found"
         exit 0
     }
-    $RootItem = Get-Item -LiteralPath $InstallRoot -Force
-    if (-not $RootItem.PSIsContainer -or (Test-ReparsePoint $RootItem)) {
-        Fail "install root is unsafe"
-    }
+    Assert-UninstallTargetsSafe
     if ($Purge) {
         Remove-Item -LiteralPath $InstallRoot -Recurse -Force
         Write-Host "monitor-agent uninstall: installation purged"

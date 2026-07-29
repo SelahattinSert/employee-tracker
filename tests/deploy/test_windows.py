@@ -175,6 +175,21 @@ def test_installer_stages_validates_and_uses_hash_locked_python_versions() -> No
     assert "Administrator" in text
 
 
+def test_installer_preflights_every_required_windows_command() -> None:
+    text = _script(INSTALLER)
+    live_flow = text[text.index("try {\n    $Principal") :]
+    command_check = live_flow[: live_flow.index("Assert-SafeDirectory $InstallParent")]
+    assert 'Test-PathCommand "py"' in command_check
+    assert 'Test-PathCommand "schtasks.exe"' in command_check
+    assert 'Test-PathCommand "icacls.exe"' in command_check
+
+
+def test_restricted_acl_verifies_inheritance_is_protected() -> None:
+    acl_function = _function(_script(INSTALLER), "Set-RestrictedAcl")
+    assert ".AreAccessRulesProtected" in acl_function
+    assert 'Fail "DACL verification failed"' in acl_function
+
+
 def test_installer_uses_locale_independent_task_scheduler_state() -> None:
     text = _script(INSTALLER)
     assert 'New-Object -ComObject "Schedule.Service"' in text
@@ -184,10 +199,40 @@ def test_installer_uses_locale_independent_task_scheduler_state() -> None:
     assert "$TaskStateRunning = 4" in text
     assert ".Exception.HResult -eq $TaskNotFoundHResult" in text
     assert "[int]$RegisteredTask.State" in text
-    assert "schtasks" not in text.lower()
+    assert text.count('Test-PathCommand "schtasks.exe"') == 1
+    assert not re.search(r"(?m)^\s*&\s*schtasks", text, re.IGNORECASE)
     assert "-match \"Running\"" not in text
     assert "cannot find" not in text.lower()
     assert "does not exist" not in text.lower()
+
+
+def test_installer_preserves_custom_registered_task_sddl_on_rollback() -> None:
+    text = _script(INSTALLER)
+    rollback = _function(text, "Invoke-Rollback")
+    rollback_verification = _function(text, "Test-RollbackState")
+    assert "$TaskSecurityOwner = 0x1" in text
+    assert "$TaskSecurityGroup = 0x2" in text
+    assert "$TaskSecurityDacl = 0x4" in text
+    assert "$TaskSecurityInformation = (" in text
+    assert "$TaskDontAddPrincipalAce = 0x10" in text
+    assert "$TaskRestoreFlags = (" in text
+    assert "$PriorTask.GetSecurityDescriptor($TaskSecurityInformation)" in text
+    assert "$PriorTaskSddl" in rollback
+    register_call = rollback[rollback.index("$TaskFolder.RegisterTask(") :]
+    assert "$TaskRestoreFlags" in register_call
+    assert re.search(
+        r"\$TaskLogonServiceAccount,\s*\$PriorTaskSddl\s*\)",
+        register_call,
+    )
+    assert "$ObservedTask.GetSecurityDescriptor($TaskSecurityInformation)" in (
+        rollback_verification
+    )
+    capture_block = text[
+        text.index("if ($PriorTaskWasPresent) {") : text.index(
+            "$MutationStarted = $true"
+        )
+    ]
+    assert "GetSecurityDescriptor" in capture_block
 
 
 def test_installer_exports_protects_and_restores_exact_registered_task_xml() -> None:
@@ -213,6 +258,55 @@ def test_installer_exports_protects_and_restores_exact_registered_task_xml() -> 
     assert "if ($PriorTaskWasPresent -and $PriorTaskWasActive)" in text
 
 
+def test_installer_locks_existing_root_transactionally_before_live_replacement() -> None:
+    text = _script(INSTALLER)
+    live_flow = text[text.index("try {\n    $Principal") :]
+    rollback = _function(text, "Invoke-Rollback")
+    rollback_verification = _function(text, "Test-RollbackState")
+    assert "Get-FileSystemSecuritySnapshot" in text
+    assert "$Journal.InstallRoot.SecuritySnapshot" in text
+    _assert_ordered(
+        live_flow,
+        "$Journal.InstallRoot.SecuritySnapshot",
+        "$MutationStarted = $true",
+        'Invoke-JournaledMutation -Name "restrict-install-root"',
+        'Invoke-JournaledMutation -Name "prior-task-stop"',
+        'Invoke-JournaledMutation -Name "remove-prior-file"',
+    )
+    assert "Restore-FileSystemSecuritySnapshot" in rollback
+    assert "$Journal.InstallRoot.SecuritySnapshot" in rollback
+    assert "Test-FileSystemSecuritySnapshot" in rollback_verification
+
+
+def test_installer_restores_prior_managed_filesystem_security_metadata() -> None:
+    text = _script(INSTALLER)
+    rollback = _function(text, "Invoke-Rollback")
+    rollback_verification = _function(text, "Test-RollbackState")
+    assert "Get-FileSystemSecurityTree" in text
+    assert "Restore-FileSystemSecurityTree" in text
+    assert "Test-FileSystemSecurityTree" in text
+    assert "[Security.AccessControl.AccessControlSections]::Access" in text
+    assert "[Security.AccessControl.AccessControlSections]::Owner" in text
+    assert "[Security.AccessControl.AccessControlSections]::Group" in text
+    security_snapshot = _function(text, "Get-FileSystemSecuritySnapshot")
+    assert "Get-Acl -LiteralPath $Path" in security_snapshot
+    _assert_ordered(
+        text,
+        "$PriorState.SecuritySnapshots = Get-FileSystemSecurityTree $LivePath",
+        "Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force",
+        "Set-RestrictedAcl $BackupPath",
+        "$PriorState.BackupPrepared = $true",
+        'Invoke-JournaledMutation -Name "remove-prior-file"',
+    )
+    assert (
+        "Restore-FileSystemSecurityTree $PriorState.SecuritySnapshots" in rollback
+    )
+    assert "Set-RestrictedAcl $LivePath" not in rollback
+    assert "Test-FileSystemSecurityTree $PriorState.SecuritySnapshots" in (
+        rollback_verification
+    )
+
+
 def test_installer_journals_every_live_mutation_boundary() -> None:
     text = _script(INSTALLER)
     mutation_helper = _function(text, "Invoke-JournaledMutation")
@@ -224,6 +318,7 @@ def test_installer_journals_every_live_mutation_boundary() -> None:
     )
     boundaries = (
         "install-root",
+        "restrict-install-root",
         "prior-task-stop",
         "remove-prior-file",
         "publish-file",
@@ -255,6 +350,7 @@ def test_transformed_real_journal_control_flow_injects_each_boundary_failure() -
     )
     assert set(boundaries) == {
         "install-root",
+        "restrict-install-root",
         "prior-task-stop",
         "remove-prior-file",
         "publish-file",
@@ -334,8 +430,8 @@ def test_installer_requires_bounded_replacement_readiness_and_cleans_success() -
     assert "for ($Attempt = 0; $Attempt -lt $ReadinessAttempts; $Attempt++)" in readiness
     assert "Start-Sleep -Milliseconds $ReadinessDelayMilliseconds" in readiness
     assert "[int]$RegisteredTask.State -eq $TaskStateRunning" in readiness
-    assert "[int]$RegisteredTask.State -ne $TaskStateQueued" in readiness
-    assert "[int]$RegisteredTask.State -ne $TaskStateReady" in readiness
+    assert "[int]$RegisteredTask.State -eq $TaskStateQueued" in readiness
+    assert "[int]$RegisteredTask.State -eq $TaskStateReady" in readiness
     assert "$DeploymentCommitted = $true" in text
     assert "if ($DeploymentCommitted)" in text
     _assert_ordered(
@@ -347,6 +443,22 @@ def test_installer_requires_bounded_replacement_readiness_and_cleans_success() -
         "Remove-SafePath $RecoveryRoot",
         '$Succeeded = $true',
     )
+
+
+def test_installer_requires_running_to_survive_the_full_observation_window() -> None:
+    readiness = _function(_script(INSTALLER), "Wait-TaskRunning")
+    assert "$ObservedRunning = $false" in readiness
+    assert "$ObservedRunning = $true" in readiness
+    assert "if (-not $ObservedRunning) { return $false }" in readiness
+    assert re.search(
+        r"for \(\$StabilityAttempt = 0;\s*"
+        r"\$StabilityAttempt -lt \$ReadinessAttempts;\s*"
+        r"\$StabilityAttempt\+\+\)",
+        readiness,
+    )
+    stability_loop = readiness[readiness.index("for ($StabilityAttempt = 0;") :]
+    assert "[int]$RegisteredTask.State -ne $TaskStateRunning" in stability_loop
+    assert stability_loop.index("return $false") < stability_loop.index("return $true")
 
 
 def test_uninstaller_uses_same_api_semantics_and_blocks_cleanup_on_task_failures() -> None:
@@ -379,6 +491,24 @@ def test_uninstaller_uses_same_api_semantics_and_blocks_cleanup_on_task_failures
     assert 'Write-Error "monitor-agent uninstall: failed"' in text
 
 
+def test_uninstaller_preflights_root_and_runtime_types_before_task_mutation() -> None:
+    text = _script(UNINSTALLER)
+    live_flow = text[text.index("try {\n    $Principal") :]
+    preflight = _function(text, "Assert-UninstallTargetsSafe")
+    assert '"venv"' in preflight
+    assert '"run-agent.ps1"' in preflight
+    assert '"monitor_agent_task.xml"' in preflight
+    assert "$ExpectedDirectory" in text
+    assert "$Item.PSIsContainer -ne $ExpectedDirectory" in text
+    _assert_ordered(
+        live_flow,
+        "Assert-UninstallTargetsSafe",
+        "Connect-TaskScheduler",
+        "$RegisteredTask.Stop(0)",
+        "$TaskFolder.DeleteTask($TaskName, 0)",
+    )
+
+
 def test_real_powershell_control_flow_handles_injected_deployment_failures() -> None:
     pwsh = shutil.which("pwsh")
     if pwsh is None:
@@ -387,8 +517,43 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     installer = _script(INSTALLER)
     uninstaller = _script(UNINSTALLER)
     fake_acl = """function Set-RestrictedAcl {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse
+    )
     if (-not (Test-Path -LiteralPath $Path)) { throw "missing ACL target" }
+    $Targets = @((Get-Item -LiteralPath $Path -Force))
+    if ($Recurse -and $Targets[0].PSIsContainer) {
+        $Targets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
+    }
+    foreach ($TargetItem in $Targets) {
+        $global:SecurityState[$TargetItem.FullName] = "restricted"
+    }
+    Add-Content -LiteralPath $global:TaskLogPath -Value ("acl:" + $Targets[0].FullName)
+}"""
+    fake_security_snapshot = """function Get-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Item = Get-Item -LiteralPath $Path -Force
+    if (-not $global:SecurityState.ContainsKey($Item.FullName)) {
+        $global:SecurityState[$Item.FullName] = "prior-security"
+    }
+    return @{
+        Path = $Item.FullName
+        IsDirectory = [bool]$Item.PSIsContainer
+        Sddl = $global:SecurityState[$Item.FullName]
+    }
+}"""
+    fake_security_restore = """function Restore-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+    $global:SecurityState[$Snapshot.Path] = $Snapshot.Sddl
+    Add-Content -LiteralPath $global:TaskLogPath -Value (
+        "restore-security:" + $Snapshot.Path + ":" + $Snapshot.Sddl
+    )
+}"""
+    fake_security_test = """function Test-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+    if (-not (Test-Path -LiteralPath $Snapshot.Path)) { return $false }
+    return $global:SecurityState[$Snapshot.Path] -eq $Snapshot.Sddl
 }"""
     fake_connect = """function Connect-TaskScheduler {
     return $global:FakeTaskFolder
@@ -401,12 +566,12 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     }
 
 """
-    command_check = (
-        '    if (-not (Test-PathCommand "py") -or -not '
-        '(Test-PathCommand "icacls.exe")) {\n'
-        '        Fail "required Windows command is unavailable"\n'
-        "    }\n"
-    )
+    command_check = """    if (-not (Test-PathCommand "py") -or
+        -not (Test-PathCommand "schtasks.exe") -or
+        -not (Test-PathCommand "icacls.exe")) {
+        Fail "required Windows command is unavailable"
+    }
+"""
     staged_commands_start = '    py "-$PythonVersion" -m venv $StageVenv\n'
     staged_commands_end = (
         '    if ($LASTEXITCODE -ne 0) { '
@@ -438,10 +603,33 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
         )
         transformed_install = transformed_install.replace(admin_check, "")
         transformed_install = transformed_install.replace(command_check, "")
+        transformed_install = transformed_install.replace(
+            "$ReadinessAttempts = 20",
+            "$ReadinessAttempts = 3",
+        )
+        transformed_install = transformed_install.replace(
+            "$ReadinessDelayMilliseconds = 250",
+            "$ReadinessDelayMilliseconds = 1",
+        )
         transformed_install = _replace_function(
             transformed_install,
             "Set-RestrictedAcl",
             fake_acl,
+        )
+        transformed_install = _replace_function(
+            transformed_install,
+            "Get-FileSystemSecuritySnapshot",
+            fake_security_snapshot,
+        )
+        transformed_install = _replace_function(
+            transformed_install,
+            "Restore-FileSystemSecuritySnapshot",
+            fake_security_restore,
+        )
+        transformed_install = _replace_function(
+            transformed_install,
+            "Test-FileSystemSecuritySnapshot",
+            fake_security_test,
         )
         transformed_install = _replace_function(
             transformed_install,
@@ -497,7 +685,8 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     [string]$FailurePosition,
     [string]$FailureMode,
     [string]$TaskLog,
-    [string]$PriorTaskXml
+    [string]$PriorTaskXml,
+    [string]$PriorTaskSddl
 )
 $ErrorActionPreference = "Stop"
 $global:FailureBoundary = $FailureBoundary
@@ -505,10 +694,18 @@ $global:FailurePosition = $FailurePosition
 $global:FailureMode = $FailureMode
 $global:TaskLogPath = $TaskLog
 $global:PartialRegistrationUsed = $false
+$global:LateCrashUsed = $false
+$global:ObserveReadiness = $false
+$global:ReadinessSequence = @()
+$global:SecurityState = @{}
 
 function New-FakeTask {
-    param([string]$Xml, [int]$State)
-    $Task = [pscustomobject]@{ Xml = $Xml; State = $State }
+    param([string]$Xml, [int]$State, [string]$Sddl)
+    $Task = [pscustomobject]@{ Xml = $Xml; State = $State; Sddl = $Sddl }
+    $Task | Add-Member -MemberType ScriptMethod -Name GetSecurityDescriptor -Value {
+        param($SecurityInformation)
+        return $this.Sddl
+    }
     $Task | Add-Member -MemberType ScriptMethod -Name Stop -Value {
         param($Flags)
         Add-Content -LiteralPath $global:TaskLogPath -Value "stop"
@@ -518,7 +715,20 @@ function New-FakeTask {
     $Task | Add-Member -MemberType ScriptMethod -Name Run -Value {
         param($Parameters)
         Add-Content -LiteralPath $global:TaskLogPath -Value "run"
-        if ($global:FailureBoundary -eq "readiness") {
+        if (($global:FailureMode -eq "late-crash" -or
+                $global:FailureMode -eq "late-running") -and
+            -not $global:LateCrashUsed) {
+            $global:LateCrashUsed = $true
+            $global:ObserveReadiness = $true
+            if ($global:FailureMode -eq "late-running") {
+                $global:ReadinessSequence = @(3, 3, 4, 3)
+            }
+            else {
+                $global:ReadinessSequence = @(4, 4, 3)
+            }
+            $this.State = 4
+        }
+        elseif ($global:FailureBoundary -eq "readiness") {
             $this.State = 3
         }
         else {
@@ -529,8 +739,15 @@ function New-FakeTask {
     return $Task
 }
 
+$InitialTask = $null
+if (-not [string]::IsNullOrEmpty($PriorTaskXml)) {
+    $InitialTask = New-FakeTask `
+        -Xml $PriorTaskXml `
+        -State 4 `
+        -Sddl $PriorTaskSddl
+}
 $Folder = [pscustomobject]@{
-    Task = (New-FakeTask -Xml $PriorTaskXml -State 4)
+    Task = $InitialTask
 }
 $Folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
     param($Name)
@@ -539,6 +756,17 @@ $Folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
             throw [Runtime.InteropServices.COMException]::new("query", -1)
         }
         throw [Runtime.InteropServices.COMException]::new("absent", -2147024894)
+    }
+    if ($global:ObserveReadiness -and $global:ReadinessSequence.Count -gt 0) {
+        $this.Task.State = [int]$global:ReadinessSequence[0]
+        if ($global:ReadinessSequence.Count -eq 1) {
+            $global:ReadinessSequence = @()
+        }
+        else {
+            $global:ReadinessSequence = @(
+                $global:ReadinessSequence[1..($global:ReadinessSequence.Count - 1)]
+            )
+        }
     }
     return $this.Task
 }
@@ -551,8 +779,15 @@ $Folder | Add-Member -MemberType ScriptMethod -Name DeleteTask -Value {
 $Folder | Add-Member -MemberType ScriptMethod -Name RegisterTask -Value {
     param($Name, $Xml, $Flags, $User, $Password, $LogonType, $Sddl)
     $Encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Xml))
+    $EncodedSddl = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes([string]$Sddl)
+    )
     Add-Content -LiteralPath $global:TaskLogPath -Value ("register:" + $Encoded)
-    $this.Task = New-FakeTask -Xml $Xml -State 3
+    Add-Content -LiteralPath $global:TaskLogPath -Value ("register-sddl:" + $EncodedSddl)
+    $EffectiveSddl = $Sddl
+    if ($null -eq $EffectiveSddl) { $EffectiveSddl = "replacement-default" }
+    $this.Task = New-FakeTask -Xml $Xml -State 3 -Sddl $EffectiveSddl
+    $global:ObserveReadiness = $false
     if ($global:FailureMode -eq "register-partial" -and
         -not $global:PartialRegistrationUsed) {
         $global:PartialRegistrationUsed = $true
@@ -574,6 +809,8 @@ else {
 
         prior_task_xml = "<Task><RegistrationInfo>registered-prior</RegistrationInfo></Task>"
         prior_task_b64 = base64.b64encode(prior_task_xml.encode()).decode()
+        prior_task_sddl = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        prior_task_sddl_b64 = base64.b64encode(prior_task_sddl.encode()).decode()
 
         def prepare_root(case_root: Path, *, present: bool = True) -> None:
             if not present:
@@ -600,9 +837,17 @@ else {
             position: str = "before",
             mode: str = "",
             root_present: bool = True,
+            prior_task_present: bool = True,
         ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
             case_name = "-".join(
-                part for part in (boundary or "success", position, mode) if part
+                part
+                for part in (
+                    boundary or "success",
+                    position,
+                    mode,
+                    "" if prior_task_present else "task-absent",
+                )
+                if part
             )
             case_dir = harness_root / ("install-" + case_name)
             case_dir.mkdir()
@@ -645,7 +890,9 @@ else {
                     "-TaskLog",
                     str(log),
                     "-PriorTaskXml",
-                    prior_task_xml,
+                    prior_task_xml if prior_task_present else "",
+                    "-PriorTaskSddl",
+                    prior_task_sddl if prior_task_present else "",
                 ],
                 check=False,
                 capture_output=True,
@@ -656,6 +903,7 @@ else {
 
         journal_boundaries = (
             ("install-root", False),
+            ("restrict-install-root", True),
             ("prior-task-stop", True),
             ("remove-prior-file", True),
             ("publish-file", True),
@@ -672,6 +920,8 @@ else {
             [
                 ("", "before", "register-partial", True),
                 ("readiness", "before", "", True),
+                ("", "before", "late-crash", True),
+                ("", "before", "late-running", True),
             ]
         )
         for boundary, position, mode, root_present in failure_cases:
@@ -699,6 +949,20 @@ else {
                 assert not install_root.exists()
             if boundary in {"register-task", "start-task", "readiness"} or mode:
                 assert f"register:{prior_task_b64}" in task_log
+                assert f"register-sddl:{prior_task_sddl_b64}" in task_log
+            if root_present:
+                assert (
+                    f"restore-security:{install_root}:prior-security" in task_log
+                )
+
+        absent_failure, absent_root, absent_log = run_installer(
+            "start-task",
+            prior_task_present=False,
+        )
+        assert absent_failure.returncode != 0
+        assert (absent_root / "venv" / "prior.txt").exists()
+        assert absent_log.count("register:") == 1
+        assert f"register-sddl:{prior_task_sddl_b64}" not in absent_log
 
         cleanup_failed, cleanup_root, cleanup_log = run_installer(
             "",
@@ -710,16 +974,31 @@ else {
         assert (cleanup_root.parent / ".monitor-agent-recovery").exists()
         assert cleanup_log.count(f"register:{prior_task_b64}") == 0
 
-        success, success_root, _task_log = run_installer("", position="")
+        success, success_root, success_log = run_installer("", position="")
         assert success.returncode == 0, success.stderr or success.stdout
         assert (success_root / "venv" / "replacement.txt").exists()
         assert not (success_root.parent / ".monitor-agent-recovery").exists()
+        success_events = success_log.splitlines()
+        assert success_events.index(f"acl:{success_root}") < success_events.index("stop")
 
-        def run_uninstaller(mode: str) -> tuple[subprocess.CompletedProcess[str], Path]:
-            case_dir = harness_root / ("uninstall-" + (mode or "success"))
+        def run_uninstaller(
+            mode: str,
+            *,
+            unsafe_name: str = "",
+        ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
+            case_name = "-".join(
+                part for part in (mode or "success", unsafe_name) if part
+            )
+            case_dir = harness_root / ("uninstall-" + case_name)
             case_dir.mkdir()
             install_root = case_dir / "MonitorAgent"
             prepare_root(install_root)
+            if unsafe_name == "venv":
+                shutil.rmtree(install_root / "venv")
+                (install_root / "venv").write_text("unsafe-file", encoding="utf-8")
+            elif unsafe_name == "run-agent.ps1":
+                (install_root / "run-agent.ps1").unlink()
+                (install_root / "run-agent.ps1").mkdir()
             log = case_dir / "task.log"
             script = case_dir / "uninstall.ps1"
             script.write_text(
@@ -743,19 +1022,31 @@ else {
                     str(log),
                     "-PriorTaskXml",
                     prior_task_xml,
+                    "-PriorTaskSddl",
+                    prior_task_sddl,
                 ],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            return result, install_root
+            task_log = log.read_text(encoding="utf-8") if log.exists() else ""
+            return result, install_root, task_log
 
         for mode in ("stop-fail", "delete-fail", "query-fail"):
-            failed, failed_root = run_uninstaller(mode)
+            failed, failed_root, _failed_log = run_uninstaller(mode)
             assert failed.returncode != 0
             assert (failed_root / "venv" / "prior.txt").exists()
 
-        removed, removed_root = run_uninstaller("")
+        for unsafe_name in ("venv", "run-agent.ps1"):
+            unsafe, unsafe_root, unsafe_log = run_uninstaller(
+                "",
+                unsafe_name=unsafe_name,
+            )
+            assert unsafe.returncode != 0
+            assert unsafe_log == ""
+            assert unsafe_root.exists()
+
+        removed, removed_root, _removed_log = run_uninstaller("")
         assert removed.returncode == 0, removed.stderr or removed.stdout
         assert not (removed_root / "venv").exists()
         assert (removed_root / "monitor-agent.env").exists()

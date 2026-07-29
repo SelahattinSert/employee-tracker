@@ -25,7 +25,20 @@ $TaskStateQueued = 2
 $TaskStateReady = 3
 $TaskStateRunning = 4
 $TaskCreateOrUpdate = 6
+$TaskDontAddPrincipalAce = 0x10
+$TaskRestoreFlags = ($TaskCreateOrUpdate -bor $TaskDontAddPrincipalAce)
 $TaskLogonServiceAccount = 5
+$TaskSecurityOwner = 0x1
+$TaskSecurityGroup = 0x2
+$TaskSecurityDacl = 0x4
+$TaskSecurityInformation = (
+    $TaskSecurityOwner -bor $TaskSecurityGroup -bor $TaskSecurityDacl
+)
+$FileSystemSecuritySections = (
+    [Security.AccessControl.AccessControlSections]::Access -bor
+    [Security.AccessControl.AccessControlSections]::Owner -bor
+    [Security.AccessControl.AccessControlSections]::Group
+)
 $ReadinessAttempts = 20
 $ReadinessDelayMilliseconds = 250
 $ManagedNames = @("venv", "monitor-agent.env", "run-agent.ps1", "monitor_agent_task.xml")
@@ -36,6 +49,7 @@ $Succeeded = $false
 $InstallRootWasPresent = $false
 $PriorTask = $null
 $PriorTaskXml = $null
+$PriorTaskSddl = $null
 $PriorTaskState = 0
 $PriorTaskWasPresent = $false
 $PriorTaskWasRunning = $false
@@ -94,27 +108,33 @@ function Test-PathCommand {
 }
 
 function Set-RestrictedAcl {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse
+    )
     $AclArguments = @(
         "/reset",
         "/inheritance:r",
         "/grant:r",
         "*S-1-5-18:(OI)(CI)F",
-        "*S-1-5-32-544:(OI)(CI)F",
-        "/T",
-        "/C"
+        "*S-1-5-32-544:(OI)(CI)F"
     )
+    if ($Recurse) { $AclArguments += @("/T", "/C") }
     & icacls.exe $Path @AclArguments | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "ACL configuration failed" }
 
     $ExpectedSids = @("S-1-5-18", "S-1-5-32-544")
     $AclTargets = @((Get-Item -LiteralPath $Path -Force))
-    if ($AclTargets[0].PSIsContainer) {
+    if ($Recurse -and $AclTargets[0].PSIsContainer) {
         $AclTargets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
     }
     foreach ($AclTarget in $AclTargets) {
+        $ObservedAcl = Get-Acl -LiteralPath $AclTarget.FullName
+        if (-not $ObservedAcl.AreAccessRulesProtected) {
+            Fail "DACL verification failed"
+        }
         $ObservedSids = New-Object -TypeName "System.Collections.Generic.HashSet[string]"
-        foreach ($Rule in (Get-Acl -LiteralPath $AclTarget.FullName).Access) {
+        foreach ($Rule in $ObservedAcl.Access) {
             $Sid = $Rule.IdentityReference.Translate(
                 [Security.Principal.SecurityIdentifier]
             ).Value
@@ -137,6 +157,74 @@ function Set-RestrictedAcl {
             }
         }
     }
+}
+
+function Get-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Item = Get-Item -LiteralPath $Path -Force
+    $Acl = Get-Acl -LiteralPath $Path
+    return @{
+        Path = $Item.FullName
+        IsDirectory = [bool]$Item.PSIsContainer
+        Sddl = $Acl.GetSecurityDescriptorSddlForm($FileSystemSecuritySections)
+    }
+}
+
+function Get-FileSystemSecurityTree {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Targets = @((Get-Item -LiteralPath $Path -Force))
+    if ($Targets[0].PSIsContainer) {
+        $Targets += @(Get-ChildItem -LiteralPath $Path -Force -Recurse)
+    }
+    $Snapshots = @()
+    foreach ($Target in $Targets) {
+        $Snapshots += @(Get-FileSystemSecuritySnapshot $Target.FullName)
+    }
+    return ,$Snapshots
+}
+
+function Restore-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+    $Item = Get-Item -LiteralPath $Snapshot.Path -Force
+    if ([bool]$Item.PSIsContainer -ne [bool]$Snapshot.IsDirectory) {
+        throw "filesystem security target type changed"
+    }
+    $Acl = Get-Acl -LiteralPath $Snapshot.Path
+    $Acl.SetSecurityDescriptorSddlForm(
+        $Snapshot.Sddl,
+        $FileSystemSecuritySections
+    )
+    Set-Acl -LiteralPath $Snapshot.Path -AclObject $Acl
+}
+
+function Restore-FileSystemSecurityTree {
+    param([Parameter(Mandatory = $true)][object[]]$Snapshots)
+    $DeepestFirst = @($Snapshots | Sort-Object { $_.Path.Length } -Descending)
+    foreach ($Snapshot in $DeepestFirst) {
+        Restore-FileSystemSecuritySnapshot $Snapshot
+    }
+}
+
+function Test-FileSystemSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+    if (-not (Test-Path -LiteralPath $Snapshot.Path)) { return $false }
+    $Item = Get-Item -LiteralPath $Snapshot.Path -Force
+    if ([bool]$Item.PSIsContainer -ne [bool]$Snapshot.IsDirectory) {
+        return $false
+    }
+    $Acl = Get-Acl -LiteralPath $Snapshot.Path
+    return (
+        $Acl.GetSecurityDescriptorSddlForm($FileSystemSecuritySections) -eq
+        $Snapshot.Sddl
+    )
+}
+
+function Test-FileSystemSecurityTree {
+    param([Parameter(Mandatory = $true)][object[]]$Snapshots)
+    foreach ($Snapshot in $Snapshots) {
+        if (-not (Test-FileSystemSecuritySnapshot $Snapshot)) { return $false }
+    }
+    return $true
 }
 
 function Connect-TaskScheduler {
@@ -172,17 +260,33 @@ function Wait-TaskRunning {
         [Parameter(Mandatory = $true)]$Folder,
         [Parameter(Mandatory = $true)][string]$Name
     )
+    $ObservedRunning = $false
     for ($Attempt = 0; $Attempt -lt $ReadinessAttempts; $Attempt++) {
         Start-Sleep -Milliseconds $ReadinessDelayMilliseconds
         $RegisteredTask = Get-RegisteredTask -Folder $Folder -Name $Name
         if ($null -eq $RegisteredTask) { return $false }
-        if ([int]$RegisteredTask.State -eq $TaskStateRunning) { return $true }
-        if ([int]$RegisteredTask.State -ne $TaskStateQueued -and
-            [int]$RegisteredTask.State -ne $TaskStateReady) {
+        if ([int]$RegisteredTask.State -eq $TaskStateRunning) {
+            $ObservedRunning = $true
+            break
+        }
+        if ([int]$RegisteredTask.State -eq $TaskStateQueued -or
+            [int]$RegisteredTask.State -eq $TaskStateReady) {
+            continue
+        }
+        return $false
+    }
+    if (-not $ObservedRunning) { return $false }
+
+    for ($StabilityAttempt = 0; $StabilityAttempt -lt $ReadinessAttempts;
+        $StabilityAttempt++) {
+        Start-Sleep -Milliseconds $ReadinessDelayMilliseconds
+        $RegisteredTask = Get-RegisteredTask -Folder $Folder -Name $Name
+        if ($null -eq $RegisteredTask -or
+            [int]$RegisteredTask.State -ne $TaskStateRunning) {
             return $false
         }
     }
-    return $false
+    return $true
 }
 
 function Remove-SafePath {
@@ -268,6 +372,10 @@ function Test-RollbackState {
         if (-not $PriorState.Existed -and (Test-Path -LiteralPath $LivePath)) {
             return $false
         }
+        if ($PriorState.Existed -and
+            -not (Test-FileSystemSecurityTree $PriorState.SecuritySnapshots)) {
+            return $false
+        }
     }
     foreach ($StateDirectoryJournal in $Journal.StateDirectories.Values) {
         if ($StateDirectoryJournal.Completed -and
@@ -279,10 +387,19 @@ function Test-RollbackState {
         (Test-Path -LiteralPath $InstallRoot)) {
         return $false
     }
+    if ($InstallRootWasPresent -and
+        $Journal.InstallRoot.Restriction.Attempted -and
+        -not (Test-FileSystemSecuritySnapshot
+            $Journal.InstallRoot.SecuritySnapshot)) {
+        return $false
+    }
 
     $ObservedTask = Get-RegisteredTask -Folder $TaskFolder -Name $TaskName
     if ($PriorTaskWasPresent) {
         if ($null -eq $ObservedTask) { return $false }
+        $ObservedTaskSddl =
+            $ObservedTask.GetSecurityDescriptor($TaskSecurityInformation)
+        if ($ObservedTaskSddl -ne $PriorTaskSddl) { return $false }
         $ObservedRunning = [int]$ObservedTask.State -eq $TaskStateRunning
         if ($ObservedRunning -ne $PriorTaskWasActive) { return $false }
     }
@@ -323,7 +440,12 @@ function Invoke-Rollback {
             try {
                 $BackupPath = Join-Path $BackupRoot $Name
                 Restore-BackupPath -Source $BackupPath -Destination $LivePath
-                Set-RestrictedAcl $LivePath
+            }
+            catch { $RollbackFailed = $true }
+        }
+        if ($PriorState.Existed -and (Test-Path -LiteralPath $LivePath)) {
+            try {
+                Restore-FileSystemSecurityTree $PriorState.SecuritySnapshots
             }
             catch { $RollbackFailed = $true }
         }
@@ -349,6 +471,14 @@ function Invoke-Rollback {
         }
         catch { $RollbackFailed = $true }
     }
+    elseif ($InstallRootWasPresent -and
+        $Journal.InstallRoot.Restriction.Attempted) {
+        try {
+            Restore-FileSystemSecuritySnapshot `
+                $Journal.InstallRoot.SecuritySnapshot
+        }
+        catch { $RollbackFailed = $true }
+    }
 
     if ($PriorTaskWasPresent) {
         if ($Journal.TaskRegistration.Attempted) {
@@ -357,11 +487,11 @@ function Invoke-Rollback {
                 [void]$TaskFolder.RegisterTask(
                     $TaskName,
                     $RestoredTaskXml,
-                    $TaskCreateOrUpdate,
+                    $TaskRestoreFlags,
                     "SYSTEM",
                     $null,
                     $TaskLogonServiceAccount,
-                    $null
+                    $PriorTaskSddl
                 )
             }
             catch { $RollbackFailed = $true }
@@ -400,7 +530,12 @@ function Invoke-Rollback {
 }
 
 $Journal = @{
-    InstallRoot = @{ Attempted = $false; Completed = $false }
+    InstallRoot = @{
+        Attempted = $false
+        Completed = $false
+        SecuritySnapshot = $null
+        Restriction = @{ Attempted = $false; Completed = $false }
+    }
     PriorTaskStop = @{ Attempted = $false; Completed = $false }
     TaskRegistration = @{ Attempted = $false; Completed = $false }
     TaskStart = @{ Attempted = $false; Completed = $false }
@@ -412,6 +547,7 @@ foreach ($Name in $ManagedNames) {
     $Journal.PriorFiles[$Name] = @{
         Existed = $false
         BackupPrepared = $false
+        SecuritySnapshots = @()
         Removal = @{ Attempted = $false; Completed = $false }
     }
     $Journal.PublishedFiles[$Name] = @{ Attempted = $false; Completed = $false }
@@ -433,12 +569,18 @@ try {
     Assert-RegularFile $LockPath "lock file"
     Assert-RegularFile $LauncherSource "launcher template"
     Assert-RegularFile $TaskSource "task template"
-    if (-not (Test-PathCommand "py") -or -not (Test-PathCommand "icacls.exe")) {
+    if (-not (Test-PathCommand "py") -or
+        -not (Test-PathCommand "schtasks.exe") -or
+        -not (Test-PathCommand "icacls.exe")) {
         Fail "required Windows command is unavailable"
     }
     Assert-SafeDirectory $InstallParent "install parent"
     Assert-SafeDirectory $InstallRoot "install root"
     $InstallRootWasPresent = Test-Path -LiteralPath $InstallRoot
+    if ($InstallRootWasPresent) {
+        $Journal.InstallRoot.SecuritySnapshot =
+            Get-FileSystemSecuritySnapshot $InstallRoot
+    }
     if (Test-Path -LiteralPath $RecoveryRoot) {
         Fail "recovery-required at C:\ProgramData\.monitor-agent-recovery"
     }
@@ -446,6 +588,10 @@ try {
         $LivePath = Join-Path $InstallRoot $Name
         Assert-SafeManagedPath $LivePath $Name
         $Journal.PriorFiles[$Name].Existed = Test-Path -LiteralPath $LivePath
+        if ($Journal.PriorFiles[$Name].Existed) {
+            $PriorState = $Journal.PriorFiles[$Name]
+            $PriorState.SecuritySnapshots = Get-FileSystemSecurityTree $LivePath
+        }
     }
     $TaskFolder = Connect-TaskScheduler
 
@@ -469,7 +615,7 @@ try {
     Copy-Item -LiteralPath $TaskSource -Destination $StageTask -Force
     Copy-Item -LiteralPath $LockPath -Destination $StageLock -Force
     Copy-Item -LiteralPath $WheelPath -Destination $StageWheel -Force
-    Set-RestrictedAcl $TransactionRoot
+    Set-RestrictedAcl $TransactionRoot -Recurse
 
     py "-$PythonVersion" -m venv $StageVenv
     if ($LASTEXITCODE -ne 0) { Fail "virtual environment creation failed" }
@@ -486,6 +632,7 @@ try {
     $PriorTaskWasPresent = $null -ne $PriorTask
     if ($PriorTaskWasPresent) {
         $PriorTaskXml = $PriorTask.Xml
+        $PriorTaskSddl = $PriorTask.GetSecurityDescriptor($TaskSecurityInformation)
         $PriorTaskState = [int]$PriorTask.State
         $PriorTaskWasRunning = $PriorTaskState -eq $TaskStateRunning
         $PriorTaskWasActive = (
@@ -498,6 +645,20 @@ try {
     }
 
     $MutationStarted = $true
+    $FailureCategory = "install-root-security"
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        [void](Invoke-JournaledMutation -Name "install-root" `
+            -State $Journal.InstallRoot -Action {
+                New-Item -ItemType Directory -LiteralPath $InstallRoot -Force |
+                    Out-Null
+            })
+    }
+    Assert-SafeDirectory $InstallRoot "install root"
+    [void](Invoke-JournaledMutation -Name "restrict-install-root" `
+        -State $Journal.InstallRoot.Restriction -Action {
+            Set-RestrictedAcl $InstallRoot
+        })
+
     if ($PriorTaskWasPresent -and $PriorTaskWasActive) {
         $FailureCategory = "prior-task-stop"
         [void](Invoke-JournaledMutation -Name "prior-task-stop" `
@@ -513,23 +674,13 @@ try {
     }
 
     $FailureCategory = "live-files"
-    if (-not (Test-Path -LiteralPath $InstallRoot)) {
-        [void](Invoke-JournaledMutation -Name "install-root" `
-            -State $Journal.InstallRoot -Action {
-                New-Item -ItemType Directory -LiteralPath $InstallRoot -Force |
-                    Out-Null
-            })
-        Set-RestrictedAcl $InstallRoot
-    }
-    Assert-SafeDirectory $InstallRoot "install root"
-
     foreach ($Name in $ManagedNames) {
         $LivePath = Join-Path $InstallRoot $Name
         $PriorState = $Journal.PriorFiles[$Name]
         if ($PriorState.Existed) {
             $BackupPath = Join-Path $BackupRoot $Name
             Copy-Item -LiteralPath $LivePath -Destination $BackupPath -Recurse -Force
-            Set-RestrictedAcl $BackupPath
+            Set-RestrictedAcl $BackupPath -Recurse
             $PriorState.BackupPrepared = $true
             [void](Invoke-JournaledMutation -Name "remove-prior-file" `
                 -State $PriorState.Removal -Action {
@@ -546,7 +697,7 @@ try {
             -State $PublishedState -Action {
                 Move-Item -LiteralPath $StagePath -Destination $LivePath
             })
-        Set-RestrictedAcl $LivePath
+        Set-RestrictedAcl $LivePath -Recurse
     }
 
     foreach ($StateDirectory in @("logs", "spool")) {
