@@ -147,9 +147,7 @@ def _memory_rss_kb(value: object) -> int:
     return max(0, _safe_int(rss)) // 1024
 
 
-def _process_record(
-    info: Mapping[str, object], mode: ProcessCmdlineMode
-) -> dict[str, JSONValue]:
+def _process_record(info: Mapping[str, object], mode: ProcessCmdlineMode) -> dict[str, JSONValue]:
     return {
         "pid": _safe_int(info.get("pid")),
         "name": _optional_string(info.get("name")),

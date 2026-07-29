@@ -38,9 +38,7 @@ class AgentConfig:
     log_level: str
 
 
-def _parse_int(
-    env: Mapping[str, str], name: str, default: int, minimum: int, maximum: int
-) -> int:
+def _parse_int(env: Mapping[str, str], name: str, default: int, minimum: int, maximum: int) -> int:
     raw_value = env.get(name)
     if raw_value is None:
         return default
@@ -154,21 +152,13 @@ def load_config(
         api_token=api_token,
         heartbeat_sec=_parse_int(source, "MONITOR_HEARTBEAT_SEC", 300, 30, 86400),
         startup_delay_sec=_parse_int(source, "MONITOR_STARTUP_DELAY_SEC", 30, 0, 3600),
-        connect_timeout_sec=_parse_float(
-            source, "MONITOR_CONNECT_TIMEOUT_SEC", 5.0, 0.1, 300.0
-        ),
+        connect_timeout_sec=_parse_float(source, "MONITOR_CONNECT_TIMEOUT_SEC", 5.0, 0.1, 300.0),
         read_timeout_sec=_parse_float(source, "MONITOR_READ_TIMEOUT_SEC", 15.0, 0.1, 300.0),
         collection_timeout_sec=_parse_float(
             source, "MONITOR_COLLECTION_TIMEOUT_SEC", 30.0, 1.0, 3600.0
         ),
-        max_collector_workers=_parse_int(
-            source, "MONITOR_MAX_COLLECTOR_WORKERS", 4, 1, 32
-        ),
-        spool_path=(
-            Path(spool_path_value)
-            if spool_path_value
-            else _default_spool_path(platform)
-        ),
+        max_collector_workers=_parse_int(source, "MONITOR_MAX_COLLECTOR_WORKERS", 4, 1, 32),
+        spool_path=(Path(spool_path_value) if spool_path_value else _default_spool_path(platform)),
         spool_max_bytes=_parse_int(
             source,
             "MONITOR_SPOOL_MAX_BYTES",
@@ -176,9 +166,7 @@ def load_config(
             1048576,
             10737418240,
         ),
-        spool_max_age_sec=_parse_int(
-            source, "MONITOR_SPOOL_MAX_AGE_SEC", 604800, 3600, 31536000
-        ),
+        spool_max_age_sec=_parse_int(source, "MONITOR_SPOOL_MAX_AGE_SEC", 604800, 3600, 31536000),
         replay_batch_size=_parse_int(source, "MONITOR_REPLAY_BATCH_SIZE", 20, 1, 1000),
         ca_bundle=ca_bundle,
         process_cmdline_mode=process_cmdline_mode,

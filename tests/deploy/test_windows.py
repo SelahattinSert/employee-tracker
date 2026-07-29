@@ -95,7 +95,7 @@ def test_task_xml_is_utf8_schema_14_and_has_one_complete_action() -> None:
     assert len(execs) == 1
     assert execs[0].findtext(_tag("Command")) == "powershell.exe"
     assert execs[0].findtext(_tag("Arguments")) == (
-        '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "
         '"C:\\ProgramData\\MonitorAgent\\run-agent.ps1"'
     )
     assert "C:\\Python" not in raw.decode("utf-8")
@@ -136,7 +136,7 @@ def test_launcher_strictly_parses_known_environment_and_runs_entry_point() -> No
         assert f'"{key}"' in text
     assert "Invoke-Expression" not in text
     assert not re.search(r"(?m)^\s*\.\s+\$", text)
-    assert "$Trimmed.StartsWith(\"#\")" in text
+    assert '$Trimmed.StartsWith("#")' in text
     assert '$Trimmed.Split("=", 2)' in text
     assert '$Parts[0] -cnotmatch "^[A-Z][A-Z0-9_]+$"' in text
     assert "$KnownEnvironmentKeys -cnotcontains $Parts[0]" in text
@@ -146,7 +146,7 @@ def test_launcher_strictly_parses_known_environment_and_runs_entry_point() -> No
     assert "Clear-KnownEnvironment" in text
     assert "Test-RegularFile" in text
     assert "ReparsePoint" in text
-    assert '& $AgentPath $Command' in text
+    assert "& $AgentPath $Command" in text
     assert "exit $LASTEXITCODE" in text
 
 
@@ -157,39 +157,28 @@ def test_launcher_isolates_staged_path_validation_after_strict_live_path_checks(
     parsed_flow = text[text.index("Clear-KnownEnvironment\n") :]
 
     assert "[string]$PathValidationRoot" in text
-    assert '$ExpectedSpoolPath = "C:\\ProgramData\\MonitorAgent\\spool"' in (
-        live_path_check
-    )
+    assert '$ExpectedSpoolPath = "C:\\ProgramData\\MonitorAgent\\spool"' in (live_path_check)
     assert (
         '$ExpectedLogPath = "C:\\ProgramData\\MonitorAgent\\logs\\monitor-agent.log"'
         in live_path_check
     )
-    assert '-cne $ExpectedSpoolPath' in live_path_check
-    assert '-cne $ExpectedLogPath' in live_path_check
+    assert "-cne $ExpectedSpoolPath" in live_path_check
+    assert "-cne $ExpectedLogPath" in live_path_check
     assert '$SeenEnvironmentKeys.Contains("MONITOR_SPOOL_PATH")' in live_path_check
     assert '$SeenEnvironmentKeys.Contains("MONITOR_LOG_PATH")' in live_path_check
 
     assert '$Command -ne "check-config"' in staged_override
     assert '$PSBoundParameters.ContainsKey("PathValidationRoot")' in text
-    assert '$ExpectedValidationRoot = Join-Path $InstallRoot "path-validation"' in (
-        staged_override
-    )
+    assert '$ExpectedValidationRoot = Join-Path $InstallRoot "path-validation"' in (staged_override)
     assert (
-        '$ExpectedTransactionRoot = '
-        '"C:\\ProgramData\\.monitor-agent-recovery\\transaction"'
-        in staged_override
+        "$ExpectedTransactionRoot = "
+        '"C:\\ProgramData\\.monitor-agent-recovery\\transaction"' in staged_override
     )
     assert "$NormalizedTransactionRoot" in staged_override
     assert "[System.IO.Path]::GetFullPath" in staged_override
     assert "Test-ReparsePoint" in staged_override
-    assert (
-        '[Environment]::SetEnvironmentVariable("MONITOR_SPOOL_PATH",'
-        in staged_override
-    )
-    assert (
-        '[Environment]::SetEnvironmentVariable("MONITOR_LOG_PATH",'
-        in staged_override
-    )
+    assert '[Environment]::SetEnvironmentVariable("MONITOR_SPOOL_PATH",' in staged_override
+    assert '[Environment]::SetEnvironmentVariable("MONITOR_LOG_PATH",' in staged_override
     _assert_ordered(
         parsed_flow,
         '[Environment]::SetEnvironmentVariable($Parts[0], $Parts[1], "Process")',
@@ -237,10 +226,7 @@ def test_installer_isolates_staged_validation_then_checks_live_paths_before_task
     )
     live_validation = "& $LiveLauncher -Command check-config"
 
-    assert (
-        '$StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"'
-        in live_flow
-    )
+    assert '$StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"' in live_flow
     _assert_ordered(
         live_flow,
         '$StagePathValidationRoot = Join-Path $TransactionRoot "path-validation"',
@@ -382,7 +368,7 @@ def test_installer_uses_locale_independent_task_scheduler_state() -> None:
     assert "[int]$RegisteredTask.State" in text
     assert text.count('Test-PathCommand "schtasks.exe"') == 1
     assert not re.search(r"(?m)^\s*&\s*schtasks", text, re.IGNORECASE)
-    assert "-match \"Running\"" not in text
+    assert '-match "Running"' not in text
     assert "cannot find" not in text.lower()
     assert "does not exist" not in text.lower()
 
@@ -409,9 +395,7 @@ def test_installer_preserves_custom_registered_task_sddl_on_rollback() -> None:
         rollback_verification
     )
     capture_block = text[
-        text.index("if ($PriorTaskWasPresent) {") : text.index(
-            "$MutationStarted = $true"
-        )
+        text.index("if ($PriorTaskWasPresent) {") : text.index("$MutationStarted = $true")
     ]
     assert "GetSecurityDescriptor" in capture_block
 
@@ -479,13 +463,9 @@ def test_installer_restores_prior_managed_filesystem_security_metadata() -> None
         "$PriorState.BackupPrepared = $true",
         'Invoke-JournaledMutation -Name "remove-prior-file"',
     )
-    assert (
-        "Restore-FileSystemSecurityTree $PriorState.SecuritySnapshots" in rollback
-    )
+    assert "Restore-FileSystemSecurityTree $PriorState.SecuritySnapshots" in rollback
     assert "Set-RestrictedAcl $LivePath" not in rollback
-    assert "Test-FileSystemSecurityTree $PriorState.SecuritySnapshots" in (
-        rollback_verification
-    )
+    assert "Test-FileSystemSecurityTree $PriorState.SecuritySnapshots" in (rollback_verification)
 
 
 def test_installer_journals_every_live_mutation_boundary() -> None:
@@ -622,7 +602,7 @@ def test_installer_requires_bounded_replacement_readiness_and_cleans_success() -
         "Remove-SafePath $TransactionRoot",
         "Remove-SafePath $BackupRoot",
         "Remove-SafePath $RecoveryRoot",
-        '$Succeeded = $true',
+        "$Succeeded = $true",
     )
 
 
@@ -824,10 +804,7 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
     }
 """
     staged_commands_start = '    py "-$PythonVersion" -m venv $StageVenv\n'
-    staged_commands_end = (
-        '    if ($LASTEXITCODE -ne 0) { '
-        'Fail "wheel installation failed" }\n'
-    )
+    staged_commands_end = '    if ($LASTEXITCODE -ne 0) { Fail "wheel installation failed" }\n'
     staged_replacement = """    New-Item -ItemType Directory -LiteralPath (
         Join-Path $StageVenv "Scripts"
     ) -Force | Out-Null
@@ -908,9 +885,7 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
         stage_end = transformed_install.index(staged_commands_end, stage_start)
         stage_end += len(staged_commands_end)
         transformed_install = (
-            transformed_install[:stage_start]
-            + staged_replacement
-            + transformed_install[stage_end:]
+            transformed_install[:stage_start] + staged_replacement + transformed_install[stage_end:]
         )
         transformed_install = transformed_install.replace(
             "& $StageLauncher -Command check-config "
@@ -1241,9 +1216,7 @@ else {
                 assert f"register:{prior_task_b64}" in task_log
                 assert f"register-sddl:{prior_task_sddl_b64}" in task_log
             if root_present:
-                assert (
-                    f"restore-security:{install_root}:prior-security" in task_log
-                )
+                assert f"restore-security:{install_root}:prior-security" in task_log
 
         absent_failure, absent_root, absent_log = run_installer(
             "start-task",
@@ -1294,9 +1267,7 @@ else {
             unsafe_name: str = "",
             purge: bool = False,
         ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
-            case_name = "-".join(
-                part for part in (mode or "success", unsafe_name) if part
-            )
+            case_name = "-".join(part for part in (mode or "success", unsafe_name) if part)
             case_dir = harness_root / ("uninstall-" + case_name)
             case_dir.mkdir()
             install_root = case_dir / "MonitorAgent"
@@ -1390,9 +1361,7 @@ else {
             assert unsafe_install.returncode != 0
             assert unsafe_install_log == ""
             assert (
-                unsafe_install_root.parent
-                / "outside-install-tree"
-                / "must-survive.txt"
+                unsafe_install_root.parent / "outside-install-tree" / "must-survive.txt"
             ).exists()
 
             unsafe_purge, unsafe_purge_root, unsafe_purge_log = run_uninstaller(
@@ -1403,11 +1372,7 @@ else {
             assert unsafe_purge.returncode != 0
             assert unsafe_purge_log == ""
             assert unsafe_purge_root.exists()
-            assert (
-                unsafe_purge_root.parent
-                / "outside-install-tree"
-                / "must-survive.txt"
-            ).exists()
+            assert (unsafe_purge_root.parent / "outside-install-tree" / "must-survive.txt").exists()
 
         removed, removed_root, _removed_log = run_uninstaller("")
         assert removed.returncode == 0, removed.stderr or removed.stdout
@@ -1612,8 +1577,7 @@ exit 0
             ("monitor_api_token=lowercase-secret\n", "lowercase-secret"),
             ("Monitor_Api_Token=mixed-case-secret\n", "mixed-case-secret"),
             (
-                "MONITOR_API_TOKEN=first-casing-secret\n"
-                "monitor_api_token=second-casing-secret\n",
+                "MONITOR_API_TOKEN=first-casing-secret\nmonitor_api_token=second-casing-secret\n",
                 "first-casing-secret",
             ),
         ):

@@ -55,9 +55,11 @@ _SAFE_REPRESENTATION = _SafeRepresentation()
 
 
 def _utc_timestamp(created: float) -> str:
-    return datetime.fromtimestamp(created, tz=UTC).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(created, tz=UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _supports_posix_permissions() -> bool:
@@ -103,9 +105,7 @@ class SecretFilter(logging.Filter):
                 if match.group("key") is not None:
                     arguments_exhausted = True
                     continue
-                star_count = int(match.group("width") == "*") + int(
-                    match.group("precision") == "*"
-                )
+                star_count = int(match.group("width") == "*") + int(match.group("precision") == "*")
                 if argument_index + star_count >= len(args):
                     arguments_exhausted = True
                     continue
@@ -191,14 +191,10 @@ class SecretFilter(logging.Filter):
                     or active[int(marker.group("index"))].key is not None
                 )
             ]
-            bearer_conversions.update(
-                int(marker.group("index")) for marker in argument_markers
-            )
+            bearer_conversions.update(int(marker.group("index")) for marker in argument_markers)
             if not argument_markers:
                 return f"{match.group(1)}{_REDACTED}"
-            return match.group(1) + "".join(
-                marker.group(0) for marker in argument_markers
-            )
+            return match.group(1) + "".join(marker.group(0) for marker in argument_markers)
 
         marked = _BEARER_PATTERN.sub(redact_bearer, marked)
         marked = self._redact_secrets_preserving_markers(marked)
@@ -232,9 +228,7 @@ class SecretFilter(logging.Filter):
         mapping_bearers: set[str] = set()
         for conversion_index, conversion in enumerate(active):
             if conversion.argument_index is not None:
-                positional.setdefault(conversion.argument_index, set()).add(
-                    conversion.conversion
-                )
+                positional.setdefault(conversion.argument_index, set()).add(conversion.conversion)
                 if conversion_index in bearer_conversions:
                     positional_bearers.add(conversion.argument_index)
             elif conversion.key is not None:
@@ -290,6 +284,7 @@ class SecretFilter(logging.Filter):
                 for key, value in args.items()
             }
         return True
+
 
 class JsonFormatter(logging.Formatter):
     """Render one compact, structured, exception-text-free log record."""

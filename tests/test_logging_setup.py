@@ -82,8 +82,7 @@ def test_secret_filter_masks_mixed_case_bearer_headers_and_ignores_empty_secrets
     assert "opaque-value" not in item.getMessage()
     assert "another-value" not in item.getMessage()
     assert item.getMessage() == (
-        "aUtHoRiZaTiOn: bEaReR [REDACTED] "
-        "note=AUTHORIZATION: BEARER [REDACTED]"
+        "aUtHoRiZaTiOn: bEaReR [REDACTED] note=AUTHORIZATION: BEARER [REDACTED]"
     )
 
 
@@ -127,13 +126,9 @@ def test_secret_filter_masks_unconsumed_bearer_after_active_placeholder() -> Non
 
     SecretFilter(["%"]).filter(item)
 
-    assert item.msg == (
-        "state=%s Authorization: Bearer [REDACTED] progress=100%%"
-    )
+    assert item.msg == ("state=%s Authorization: Bearer [REDACTED] progress=100%%")
     assert item.args == ("ready",)
-    assert item.getMessage() == (
-        "state=ready Authorization: Bearer [REDACTED] progress=100%"
-    )
+    assert item.getMessage() == ("state=ready Authorization: Bearer [REDACTED] progress=100%")
 
 
 def test_secret_filter_preserves_percent_escape_when_formatting_is_active() -> None:
@@ -182,9 +177,7 @@ def test_secret_filter_preserves_unrelated_percent_escape_with_mapping_formattin
 
     assert item.msg == "progress=100%% state=%(state)s Authorization: Bearer [REDACTED]"
     assert item.args == {"state": "ready"}
-    assert item.getMessage() == (
-        "progress=100% state=ready Authorization: Bearer [REDACTED]"
-    )
+    assert item.getMessage() == ("progress=100% state=ready Authorization: Bearer [REDACTED]")
 
 
 def test_secret_filter_masks_empty_secret_positional_bearer_after_placeholder() -> None:
@@ -321,13 +314,9 @@ def test_secret_filter_never_corrupts_overlapping_mapping_format_tokens() -> Non
 
     SecretFilter(["s"]).filter(item)
 
-    assert item.msg == (
-        "[REDACTED]tatu[REDACTED]=%(state)s "
-        "Authorization: Bearer %(credential)s"
-    )
+    assert item.msg == ("[REDACTED]tatu[REDACTED]=%(state)s Authorization: Bearer %(credential)s")
     assert item.getMessage() == (
-        "[REDACTED]tatu[REDACTED]=[REDACTED]tatu[REDACTED] "
-        "Authorization: Bearer [REDACTED]"
+        "[REDACTED]tatu[REDACTED]=[REDACTED]tatu[REDACTED] Authorization: Bearer [REDACTED]"
     )
 
 
@@ -461,9 +450,7 @@ def test_configure_logging_file_rotation_permissions_and_secret_filter(
     contents = log_path.read_text(encoding="utf-8")
     assert "top-secret" not in contents
     assert "other" not in contents
-    assert json.loads(contents)["message"] == (
-        "Authorization: Bearer [REDACTED] token=[REDACTED]"
-    )
+    assert json.loads(contents)["message"] == ("Authorization: Bearer [REDACTED] token=[REDACTED]")
 
 
 def test_file_logging_does_not_follow_symlink_target(tmp_path: Path) -> None:

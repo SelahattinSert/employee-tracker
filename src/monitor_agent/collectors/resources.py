@@ -74,9 +74,7 @@ class ResourceCollector:
         )
         percentages = [float(value) for value in raw_percentages]
         percentage_values: list[JSONValue] = [value for value in percentages]
-        percent_total = (
-            round(sum(percentages) / len(percentages), 2) if percentages else 0.0
-        )
+        percent_total = round(sum(percentages) / len(percentages), 2) if percentages else 0.0
         frequency = cast(_CpuFrequency | None, psutil.cpu_freq())
 
         load_average: JSONValue = None

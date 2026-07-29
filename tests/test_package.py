@@ -56,9 +56,7 @@ def test_entrypoint_exits_with_success(monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert exc_info.value.code == 0
-    assert captured.out.strip() == (
-        f"monitor-agent 2.0.0 Python {platform.python_version()}"
-    )
+    assert captured.out.strip() == (f"monitor-agent 2.0.0 Python {platform.python_version()}")
     assert captured.err == ""
 
 
@@ -71,7 +69,5 @@ def test_python_m_monitor_agent() -> None:
     )
 
     assert result.returncode == 0
-    assert result.stdout.strip() == (
-        f"monitor-agent 2.0.0 Python {platform.python_version()}"
-    )
+    assert result.stdout.strip() == (f"monitor-agent 2.0.0 Python {platform.python_version()}")
     assert result.stderr == ""

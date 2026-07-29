@@ -182,9 +182,7 @@ def test_request_exceptions_retry_with_sanitized_messages(
 ) -> None:
     session = FakeSession(iter([failure, response(200)]))
 
-    result = TelemetryTransport(
-        config(), session=session, sleep=lambda _: None
-    ).send(telemetry())  # type: ignore[arg-type]
+    result = TelemetryTransport(config(), session=session, sleep=lambda _: None).send(telemetry())  # type: ignore[arg-type]
 
     assert result.kind is DeliveryKind.SUCCESS
     assert result.attempts == 2

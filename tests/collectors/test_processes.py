@@ -63,9 +63,7 @@ def process_info(
         (["worker", "--token"], "worker --token"),
     ],
 )
-def test_redacted_mode_masks_secret_values(
-    arguments: list[str], expected: str
-) -> None:
+def test_redacted_mode_masks_secret_values(arguments: list[str], expected: str) -> None:
     rendered = redact_command_line(arguments, "redacted", platform_name="linux")
 
     assert rendered == expected
@@ -94,9 +92,7 @@ def test_windows_uses_list2cmdline_after_redaction() -> None:
 
     rendered = redact_command_line(arguments, "redacted", platform_name="win32")
 
-    assert rendered == subprocess.list2cmdline(
-        ["worker app", "--token", "***", "--port", "443"]
-    )
+    assert rendered == subprocess.list2cmdline(["worker app", "--token", "***", "--port", "443"])
     assert "do-not-print" not in rendered
 
 
@@ -342,9 +338,7 @@ def test_none_mode_never_retains_process_arguments(
     monkeypatch.setattr(
         processes_module.psutil,
         "process_iter",
-        lambda attrs, ad_value: [
-            FakeProcess(process_info(1, 1024, ["worker", "plain-secret"]))
-        ],
+        lambda attrs, ad_value: [FakeProcess(process_info(1, 1024, ["worker", "plain-secret"]))],
     )
 
     result = ProcessesCollector("none").collect()

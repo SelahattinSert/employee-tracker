@@ -25,9 +25,7 @@ from monitor_agent.identity import (
     resolve_machine_identity,
 )
 
-UUID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def test_machine_identity_is_frozen_slotted_and_has_exact_fields() -> None:
@@ -64,9 +62,7 @@ def test_linux_machine_id_is_hashed(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert UUID_PATTERN.fullmatch(identity.value)
 
 
-def test_windows_machine_guid_is_hashed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_windows_machine_guid_is_hashed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "monitor_agent.identity._read_windows_machine_id",
         lambda: "raw-windows-machine-guid",
@@ -92,9 +88,7 @@ def test_hash_never_contains_raw_macos_identifier(
     assert "secret" not in identity.value
 
 
-def test_platform_defaults_to_sys_platform(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_platform_defaults_to_sys_platform(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(identity_module.sys, "platform", "darwin")
     monkeypatch.setattr(
         identity_module,
@@ -104,9 +98,7 @@ def test_platform_defaults_to_sys_platform(
 
     identity = resolve_machine_identity(tmp_path)
 
-    assert identity == MachineIdentity(
-        _hashed_uuid("raw-macos-identifier"), "macos-platform-uuid"
-    )
+    assert identity == MachineIdentity(_hashed_uuid("raw-macos-identifier"), "macos-platform-uuid")
 
 
 def test_missing_platform_id_persists_random_fallback(
@@ -408,9 +400,7 @@ def test_permanently_malformed_fallback_fails_after_bounded_retries(
     monkeypatch.setattr(identity_module, "_FALLBACK_READ_ATTEMPTS", 3)
     monkeypatch.setattr(identity_module.time, "sleep", retry_delays.append)
 
-    with pytest.raises(
-        RuntimeError, match="concurrent machine identity creation did not complete"
-    ):
+    with pytest.raises(RuntimeError, match="concurrent machine identity creation did not complete"):
         _load_or_create_fallback(tmp_path)
 
     assert retry_delays == [identity_module._FALLBACK_READ_DELAY_SEC] * 3

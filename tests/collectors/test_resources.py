@@ -57,9 +57,7 @@ def test_resource_collector_preserves_schema_units_rounding_and_one_cpu_sample(
     install_memory_fakes(monkeypatch)
     monkeypatch.setattr(
         "monitor_agent.collectors.resources.psutil.disk_partitions",
-        lambda all=False: [
-            SimpleNamespace(device="/dev/root", mountpoint="/", fstype="ext4")
-        ],
+        lambda all=False: [SimpleNamespace(device="/dev/root", mountpoint="/", fstype="ext4")],
     )
     monkeypatch.setattr(
         "monitor_agent.collectors.resources.psutil.disk_usage",

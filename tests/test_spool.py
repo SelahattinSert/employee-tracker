@@ -464,6 +464,7 @@ def test_reject_uses_replace_and_preserves_committed_destination_after_fsync_fai
         original_replace(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(spool_module.os, "replace", tracking_replace)
+
     def fail_after_record_commit(directory: Path) -> None:
         if directory == spool.root and not record.exists():
             raise OSError("dir fsync")
@@ -569,9 +570,7 @@ def test_dead_letter_chmod_uses_a_validated_file_descriptor(
     original_chmod = spool_module.os.chmod
     original_fchmod = spool_module.os.fchmod
 
-    def forbid_record_path_chmod(
-        path: object, mode: int, *args: object, **kwargs: object
-    ) -> None:
+    def forbid_record_path_chmod(path: object, mode: int, *args: object, **kwargs: object) -> None:
         if str(path).endswith(".json"):
             raise AssertionError("record chmod must be descriptor based")
         original_chmod(path, mode, *args, **kwargs)
@@ -586,9 +585,7 @@ def test_dead_letter_chmod_uses_a_validated_file_descriptor(
     result = spool.load(record) if operation == "corrupt" else spool.reject(record)
 
     destination = next(
-        path
-        for path in (tmp_path / "dead-letter").glob("*.json")
-        if not path.name.startswith(".")
+        path for path in (tmp_path / "dead-letter").glob("*.json") if not path.name.startswith(".")
     )
     assert result is None if operation == "corrupt" else result == destination
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
@@ -820,9 +817,7 @@ def test_cross_instance_publish_reservation_chooses_deterministic_next_candidate
     assert reservation is not None
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        record = executor.submit(second.enqueue, payload(event(1)), now=now).result(
-            timeout=2
-        )
+        record = executor.submit(second.enqueue, payload(event(1)), now=now).result(timeout=2)
     finally:
         first._release_reservation(first.root, reservation_name, reservation)
         executor.shutdown(wait=True)
@@ -892,9 +887,7 @@ def test_cross_instance_dead_letter_reservation_chooses_next_destination(
         '{"destination":"../escape.json","source":"SOURCE","suffix":".rejected"}',
     ],
 )
-def test_dead_letter_operation_marker_rejects_tampering(
-    tmp_path: Path, marker: str
-) -> None:
+def test_dead_letter_operation_marker_rejects_tampering(tmp_path: Path, marker: str) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
     source = tmp_path / "20260720T120000000000Z_missing.json"
     operation_id = spool._operation_id(source.name, ".rejected")
@@ -1052,9 +1045,7 @@ def test_dead_letter_detects_source_identity_change_before_commit(
 
     assert record.exists()
     assert not [
-        path
-        for path in (tmp_path / "dead-letter").glob("*.json")
-        if not path.name.startswith(".")
+        path for path in (tmp_path / "dead-letter").glob("*.json") if not path.name.startswith(".")
     ]
 
 
@@ -1167,9 +1158,7 @@ def test_pending_publish_never_overwrites_a_destination_created_after_reservatio
         if not injected and destination_name == canonical.name:
             injected = True
             canonical.write_bytes(b"unrelated")
-        original_publish(
-            source_directory, source_name, destination_directory, destination_name
-        )
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
     monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
 
@@ -1199,9 +1188,7 @@ def test_dead_letter_publish_reselects_after_an_atomic_collision_and_retries_exa
         if source_directory == spool.root and injected_destination is None:
             injected_destination = destination_directory / destination_name
             injected_destination.write_bytes(b"unrelated")
-        original_publish(
-            source_directory, source_name, destination_directory, destination_name
-        )
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
     monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
 
@@ -1233,9 +1220,7 @@ def test_dead_letter_never_accepts_an_identical_uncommitted_collision(
         if source_directory == spool.root and injected_destination is None:
             injected_destination = destination_directory / destination_name
             injected_destination.write_bytes((source_directory / source_name).read_bytes())
-        original_publish(
-            source_directory, source_name, destination_directory, destination_name
-        )
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
     monkeypatch.setattr(spool, "_publish_noreplace", race_publish)
 
@@ -1299,9 +1284,9 @@ def test_posix_link_fallback_recovers_a_dead_letter_publish_crash(
         spool.reject(record)
 
     marker = next((tmp_path / "dead-letter").glob(".deadop-*.json"))
-    destination = tmp_path / "dead-letter" / json.loads(
-        marker.read_text(encoding="utf-8")
-    )["destination"]
+    destination = (
+        tmp_path / "dead-letter" / json.loads(marker.read_text(encoding="utf-8"))["destination"]
+    )
     assert record.stat().st_ino == destination.stat().st_ino
     assert destination.stat().st_nlink == 2
 
@@ -1376,9 +1361,7 @@ def test_dead_letter_marker_rejects_changed_source_content(
     ) -> None:
         if source_directory == spool.root:
             raise OSError("crash")
-        original_publish(
-            source_directory, source_name, destination_directory, destination_name
-        )
+        original_publish(source_directory, source_name, destination_directory, destination_name)
 
     monkeypatch.setattr(spool, "_publish_noreplace", fail_record_move)
     with pytest.raises(OSError, match="crash"):
@@ -1440,9 +1423,7 @@ def test_windows_publish_uses_a_rename_that_propagates_destination_collisions(
     monkeypatch.setattr(os, "rename", collide)
 
     with pytest.raises(FileExistsError):
-        spool._publish_noreplace(
-            spool.root, source.name, spool.root, destination.name
-        )
+        spool._publish_noreplace(spool.root, source.name, spool.root, destination.name)
 
     assert source.read_bytes() == b"source"
     assert destination.read_bytes() == b"existing"
@@ -1483,11 +1464,7 @@ def test_posix_fallback_recovery_waits_for_the_publisher_to_unlink(
     monkeypatch.setattr(publisher, "_linux_rename_noreplace", lambda *args: False)
 
     def pause_after_link(path: object, *args: object, **kwargs: object) -> None:
-        if (
-            isinstance(path, str)
-            and path.startswith(".spool-")
-            and not link_created.is_set()
-        ):
+        if isinstance(path, str) and path.startswith(".spool-") and not link_created.is_set():
             link_created.set()
             if not finish_unlink.wait(timeout=5):
                 raise TimeoutError("publisher unlink was not released")
@@ -1745,9 +1722,7 @@ def test_artifact_guard_repairs_mode_and_rejects_hardlinked_guard(
     guard.write_bytes(b"")
     guard.chmod(0o640)
 
-    assert spool._acquire_artifact_guard(
-        spool.root, artifact_name, blocking=False
-    )
+    assert spool._acquire_artifact_guard(spool.root, artifact_name, blocking=False)
     try:
         assert stat.S_IMODE(guard.stat().st_mode) == 0o600
     finally:
@@ -1759,9 +1734,7 @@ def test_artifact_guard_repairs_mode_and_rejects_hardlinked_guard(
     hardlinked_guard = tmp_path / spool._artifact_guard_name(hardlinked_artifact)
     os.link(outside, hardlinked_guard)
     with pytest.raises(ValueError, match="guard must be a regular file"):
-        spool._acquire_artifact_guard(
-            spool.root, hardlinked_artifact, blocking=False
-        )
+        spool._acquire_artifact_guard(spool.root, hardlinked_artifact, blocking=False)
 
 
 def test_artifact_guard_rejects_identity_change_after_lock(
@@ -1776,6 +1749,4 @@ def test_artifact_guard_rejects_identity_change_after_lock(
     )
 
     with pytest.raises(ValueError, match="guard changed while locking"):
-        spool._acquire_artifact_guard(
-            spool.root, ".publish-replaced.lock", blocking=True
-        )
+        spool._acquire_artifact_guard(spool.root, ".publish-replaced.lock", blocking=True)

@@ -67,9 +67,7 @@ def test_agent_config_is_frozen_slotted_and_has_exact_fields() -> None:
 def test_agent_config_repr_omits_api_token() -> None:
     token = "real-secret-token"
 
-    config = load_config(
-        BASE_ENV | {"MONITOR_API_TOKEN": token}, platform_name="linux"
-    )
+    config = load_config(BASE_ENV | {"MONITOR_API_TOKEN": token}, platform_name="linux")
 
     assert token not in repr(config)
 
@@ -235,9 +233,7 @@ def test_all_overrides_are_loaded(tmp_path: Path) -> None:
         ),
     ],
 )
-def test_platform_paths(
-    platform_name: str, spool_path: Path, log_path: Path | None
-) -> None:
+def test_platform_paths(platform_name: str, spool_path: Path, log_path: Path | None) -> None:
     config = load_config({}, require_transport=False, platform_name=platform_name)
     assert config.spool_path == spool_path
     assert config.log_path == log_path
@@ -306,9 +302,7 @@ def test_ca_bundle_must_be_an_existing_regular_file(tmp_path: Path, path_kind: s
 
 @pytest.mark.parametrize("mode", ["none", "redacted", "full"])
 def test_process_cmdline_modes_are_accepted(mode: str) -> None:
-    config = load_config(
-        BASE_ENV | {"MONITOR_PROCESS_CMDLINE_MODE": mode}, platform_name="linux"
-    )
+    config = load_config(BASE_ENV | {"MONITOR_PROCESS_CMDLINE_MODE": mode}, platform_name="linux")
     assert config.process_cmdline_mode == mode
 
 

@@ -122,9 +122,7 @@ def _validate_paths(config: AgentConfig) -> None:
 
     if config.log_path is None:
         return
-    if config.log_path.is_symlink() or (
-        config.log_path.exists() and not config.log_path.is_file()
-    ):
+    if config.log_path.is_symlink() or (config.log_path.exists() and not config.log_path.is_file()):
         raise ConfigError("log path must identify a file")
     _validate_writable_directory(
         config.log_path.parent,

@@ -21,9 +21,7 @@ _FALLBACK_READ_DELAY_SEC = 0.01
 class _RegistryModule(Protocol):
     HKEY_LOCAL_MACHINE: object
 
-    def OpenKey(
-        self, key: object, sub_key: str
-    ) -> AbstractContextManager[object]: ...
+    def OpenKey(self, key: object, sub_key: str) -> AbstractContextManager[object]: ...
 
     def QueryValueEx(self, key: object, value_name: str) -> tuple[object, int]: ...
 

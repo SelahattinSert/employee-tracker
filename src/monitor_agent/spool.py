@@ -250,14 +250,10 @@ class Spool:
         return encoded.encode("utf-8")
 
     def _write_staged(self, encoded: bytes) -> tuple[Path, int]:
-        if not self._acquire_artifact_guard(
-            self.root, ".spool-", blocking=True
-        ):
+        if not self._acquire_artifact_guard(self.root, ".spool-", blocking=True):
             raise OSError(errno.EAGAIN, "spool artifact guard is busy")
         try:
-            descriptor, raw_path = tempfile.mkstemp(
-                dir=self.root, prefix=".spool-", suffix=".tmp"
-            )
+            descriptor, raw_path = tempfile.mkstemp(dir=self.root, prefix=".spool-", suffix=".tmp")
         except BaseException:
             self._release_artifact_guard(self.root, ".spool-")
             raise
@@ -291,14 +287,10 @@ class Spool:
             if reservation is None:
                 continue
             try:
-                self._publish_noreplace(
-                    self.root, temporary.name, self.root, destination.name
-                )
+                self._publish_noreplace(self.root, temporary.name, self.root, destination.name)
                 self._fsync_directory(self.root)
             except FileExistsError:
-                self._release_reservation(
-                    self.root, reservation_name, reservation
-                )
+                self._release_reservation(self.root, reservation_name, reservation)
                 continue
             except BaseException:
                 try:
@@ -387,17 +379,13 @@ class Spool:
             source_digest = self._descriptor_digest(source_descriptor)
             operation_id = self._operation_id(source.name, suffix)
             operation_lock_name = f".deadop-{operation_id}.lock"
-            operation_lock = self._acquire_reservation(
-                self._dead_letter, operation_lock_name
-            )
+            operation_lock = self._acquire_reservation(self._dead_letter, operation_lock_name)
             if operation_lock is None:
                 raise OSError(errno.EAGAIN, "dead-letter operation is already in progress")
 
             try:
                 marker_name = f".deadop-{operation_id}.json"
-                marker = self._read_operation_marker(
-                    marker_name, source.name, suffix
-                )
+                marker = self._read_operation_marker(marker_name, source.name, suffix)
                 destination_lock: int | None = None
                 destination_lock_name = ""
                 if marker is None:
@@ -466,22 +454,16 @@ class Spool:
                         continue
 
                     if destination_lock is None:
-                        destination_lock_name = self._dead_letter_reservation_name(
-                            destination_name
-                        )
+                        destination_lock_name = self._dead_letter_reservation_name(destination_name)
                         destination_lock = self._acquire_reservation(
                             self._dead_letter, destination_lock_name
                         )
                     if destination_lock is None:
                         if self._name_exists(self._dead_letter, destination_name):
                             continue
-                        raise OSError(
-                            errno.EAGAIN, "dead-letter destination is reserved"
-                        )
+                        raise OSError(errno.EAGAIN, "dead-letter destination is reserved")
 
-                    if not self._open_name_matches(
-                        self.root, source.name, source_descriptor
-                    ):
+                    if not self._open_name_matches(self.root, source.name, source_descriptor):
                         raise ValueError("dead-letter source changed before commit")
 
                     if _platform_name() != "posix":  # pragma: no cover - Windows fallback
@@ -503,15 +485,11 @@ class Spool:
                         destination_lock = None
                         destination_lock_name = ""
                         if source_descriptor < 0:
-                            source_descriptor = self._open_record(
-                                self.root, source.name
-                            )
+                            source_descriptor = self._open_record(self.root, source.name)
                         continue
                     self._fsync_directory(self.root)
                     self._fsync_directory(self._dead_letter)
-                    self._validate_dead_letter_destination(
-                        final_destination, source_digest
-                    )
+                    self._validate_dead_letter_destination(final_destination, source_digest)
                     self._persist_operation_marker(
                         marker_name,
                         source.name,
@@ -528,9 +506,7 @@ class Spool:
                     destination_lock_name,
                     destination_lock,
                 )
-                self._release_reservation(
-                    self._dead_letter, operation_lock_name, operation_lock
-                )
+                self._release_reservation(self._dead_letter, operation_lock_name, operation_lock)
         finally:
             if source_descriptor >= 0:
                 if source_locked:
@@ -580,9 +556,7 @@ class Spool:
         digest = hashlib.sha256(destination_name.encode("utf-8")).hexdigest()[:24]
         return f".deadres-{digest}.lock"
 
-    def _reserve_dead_letter_destination(
-        self, source: Path, suffix: str
-    ) -> tuple[str, str, int]:
+    def _reserve_dead_letter_destination(self, source: Path, suffix: str) -> tuple[str, str, int]:
         canonical = self._dead_letter_name(source, suffix)
         for number in range(1_000_000):
             destination_name = self._numbered_name(canonical, number)
@@ -591,9 +565,7 @@ class Spool:
             if reservation is None:
                 continue
             if self._name_exists(self._dead_letter, destination_name):
-                self._release_reservation(
-                    self._dead_letter, reservation_name, reservation
-                )
+                self._release_reservation(self._dead_letter, reservation_name, reservation)
                 continue
             return destination_name, reservation_name, reservation
         raise OSError("could not reserve a unique dead-letter destination")
@@ -609,9 +581,7 @@ class Spool:
         committed: bool = False,
         replace_existing: bool = False,
     ) -> None:
-        if not self._acquire_artifact_guard(
-            self._dead_letter, ".deadmark-", blocking=True
-        ):
+        if not self._acquire_artifact_guard(self._dead_letter, ".deadmark-", blocking=True):
             raise OSError(errno.EAGAIN, "dead-letter marker guard is busy")
         try:
             encoded = json.dumps(
@@ -638,12 +608,8 @@ class Spool:
                     handle.write(encoded)
                     handle.flush()
                     os.fsync(handle.fileno())
-                if not replace_existing and self._name_exists(
-                    self._dead_letter, marker_name
-                ):
-                    raise FileExistsError(
-                        "dead-letter operation marker already exists"
-                    )
+                if not replace_existing and self._name_exists(self._dead_letter, marker_name):
+                    raise FileExistsError("dead-letter operation marker already exists")
                 self._replace_name(
                     self._dead_letter,
                     temporary.name,
@@ -694,9 +660,7 @@ class Spool:
             raise ValueError("invalid dead-letter operation marker")
         return cast(dict[str, object], decoded)
 
-    def _validate_dead_letter_destination(
-        self, destination: Path, expected_digest: str
-    ) -> None:
+    def _validate_dead_letter_destination(self, destination: Path, expected_digest: str) -> None:
         descriptor = self._open_record(self._dead_letter, destination.name)
         try:
             if self._descriptor_digest(descriptor) != expected_digest:
@@ -704,9 +668,7 @@ class Spool:
         finally:
             os.close(descriptor)
 
-    def _destination_matches_digest(
-        self, destination: Path, expected_digest: str
-    ) -> bool:
+    def _destination_matches_digest(self, destination: Path, expected_digest: str) -> bool:
         try:
             self._validate_dead_letter_destination(destination, expected_digest)
         except (OSError, ValueError):
@@ -727,9 +689,7 @@ class Spool:
 
     def _recover_pending_links(self) -> None:
         for hidden in self.root.glob(".spool-*"):
-            if not self._acquire_artifact_guard(
-                self.root, hidden.name, blocking=False
-            ):
+            if not self._acquire_artifact_guard(self.root, hidden.name, blocking=False):
                 continue
             try:
                 try:
@@ -746,10 +706,7 @@ class Spool:
                         continue
                     locked = True
                     hidden_stat = os.fstat(descriptor)
-                    if (
-                        not stat.S_ISREG(hidden_stat.st_mode)
-                        or hidden_stat.st_nlink != 2
-                    ):
+                    if not stat.S_ISREG(hidden_stat.st_mode) or hidden_stat.st_nlink != 2:
                         continue
                     matches = []
                     for candidate in self.root.glob("*.json"):
@@ -796,8 +753,7 @@ class Spool:
                     or source_name.startswith(".")
                     or not source_name.endswith(".json")
                     or not isinstance(suffix, str)
-                    or marker_path.name
-                    != f".deadop-{self._operation_id(source_name, suffix)}.json"
+                    or marker_path.name != f".deadop-{self._operation_id(source_name, suffix)}.json"
                     or not isinstance(destination_name, str)
                     or Path(destination_name).name != destination_name
                     or destination_name.startswith(".")
@@ -837,9 +793,7 @@ class Spool:
                     ):
                         continue
                     if self._descriptor_digest(descriptor) != expected_digest:
-                        raise ValueError(
-                            "dead-letter recovery source does not match marker"
-                        )
+                        raise ValueError("dead-letter recovery source does not match marker")
                     if self._unlink_open_name(self.root, source.name, descriptor):
                         self._fsync_directory(self.root)
                         self._fsync_directory(self._dead_letter)
@@ -849,9 +803,7 @@ class Spool:
                     else:
                         os.close(descriptor)
             finally:
-                self._release_artifact_guard(
-                    self._dead_letter, operation_lock_name
-                )
+                self._release_artifact_guard(self._dead_letter, operation_lock_name)
 
     def _cleanup_hidden_artifacts(self) -> None:
         root_prefixes = (".spool-", ".publish-")
@@ -863,9 +815,7 @@ class Spool:
             for path in directory.iterdir():
                 if not path.name.startswith(prefixes):
                     continue
-                if path.name.startswith(".deadop-") and path.name.endswith(
-                    ".json"
-                ):
+                if path.name.startswith(".deadop-") and path.name.endswith(".json"):
                     continue
                 self._cleanup_stale_hidden_file(directory, path.name)
 
@@ -874,18 +824,13 @@ class Spool:
             return False
         try:
             try:
-                descriptor = self._open_name(
-                    directory, name, os.O_RDWR | _NOFOLLOW | _CLOEXEC
-                )
+                descriptor = self._open_name(directory, name, os.O_RDWR | _NOFOLLOW | _CLOEXEC)
             except (FileNotFoundError, OSError):
                 return False
             locked = False
             try:
                 record_stat = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(record_stat.st_mode)
-                    or record_stat.st_nlink != 1
-                ):
+                if not stat.S_ISREG(record_stat.st_mode) or record_stat.st_nlink != 1:
                     return False
                 if not self._try_lock_descriptor(descriptor):
                     return False
@@ -898,11 +843,10 @@ class Spool:
                         current_stat = os.lstat(directory / name)
                     except FileNotFoundError:
                         return False
-                    if (
-                        not stat.S_ISREG(current_stat.st_mode)
-                        or (current_stat.st_dev, current_stat.st_ino)
-                        != (record_stat.st_dev, record_stat.st_ino)
-                    ):
+                    if not stat.S_ISREG(current_stat.st_mode) or (
+                        current_stat.st_dev,
+                        current_stat.st_ino,
+                    ) != (record_stat.st_dev, record_stat.st_ino):
                         return False
                     (directory / name).unlink()
                     self._fsync_directory(directory)
@@ -930,11 +874,7 @@ class Spool:
                     descriptor = self._open_name(
                         directory,
                         name,
-                        os.O_RDWR
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | _NOFOLLOW
-                        | _CLOEXEC,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
                         0o600,
                     )
                 except FileExistsError:
@@ -957,9 +897,7 @@ class Spool:
             if not acquired:
                 self._release_artifact_guard(directory, name)
 
-    def _release_reservation(
-        self, directory: Path, name: str, descriptor: int | None
-    ) -> None:
+    def _release_reservation(self, directory: Path, name: str, descriptor: int | None) -> None:
         if descriptor is None:
             return
         try:
@@ -1015,9 +953,7 @@ class Spool:
             if (
                 not stat.S_ISREG(record_stat.st_mode)
                 or record_stat.st_nlink != 1
-                or not Spool._open_name_matches(
-                    directory, guard_name, descriptor
-                )
+                or not Spool._open_name_matches(directory, guard_name, descriptor)
             ):
                 raise ValueError("spool artifact guard must be a regular file")
             if blocking:
@@ -1027,14 +963,10 @@ class Spool:
                 locked = True
             else:
                 return False
-            if not Spool._open_name_matches(
-                directory, guard_name, descriptor
-            ):
+            if not Spool._open_name_matches(directory, guard_name, descriptor):
                 raise ValueError("spool artifact guard changed while locking")
             if stat.S_IMODE(record_stat.st_mode) != 0o600:
-                self._fchmod_descriptor(
-                    descriptor, directory / guard_name, 0o600
-                )
+                self._fchmod_descriptor(descriptor, directory / guard_name, 0o600)
             self._artifact_guards[key] = (descriptor, 1)
             return True
         finally:
@@ -1044,9 +976,7 @@ class Spool:
                 else:
                     os.close(descriptor)
 
-    def _release_artifact_guard(
-        self, directory: Path, artifact_name: str
-    ) -> None:
+    def _release_artifact_guard(self, directory: Path, artifact_name: str) -> None:
         guard_name = self._artifact_guard_name(artifact_name)
         key = (directory.absolute(), guard_name)
         descriptor, depth = self._artifact_guards[key]
@@ -1149,14 +1079,10 @@ class Spool:
             except FileNotFoundError:
                 return False
         else:
-            directory_descriptor = os.open(
-                directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
-            )
+            directory_descriptor = os.open(directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
             try:
                 try:
-                    current_stat = os.stat(
-                        name, dir_fd=directory_descriptor, follow_symlinks=False
-                    )
+                    current_stat = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
                 except FileNotFoundError:
                     return False
             finally:
@@ -1183,14 +1109,10 @@ class Spool:
                 return False
             (directory / name).unlink()
             return True
-        directory_descriptor = os.open(
-            directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
-        )
+        directory_descriptor = os.open(directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
         try:
             try:
-                current_stat = os.stat(
-                    name, dir_fd=directory_descriptor, follow_symlinks=False
-                )
+                current_stat = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
             except FileNotFoundError:
                 return False
             if (current_stat.st_dev, current_stat.st_ino) != (
@@ -1238,12 +1160,8 @@ class Spool:
             )
             return
 
-        source_fd = os.open(
-            source_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
-        )
-        destination_fd = os.open(
-            destination_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC
-        )
+        source_fd = os.open(source_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
+        destination_fd = os.open(destination_directory, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
         try:
             if sys.platform.startswith("linux") and self._linux_rename_noreplace(
                 source_fd, source_name, destination_fd, destination_name
@@ -1286,9 +1204,7 @@ class Spool:
             return True
         error_number = get_errno()
         if error_number == errno.EEXIST:
-            raise FileExistsError(
-                error_number, os.strerror(error_number), destination_name
-            )
+            raise FileExistsError(error_number, os.strerror(error_number), destination_name)
         if error_number in {
             errno.ENOSYS,
             errno.EINVAL,

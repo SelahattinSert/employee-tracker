@@ -316,9 +316,7 @@ def test_check_config_validates_transport_and_paths_without_work(
     monkeypatch.setattr(
         cli,
         "load_config",
-        lambda *, require_transport: (
-            requirements.append(require_transport) or agent_config
-        ),
+        lambda *, require_transport: requirements.append(require_transport) or agent_config,
     )
     monkeypatch.setattr(cli, "_validate_paths", validations.append)
     monkeypatch.setattr(cli, "configure_logging", lambda value: None)
@@ -476,9 +474,7 @@ def test_validate_paths_sanitizes_probe_creation_failure(
     monkeypatch.setattr(
         cli.tempfile,
         "mkstemp",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            PermissionError("raw path and probe")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("raw path and probe")),
     )
 
     with pytest.raises(ConfigError, match=r"^spool path is not writable$"):
@@ -535,9 +531,7 @@ def test_prepare_config_sanitizes_logging_setup_race(
     monkeypatch.setattr(
         cli,
         "configure_logging",
-        lambda value: (_ for _ in ()).throw(
-            PermissionError("raw private log path from race")
-        ),
+        lambda value: (_ for _ in ()).throw(PermissionError("raw private log path from race")),
     )
 
     with pytest.raises(ConfigError, match=r"^log path is not writable$") as error:

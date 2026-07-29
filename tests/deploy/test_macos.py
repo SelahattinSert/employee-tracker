@@ -146,8 +146,8 @@ def _deployment_harness(
     fake_bin.mkdir()
     _write_executable(fake_bin / "id", "#!/bin/sh\nprintf '0\\n'\n")
     _write_executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")
-    _write_executable(fake_bin / "chmod", "#!/bin/sh\nexec /usr/bin/chmod \"$@\"\n")
-    _write_executable(fake_bin / "install", "#!/bin/sh\nexec /usr/bin/install \"$@\"\n")
+    _write_executable(fake_bin / "chmod", '#!/bin/sh\nexec /usr/bin/chmod "$@"\n')
+    _write_executable(fake_bin / "install", '#!/bin/sh\nexec /usr/bin/install "$@"\n')
     _write_executable(
         fake_bin / "mv",
         "#!/bin/sh\n"
@@ -186,13 +186,13 @@ def _deployment_harness(
         'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
         '  mkdir -p "$3/bin"\n'
         '  cp "$0" "$3/bin/python"\n'
-        "  chmod 755 \"$3/bin/python\"\n"
+        '  chmod 755 "$3/bin/python"\n'
         "  exit 0\n"
         "fi\n"
         'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
         '  agent="$(dirname "$0")/monitor-agent"\n'
         "  printf '%s\\n' '#!/bin/sh' 'exit 0' > \"$agent\"\n"
-        "  chmod 755 \"$agent\"\n"
+        '  chmod 755 "$agent"\n'
         "  exit 0\n"
         "fi\n"
         "exit 1\n",
@@ -210,14 +210,14 @@ def _deployment_harness(
         '  print) if [ "$(cat "$LAUNCHD_STATE")" = 1 ]; then if [ "$(cat "$LAUNCHD_RUNNING")" = 1 ]; then printf "state = running\\n"; else printf "state = exited\\n"; fi; exit 0; fi; exit 113 ;;\n'
         '  bootout) printf "0\\n" > "$LAUNCHD_STATE"; printf "0\\n" > "$LAUNCHD_RUNNING" ;;\n'
         '  bootstrap) printf "1\\n" > "$LAUNCHD_STATE"; printf "1\\n" > "$LAUNCHD_RUNNING" ;;\n'
-        '  enable) : ;;\n'
+        "  enable) : ;;\n"
         '  stop) [ "$2" = com.company.monitor-agent ] || exit 1; printf "0\\n" > "$LAUNCHD_RUNNING" ;;\n'
-        '  *) exit 1 ;;\n'
+        "  *) exit 1 ;;\n"
         "esac\n",
     )
     _write_executable(
         fake_bin / "plutil",
-        "#!/bin/sh\n[ \"${FAIL_STAGE:-}\" != plutil ]\n",
+        '#!/bin/sh\n[ "${FAIL_STAGE:-}" != plutil ]\n',
     )
     wheel = tmp_path / "monitor_agent-2.0.0-py3-none-any.whl"
     wheel.write_bytes(b"wheel")
@@ -271,12 +271,12 @@ def test_launcher_uses_a_nonexecuting_strict_allowlist_parser() -> None:
     assert "eval " not in text
     assert "xargs" not in text
     assert "env $(" not in text
-    assert ". \"$config_file\"" not in text
+    assert '. "$config_file"' not in text
     assert "IFS= read -r line" in text
     assert "${line%%=*}" in text and "${line#*=}" in text
-    assert "export \"$key=$value\"" in text
-    assert "unset \"$known_key\"" in text
-    assert "exec \"$agent\" \"$command\"" in text
+    assert 'export "$key=$value"' in text
+    assert 'unset "$known_key"' in text
+    assert 'exec "$agent" "$command"' in text
     for key in KNOWN_KEYS:
         assert key in text
 
@@ -336,18 +336,18 @@ def test_installer_has_transactional_preflight_and_locked_installation() -> None
     assert "CPython" in text
     for minor in ("11", "12", "13", "14"):
         assert minor in text
-    assert "--require-hashes -r \"$requirements_path\"" in text
-    assert "--no-deps --force-reinstall \"$wheel_path\"" in text
+    assert '--require-hashes -r "$requirements_path"' in text
+    assert '--no-deps --force-reinstall "$wheel_path"' in text
     assert "install --upgrade pip" not in text
     assert 'install_root="/Library/Application Support/MonitorAgent"' in text
     assert 'log_root="/Library/Logs/MonitorAgent"' in text
     assert 'plist_target="/Library/LaunchDaemons/com.company.monitor-agent.plist"' in text
-    assert "mktemp -d \"$app_parent/.monitor-agent-transaction." in text
+    assert 'mktemp -d "$app_parent/.monitor-agent-transaction.' in text
     assert "rollback" in text.lower()
     assert 'launchctl stop "$launchd_label"' in text
-    assert "launchctl bootstrap system \"$plist_target\"" in text
+    assert 'launchctl bootstrap system "$plist_target"' in text
     assert "launchctl enable system/com.company.monitor-agent" in text
-    assert "plutil -lint \"$staged_plist\"" in text
+    assert 'plutil -lint "$staged_plist"' in text
     assert '"$staged_root/run-agent.sh" check-config' in text
     assert "|| true" not in text
     assert '"$launchd_running" -ne 1' in text
@@ -369,11 +369,11 @@ def test_uninstaller_is_state_aware_and_preserves_data_by_default() -> None:
     assert "launchctl bootout system/com.company.monitor-agent" in text
     assert "unable to inspect LaunchDaemon state" in text
     assert "unable to verify LaunchDaemon removal" in text
-    assert "rm -rf \"$venv_dir\"" in text
-    assert "rm -f \"$launcher\"" in text
+    assert 'rm -rf "$venv_dir"' in text
+    assert 'rm -f "$launcher"' in text
     assert 'if [ "$purge" -eq 1 ]; then' in text
-    assert "rm -rf \"$install_root\"" in text
-    assert "rm -rf \"$log_root\"" in text
+    assert 'rm -rf "$install_root"' in text
+    assert 'rm -rf "$log_root"' in text
     assert "|| true" not in text
 
 
@@ -383,8 +383,12 @@ def test_environment_example_uses_literal_macos_paths_and_placeholder_secret() -
     assert "MONITOR_SPOOL_PATH=/Library/Application Support/MonitorAgent/spool" in lines
     assert "MONITOR_LOG_PATH=/Library/Logs/MonitorAgent/monitor-agent.log" in lines
     assert "MONITOR_LOG_FORMAT=json" in lines
-    assert not any(line.startswith("MONITOR_API_TOKEN=") and "replace" not in line for line in lines)
-    assert all(not value.startswith(('"', "'")) for _, _, value in (line.partition("=") for line in lines))
+    assert not any(
+        line.startswith("MONITOR_API_TOKEN=") and "replace" not in line for line in lines
+    )
+    assert all(
+        not value.startswith(('"', "'")) for _, _, value in (line.partition("=") for line in lines)
+    )
 
 
 def test_shell_scripts_pass_posix_syntax_and_no_insecure_modes() -> None:
@@ -407,10 +411,17 @@ def test_installer_stage_failure_does_not_mutate_live_files(tmp_path: Path) -> N
     (install_root / "venv" / "old").write_text("old", encoding="utf-8")
     (install_root / "monitor-agent.env").write_text("MONITOR_API_TOKEN=old\n", encoding="utf-8")
     env["FAIL_STAGE"] = "plutil"
-    result = _run(installer, tmp_path / "monitor_agent-2.0.0-py3-none-any.whl", tmp_path / "managed.env", env=env)
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
     assert result.returncode != 0
     assert (install_root / "venv" / "old").read_text(encoding="utf-8") == "old"
-    assert (install_root / "monitor-agent.env").read_text(encoding="utf-8") == "MONITOR_API_TOKEN=old\n"
+    assert (install_root / "monitor-agent.env").read_text(
+        encoding="utf-8"
+    ) == "MONITOR_API_TOKEN=old\n"
     assert (tmp_path / "launchd-state").read_text(encoding="utf-8") == "1\n"
     assert not list(install_root.parent.glob(".monitor-agent-transaction.*"))
 
@@ -428,7 +439,12 @@ def test_installer_activation_failure_rolls_back_prior_runtime_and_launchd(
     plist.parent.mkdir(parents=True, exist_ok=True)
     plist.write_text("old plist", encoding="utf-8")
     env["FAIL_STAGE"] = failed_stage
-    result = _run(installer, tmp_path / "monitor_agent-2.0.0-py3-none-any.whl", tmp_path / "managed.env", env=env)
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
     assert result.returncode != 0
     assert (install_root / "venv" / "old").read_text(encoding="utf-8") == "old"
     assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == "old launcher"
@@ -447,13 +463,7 @@ def test_installer_backup_rename_failure_preserves_every_prior_artifact_and_daem
     (install_root / "monitor-agent.env").write_text(
         "MONITOR_API_TOKEN=old secret\n", encoding="utf-8"
     )
-    plist = (
-        tmp_path
-        / "managed"
-        / "Library"
-        / "LaunchDaemons"
-        / "com.company.monitor-agent.plist"
-    )
+    plist = tmp_path / "managed" / "Library" / "LaunchDaemons" / "com.company.monitor-agent.plist"
     plist.write_text("old plist", encoding="utf-8")
     env["FAIL_MV_SOURCE"] = str(
         install_root / "run-agent.sh" if failed_backup == "run-agent.sh" else plist
@@ -481,13 +491,7 @@ def test_installer_restores_a_prior_loaded_but_stopped_daemon(tmp_path: Path) ->
     installer, _, install_root, env, _ = _deployment_harness(tmp_path, loaded=True)
     (tmp_path / "launchd-running").write_text("0\n", encoding="utf-8")
     (install_root / "venv").mkdir(parents=True)
-    plist = (
-        tmp_path
-        / "managed"
-        / "Library"
-        / "LaunchDaemons"
-        / "com.company.monitor-agent.plist"
-    )
+    plist = tmp_path / "managed" / "Library" / "LaunchDaemons" / "com.company.monitor-agent.plist"
     plist.write_text("old plist", encoding="utf-8")
     env["FAIL_STAGE"] = "enable"
     result = _run(
@@ -537,37 +541,32 @@ def test_installer_rejects_loaded_daemon_without_a_managed_plist(tmp_path: Path)
 def test_installer_successful_upgrade_replaces_runtime_preserves_data_and_cleans_transaction(
     tmp_path: Path,
 ) -> None:
-    installer, _, install_root, env, log_root = _deployment_harness(
-        tmp_path, loaded=True
-    )
+    installer, _, install_root, env, log_root = _deployment_harness(tmp_path, loaded=True)
     (install_root / "venv").mkdir(parents=True)
     (install_root / "venv" / "old").write_text("old venv", encoding="utf-8")
     (install_root / "run-agent.sh").write_text("old launcher", encoding="utf-8")
     (install_root / "monitor-agent.env").write_text(
         "MONITOR_API_TOKEN=old secret\n", encoding="utf-8"
     )
-    plist = (
-        tmp_path
-        / "managed"
-        / "Library"
-        / "LaunchDaemons"
-        / "com.company.monitor-agent.plist"
-    )
+    plist = tmp_path / "managed" / "Library" / "LaunchDaemons" / "com.company.monitor-agent.plist"
     plist.write_text("old plist", encoding="utf-8")
     spool = install_root / "spool"
     spool.mkdir()
     (spool / "queued.json").write_text("queued", encoding="utf-8")
     log_root.mkdir(parents=True)
     (log_root / "agent.log").write_text("prior log", encoding="utf-8")
-    result = _run(installer, tmp_path / "monitor_agent-2.0.0-py3-none-any.whl", tmp_path / "managed.env", env=env)
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
     assert result.returncode == 0, result.stderr
     assert (spool / "queued.json").read_text(encoding="utf-8") == "queued"
     assert (log_root / "agent.log").read_text(encoding="utf-8") == "prior log"
     assert (install_root / "venv" / "bin" / "monitor-agent").is_file()
     assert not (install_root / "venv" / "old").exists()
-    assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == _script(
-        LAUNCHER
-    )
+    assert (install_root / "run-agent.sh").read_text(encoding="utf-8") == _script(LAUNCHER)
     assert (install_root / "monitor-agent.env").read_text(
         encoding="utf-8"
     ) == "MONITOR_API_TOKEN=new secret=value\n"
@@ -594,8 +593,7 @@ def test_installer_success_cleanup_failure_names_retained_recovery(
     assert result.returncode != 0
     assert len(transactions) == 1
     assert result.stderr == (
-        "monitor-agent install: cleanup incomplete; recovery retained at "
-        f"{transactions[0]}\n"
+        f"monitor-agent install: cleanup incomplete; recovery retained at {transactions[0]}\n"
     )
     assert "new secret=value" not in result.stderr
 

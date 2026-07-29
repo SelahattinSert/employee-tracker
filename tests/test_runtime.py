@@ -181,14 +181,10 @@ def test_replay_rejects_permanent_and_continues_after_corrupt_record(
         [delivery(DeliveryKind.PERMANENT, 422), delivery(DeliveryKind.SUCCESS, 200)]
     )
     agent = runtime(tmp_path, transport)
-    first = agent.spool.enqueue(
-        queued_payload(1), now=datetime(2099, 7, 19, tzinfo=UTC)
-    )
+    first = agent.spool.enqueue(queued_payload(1), now=datetime(2099, 7, 19, tzinfo=UTC))
     corrupt = tmp_path / "20990720T120000000000Z_corrupt.json"
     corrupt.write_text("{", encoding="utf-8")
-    last = agent.spool.enqueue(
-        queued_payload(2), now=datetime(2099, 7, 21, tzinfo=UTC)
-    )
+    last = agent.spool.enqueue(queued_payload(2), now=datetime(2099, 7, 21, tzinfo=UTC))
 
     assert agent.replay() is True
 
@@ -326,9 +322,7 @@ def test_run_cycle_spools_live_payload_without_sending_when_backlog_remains(
     assert result.delivery_kind is None
     assert len(transport.payloads) == 1
     pending_payloads = [agent.spool.load(path) for path in agent.spool.pending()]
-    pending_event_ids = [
-        payload["event_id"] for payload in pending_payloads if payload is not None
-    ]
+    pending_event_ids = [payload["event_id"] for payload in pending_payloads if payload is not None]
     assert pending_event_ids[0] == queued_payload(2)["event_id"]
     assert result.event_id == pending_event_ids[1]
 

@@ -134,8 +134,9 @@ def test_payload_merges_only_known_sections_from_success_and_partial_mapping_dat
     assert "unexpected" not in payload
 
 
-def test_payload_keeps_defaults_and_inputs_independent_for_duplicate_and_unknown_collectors(
-) -> None:
+def test_payload_keeps_defaults_and_inputs_independent_for_duplicate_and_unknown_collectors() -> (
+    None
+):
     first_data = {"system": {"hostname": "first"}}
     second_data = {"system": {"hostname": "second"}}
     batch = CollectionBatch(
@@ -174,6 +175,4 @@ def test_payload_records_all_collector_statuses_and_machine_identity_without_sou
     collector_statuses = {
         name: details["status"] for name, details in payload["agent"]["collectors"].items()
     }
-    assert collector_statuses == {
-        status.value: status.value for status in statuses
-    }
+    assert collector_statuses == {status.value: status.value for status in statuses}

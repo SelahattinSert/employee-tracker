@@ -4,9 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
-JSONValue: TypeAlias = (
-    None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
-)
+JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 
 
 class DeliveryKind(StrEnum):

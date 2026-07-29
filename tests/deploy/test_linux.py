@@ -284,8 +284,7 @@ def _state(path: Path) -> tuple[int, int]:
     values = {
         key: int(value)
         for key, value in (
-            line.split("=", maxsplit=1)
-            for line in path.read_text(encoding="utf-8").splitlines()
+            line.split("=", maxsplit=1) for line in path.read_text(encoding="utf-8").splitlines()
         )
     }
     return values["active"], values["enabled"]
@@ -390,10 +389,7 @@ class Harness:
 
     def _write_state(self, *, active: bool, enabled: bool) -> None:
         self.service_state.write_text(
-            f"active={int(active)}\n"
-            f"enabled={int(enabled)}\n"
-            "active_queries=0\n"
-            "enabled_queries=0\n",
+            f"active={int(active)}\nenabled={int(enabled)}\nactive_queries=0\nenabled_queries=0\n",
             encoding="utf-8",
         )
 
@@ -904,8 +900,11 @@ esac
             "FAKE_DIRECTORY_FAIL_TARGET": directory_fail_target,
             "FAKE_MODE_FAIL_TARGET": mode_fail_target,
             "FAKE_FAIL_STAGE": (
-                "directory-create" if directory_fail_target else
-                "directory-mode" if mode_fail_target else failure
+                "directory-create"
+                if directory_fail_target
+                else "directory-mode"
+                if mode_fail_target
+                else failure
             ),
             "MONITOR_AGENT_TEST_BYPASS_ROOT": "1",
         }
@@ -1284,8 +1283,7 @@ def test_failed_rollback_retains_recoverable_artifacts(
     assert (tmp_path / "restore.marker").exists()
     assert result.stdout == ""
     assert result.stderr == (
-        "monitor-agent install: installation failed\n"
-        "monitor-agent install: rollback failed\n"
+        "monitor-agent install: installation failed\nmonitor-agent install: rollback failed\n"
     )
     transactions = list((harness.stage / "opt").glob(".monitor-agent-install.*"))
     assert len(transactions) == 1
@@ -1348,8 +1346,7 @@ def test_rollback_failure_output_is_fixed_and_never_leaks_native_diagnostics(
     assert (tmp_path / "restore.marker").exists()
     assert result.stdout == ""
     assert result.stderr == (
-        "monitor-agent install: installation failed\n"
-        "monitor-agent install: rollback failed\n"
+        "monitor-agent install: installation failed\nmonitor-agent install: rollback failed\n"
     )
     assert "native-failure-token" not in result.stdout + result.stderr
     assert "randomized-transaction-path" not in result.stdout + result.stderr
@@ -1497,8 +1494,7 @@ def test_copied_uninstaller_preserves_config_and_state_by_default_in_order(
     assert not harness.unit.exists()
     assert harness.config.read_text(encoding="utf-8") == "MONITOR_API_TOKEN=old-secret\n"
     assert (
-        harness.state_dir.joinpath("telemetry.json").read_text(encoding="utf-8")
-        == "keep state\n"
+        harness.state_dir.joinpath("telemetry.json").read_text(encoding="utf-8") == "keep state\n"
     )
     assert _state(harness.service_state) == (0, 0)
     assert harness.log.read_text(encoding="utf-8").splitlines() == [
@@ -1570,9 +1566,7 @@ def test_copied_uninstaller_rejects_invalid_arguments(
     tmp_path: Path, arguments: tuple[str, ...]
 ) -> None:
     harness = Harness(tmp_path)
-    result = _run(
-        harness.linux / "uninstall.sh", *arguments, env=harness.process_environment()
-    )
+    result = _run(harness.linux / "uninstall.sh", *arguments, env=harness.process_environment())
     assert result.returncode == 2
     assert result.stderr == "monitor-agent uninstall: expected no arguments or --purge\n"
 
@@ -1602,7 +1596,7 @@ def test_copied_uninstaller_rejects_invalid_arguments(
         "env rm -rf -- /",
         "delete_command='rm -rf -- /'",
         "delete_command=rm\n$delete_command -rf -- /",
-        "delete_command=rm\n\"$delete_command\" -rf -- /tmp/third",
+        'delete_command=rm\n"$delete_command" -rf -- /tmp/third',
         "rm -rf -- \\\n/",
         "rm -rf -- /opt/*",
         "rm -rf -- /opt/monitor-agent /tmp/third",
@@ -1612,7 +1606,7 @@ def test_copied_uninstaller_rejects_invalid_arguments(
         'result=$(r""m -r -- /tmp/third)',
         "result=$(outer=$(rm -r -- /tmp/third))",
         'wrapper "$(rm -r -- /tmp/third)"',
-        "result=`r\"\"m -R -- /tmp/third`",
+        'result=`r""m -R -- /tmp/third`',
         'result=$(tool=r""m; "$tool" -r -- /tmp/third)',
         "$(rm -rf -- /tmp/third)",
     ],
