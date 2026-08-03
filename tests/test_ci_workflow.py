@@ -38,8 +38,20 @@ def test_systemd_unit_is_verified_against_staged_runtime_paths() -> None:
         '"$staged_root/opt/monitor-agent/venv/bin/monitor-agent"\n'
         "          install -Dm600 /dev/null "
         '"$staged_root/etc/monitor-agent/monitor-agent.env"\n'
+        "          for target in sysinit.target network-online.target multi-user.target; do\n"
+        '            target_path="$staged_root/usr/lib/systemd/system/$target"\n'
+        '            install -Dm644 /dev/null "$target_path"\n'
+        "            printf '%s\\n' '[Unit]' \"Description=staged $target\" > \"$target_path\"\n"
+        "          done\n"
         "          systemd-analyze verify --root="
         '"$staged_root" --recursive-errors=yes '
         "/etc/systemd/system/monitor-agent.service"
     ) in workflow
     assert "systemd-analyze verify deploy/linux/monitor-agent.service" not in workflow
+    assert 'for target in sysinit.target network-online.target multi-user.target; do' in workflow
+
+
+def test_matrix_test_job_excludes_platform_deployment_harnesses() -> None:
+    workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "python -m pytest --ignore=tests/deploy" in workflow

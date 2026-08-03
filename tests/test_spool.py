@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import stat
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -595,6 +596,9 @@ def test_dead_letter_chmod_uses_a_validated_file_descriptor(
 def test_enqueue_publishes_with_replace_without_hard_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("macOS uses the POSIX hard-link no-replace fallback")
+
     import monitor_agent.spool as spool_module
 
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)

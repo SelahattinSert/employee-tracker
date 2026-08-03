@@ -60,7 +60,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest
+      - run: python -m pytest --ignore=tests/deploy
 
   package:
     runs-on: ubuntu-24.04
@@ -129,6 +129,11 @@ jobs:
           install -Dm644 deploy/linux/monitor-agent.service "$staged_root/etc/systemd/system/monitor-agent.service"
           install -Dm755 /bin/true "$staged_root/opt/monitor-agent/venv/bin/monitor-agent"
           install -Dm600 /dev/null "$staged_root/etc/monitor-agent/monitor-agent.env"
+          for target in sysinit.target network-online.target multi-user.target; do
+            target_path="$staged_root/usr/lib/systemd/system/$target"
+            install -Dm644 /dev/null "$target_path"
+            printf '%s\n' '[Unit]' "Description=staged $target" > "$target_path"
+          done
           systemd-analyze verify --root="$staged_root" --recursive-errors=yes /etc/systemd/system/monitor-agent.service
 
   deployment-windows:

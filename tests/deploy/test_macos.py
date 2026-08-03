@@ -144,17 +144,27 @@ def _deployment_harness(
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
+    system_commands = {
+        name: shutil.which(name) or f"/usr/bin/{name}"
+        for name in ("chmod", "install", "mv", "rm")
+    }
     _write_executable(fake_bin / "id", "#!/bin/sh\nprintf '0\\n'\n")
     _write_executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")
-    _write_executable(fake_bin / "chmod", '#!/bin/sh\nexec /usr/bin/chmod "$@"\n')
-    _write_executable(fake_bin / "install", '#!/bin/sh\nexec /usr/bin/install "$@"\n')
+    _write_executable(
+        fake_bin / "chmod",
+        f'#!/bin/sh\nexec "{system_commands["chmod"]}" "$@"\n',
+    )
+    _write_executable(
+        fake_bin / "install",
+        f'#!/bin/sh\nexec "{system_commands["install"]}" "$@"\n',
+    )
     _write_executable(
         fake_bin / "mv",
         "#!/bin/sh\n"
         'if [ -n "${FAIL_MV_SOURCE:-}" ] && [ "$1" = "$FAIL_MV_SOURCE" ]; then\n'
         "  exit 1\n"
         "fi\n"
-        'exec /usr/bin/mv "$@"\n',
+        f'exec "{system_commands["mv"]}" "$@"\n',
     )
     _write_executable(
         fake_bin / "rm",
@@ -166,7 +176,7 @@ def _deployment_harness(
         '    "$TRANSACTION_PARENT"/.monitor-agent-transaction.*) exit 1 ;;\n'
         "  esac\n"
         "fi\n"
-        'exec /usr/bin/rm "$@"\n',
+        f'exec "{system_commands["rm"]}" "$@"\n',
     )
     _write_executable(
         fake_bin / "stat",

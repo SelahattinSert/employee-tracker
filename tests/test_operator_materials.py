@@ -3,6 +3,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not Path("docs").is_dir(),
+    reason="operator docs are maintained locally and excluded from the repository",
+)
+
 
 def _read(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
