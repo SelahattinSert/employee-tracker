@@ -430,7 +430,7 @@ case "$prior_loaded:$prior_running:$prior_disabled" in
         backup_run_at_load=$(read_backup_plist_boolean RunAtLoad)
         case "$backup_keep_alive:$backup_run_at_load" in
             true:*|*:true|invalid:*|*:invalid)
-                printf '%s\n' 'cannot safely restore loaded, enabled, inactive LaunchDaemon; aborting' >&2
+                printf '%s\n' 'cannot safely restore loaded, inactive LaunchDaemon; aborting' >&2
                 exit 1
                 ;;
         esac
