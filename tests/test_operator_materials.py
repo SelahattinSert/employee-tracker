@@ -539,6 +539,11 @@ def test_migration_rollback_preflight_is_fail_fast_and_never_uses_unsafe_stop() 
         ),
     )
     assert "cannot safely restore loaded, enabled, inactive LaunchDaemon" in macos
+    safety_preflight = macos[
+        : macos.index("sudo install -d -m 0700 /var/root/MonitorAgentV2Displaced")
+    ]
+    assert 'case "$prior_loaded:$prior_running:$prior_disabled" in' in safety_preflight
+    assert "true:false:*)" in safety_preflight
 
 
 def test_operations_matches_delivery_and_recovery_behavior() -> None:

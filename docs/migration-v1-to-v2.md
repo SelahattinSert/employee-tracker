@@ -424,16 +424,18 @@ wait_for_launchdaemon_stopped() {
     exit 1
 }
 
-if [ "$prior_loaded:$prior_running:$prior_disabled" = "true:false:false" ]; then
-    backup_keep_alive=$(read_backup_plist_boolean KeepAlive)
-    backup_run_at_load=$(read_backup_plist_boolean RunAtLoad)
-    case "$backup_keep_alive:$backup_run_at_load" in
-        true:*|*:true|invalid:*|*:invalid)
-            printf '%s\n' 'cannot safely restore loaded, enabled, inactive LaunchDaemon; aborting' >&2
-            exit 1
-            ;;
-    esac
-fi
+case "$prior_loaded:$prior_running:$prior_disabled" in
+    true:false:*)
+        backup_keep_alive=$(read_backup_plist_boolean KeepAlive)
+        backup_run_at_load=$(read_backup_plist_boolean RunAtLoad)
+        case "$backup_keep_alive:$backup_run_at_load" in
+            true:*|*:true|invalid:*|*:invalid)
+                printf '%s\n' 'cannot safely restore loaded, enabled, inactive LaunchDaemon; aborting' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+esac
 if sudo test -e /var/root/MonitorAgentV2Displaced; then
     printf '%s\n' 'v2 recovery path already exists; aborting' >&2
     exit 1
