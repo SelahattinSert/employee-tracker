@@ -82,43 +82,45 @@ def test_network_preserves_schema_formats_addresses_and_sorts(monkeypatch) -> No
     assert collector.name == "network"
     assert result.status is CollectorStatus.SUCCESS
     assert result.data == {
-        "adapters": [
-            {
-                "interface": "eth0",
-                "ipv4": "10.0.0.2",
-                "mac": "00:11:22:33:44:55",
-                "speed_mb": 1000,
-                "mtu": 1500,
-            }
-        ],
-        "connections": [
-            {
-                "fd": 3,
-                "family": "AF_INET",
-                "type": "SOCK_DGRAM",
-                "laddr": "127.0.0.1:53",
-                "raddr": None,
-                "status": "NONE",
-                "pid": None,
+        "network": {
+            "adapters": [
+                {
+                    "interface": "eth0",
+                    "ipv4": "10.0.0.2",
+                    "mac": "00:11:22:33:44:55",
+                    "speed_mb": 1000,
+                    "mtu": 1500,
+                }
+            ],
+            "connections": [
+                {
+                    "fd": 3,
+                    "family": "AF_INET",
+                    "type": "SOCK_DGRAM",
+                    "laddr": "127.0.0.1:53",
+                    "raddr": None,
+                    "status": "NONE",
+                    "pid": None,
+                },
+                {
+                    "fd": 7,
+                    "family": "AF_INET6",
+                    "type": "SOCK_STREAM",
+                    "laddr": "[::1]:443",
+                    "raddr": "[2001:db8::1]:54000",
+                    "status": "ESTABLISHED",
+                    "pid": 44,
+                },
+            ],
+            "io": {
+                "bytes_sent": 1,
+                "bytes_recv": 2,
+                "packets_sent": 3,
+                "packets_recv": 4,
+                "errin": 0,
+                "errout": 0,
             },
-            {
-                "fd": 7,
-                "family": "AF_INET6",
-                "type": "SOCK_STREAM",
-                "laddr": "[::1]:443",
-                "raddr": "[2001:db8::1]:54000",
-                "status": "ESTABLISHED",
-                "pid": 44,
-            },
-        ],
-        "io": {
-            "bytes_sent": 1,
-            "bytes_recv": 2,
-            "packets_sent": 3,
-            "packets_recv": 4,
-            "errin": 0,
-            "errout": 0,
-        },
+        }
     }
     json.dumps(result.data, allow_nan=False)
 
@@ -144,9 +146,9 @@ def test_connection_denial_preserves_adapter_and_io_with_sanitized_metadata(
     assert result.status is CollectorStatus.PARTIAL
     assert result.error_code == "network_connections_denied"
     assert result.error_message == "network connections unavailable"
-    assert result.data["adapters"]
-    assert result.data["connections"] == []
-    assert result.data["io"]["bytes_recv"] == 2
+    assert result.data["network"]["adapters"]
+    assert result.data["network"]["connections"] == []
+    assert result.data["network"]["io"]["bytes_recv"] == 2
     assert "secret" not in repr(result)
     assert "private" not in repr(result)
 
@@ -165,7 +167,7 @@ def test_disabled_network_performs_no_psutil_probes(
     result = NetworkCollector(enabled=False).collect()
 
     assert result.status is CollectorStatus.DISABLED
-    assert result.data == {"adapters": [], "connections": [], "io": {}}
+    assert result.data == {"network": {"adapters": [], "connections": [], "io": {}}}
 
 
 def test_adapter_and_connection_order_is_deterministic(monkeypatch) -> None:
@@ -218,13 +220,13 @@ def test_adapter_and_connection_order_is_deterministic(monkeypatch) -> None:
 
     result = NetworkCollector().collect()
 
-    assert [item["interface"] for item in result.data["adapters"]] == [
+    assert [item["interface"] for item in result.data["network"]["adapters"]] == [
         "Alpha",
         "zeta",
     ]
-    assert [item["fd"] for item in result.data["connections"]] == [1, 9]
-    assert result.data["connections"][0]["family"] == "2"
-    assert result.data["io"] == {}
+    assert [item["fd"] for item in result.data["network"]["connections"]] == [1, 9]
+    assert result.data["network"]["connections"][0]["family"] == "2"
+    assert result.data["network"]["io"] == {}
 
 
 def test_network_handles_missing_af_link_malformed_addresses_and_unsafe_values(
@@ -287,7 +289,7 @@ def test_network_handles_missing_af_link_malformed_addresses_and_unsafe_values(
     result = NetworkCollector().collect()
 
     assert result.status is CollectorStatus.SUCCESS
-    assert result.data["adapters"] == [
+    assert result.data["network"]["adapters"] == [
         {
             "interface": "eth0",
             "ipv4": None,
@@ -296,7 +298,7 @@ def test_network_handles_missing_af_link_malformed_addresses_and_unsafe_values(
             "mtu": None,
         }
     ]
-    assert result.data["connections"] == [
+    assert result.data["network"]["connections"] == [
         {
             "fd": None,
             "family": "AF_INET6",
@@ -307,7 +309,7 @@ def test_network_handles_missing_af_link_malformed_addresses_and_unsafe_values(
             "pid": None,
         }
     ]
-    assert result.data["io"] == {
+    assert result.data["network"]["io"] == {
         "bytes_sent": None,
         "bytes_recv": None,
         "packets_sent": 3,

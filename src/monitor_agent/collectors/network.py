@@ -177,7 +177,7 @@ class NetworkCollector:
     def collect(self) -> CollectorPayload:
         if not self._enabled:
             return CollectorPayload(
-                data={"adapters": [], "connections": [], "io": {}},
+                data={"network": {"adapters": [], "connections": [], "io": {}}},
                 status=CollectorStatus.DISABLED,
             )
 
@@ -197,10 +197,12 @@ class NetworkCollector:
             connections: list[JSONValue] = [record for record in connection_records]
         except (PermissionError, psutil.AccessDenied):
             return CollectorPayload(
-                data={"adapters": adapters, "connections": [], "io": io},
+                data={"network": {"adapters": adapters, "connections": [], "io": io}},
                 status=CollectorStatus.PARTIAL,
                 error_code="network_connections_denied",
                 error_message="network connections unavailable",
             )
 
-        return CollectorPayload(data={"adapters": adapters, "connections": connections, "io": io})
+        return CollectorPayload(
+            data={"network": {"adapters": adapters, "connections": connections, "io": io}}
+        )

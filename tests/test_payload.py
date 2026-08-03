@@ -5,6 +5,7 @@ from uuid import UUID
 
 import pytest
 
+from monitor_agent.collectors.network import NetworkCollector
 from monitor_agent.identity import MachineIdentity
 from monitor_agent.models import CollectionBatch, CollectorResult, CollectorStatus
 from monitor_agent.payload import build_payload
@@ -132,6 +133,45 @@ def test_payload_merges_only_known_sections_from_success_and_partial_mapping_dat
     assert payload["users"] == []
     assert payload["disks"] == []
     assert "unexpected" not in payload
+
+
+def test_payload_includes_network_collector_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected_network = {
+        "adapters": [{"interface": "eth0"}],
+        "connections": [],
+        "io": {"bytes_recv": 42},
+    }
+    monkeypatch.setattr(
+        "monitor_agent.collectors.network._collect_adapters",
+        lambda: expected_network["adapters"],
+    )
+    monkeypatch.setattr(
+        "monitor_agent.collectors.network._collect_io",
+        lambda: expected_network["io"],
+    )
+    monkeypatch.setattr(
+        "monitor_agent.collectors.network.psutil.net_connections",
+        lambda kind: [],
+    )
+
+    collector_payload = NetworkCollector().collect()
+    batch = CollectionBatch(
+        (
+            CollectorResult(
+                NetworkCollector.name,
+                collector_payload.status,
+                1,
+                collector_payload.data,
+                collector_payload.error_code,
+                collector_payload.error_message,
+            ),
+        ),
+        1,
+    )
+
+    payload = build_payload("heartbeat", MachineIdentity("machine", "source"), batch)
+
+    assert payload["network"] == expected_network
 
 
 def test_payload_keeps_defaults_and_inputs_independent_for_duplicate_and_unknown_collectors() -> (
