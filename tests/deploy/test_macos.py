@@ -145,8 +145,7 @@ def _deployment_harness(
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     system_commands = {
-        name: shutil.which(name) or f"/usr/bin/{name}"
-        for name in ("chmod", "install", "mv", "rm")
+        name: shutil.which(name) or f"/usr/bin/{name}" for name in ("chmod", "install", "mv", "rm")
     }
     _write_executable(fake_bin / "id", "#!/bin/sh\nprintf '0\\n'\n")
     _write_executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")

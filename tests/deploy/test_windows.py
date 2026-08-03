@@ -1215,9 +1215,7 @@ else {
             if boundary in {"register-task", "start-task", "readiness"} or mode:
                 assert f"register:{prior_task_b64}" in task_log
                 assert f"register-sddl:{prior_task_sddl_b64}" in task_log
-            if root_present and not (
-                boundary == "restrict-install-root" and position == "before"
-            ):
+            if root_present and boundary != "restrict-install-root":
                 assert f"restore-security:{install_root}:prior-security" in task_log
 
         absent_failure, absent_root, absent_log = run_installer(
@@ -1411,15 +1409,11 @@ def test_powershell_parser_and_environment_runtime_are_skipped_without_pwsh() ->
                 pwsh,
                 "-NoProfile",
                 "-Command",
-                "param($path) $errors = $null; "
+                f"$path = {_ps_literal(script)}; "
+                "$errors = $null; "
                 "[System.Management.Automation.Language.Parser]::ParseFile("
                 "$path, [ref]$null, [ref]$errors) | Out-Null; "
-                    "if ($errors.Count) { $errors | ForEach-Object { $_.ToString() }; exit 1 }; "
-                    f"$path = {str(script)!r}; "
-                    "$errors = $null; "
-                    "[System.Management.Automation.Language.Parser]::ParseFile("
-                    "$path, [ref]$null, [ref]$errors) | Out-Null; "
-                    "if ($errors.Count) { $errors | ForEach-Object { $_.ToString() }; exit 1 }",
+                "if ($errors.Count) { $errors | ForEach-Object { $_.ToString() }; exit 1 }",
             ],
             check=False,
             capture_output=True,

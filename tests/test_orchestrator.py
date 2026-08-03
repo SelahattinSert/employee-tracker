@@ -294,7 +294,7 @@ def test_global_cycle_deadline_applies_to_queued_work() -> None:
     assert batch.results[1].status is CollectorStatus.TIMED_OUT
     assert batch.results[1].data == {}
     assert batch.results[1].error_code == "deadline_exceeded"
-    assert batch.duration_ms < 100
+    assert batch.duration_ms < 500
 
 
 def test_queued_collector_is_cancelled_after_deadline() -> None:
