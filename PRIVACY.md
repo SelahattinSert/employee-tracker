@@ -7,8 +7,8 @@ Monitor Agent collects operational telemetry for endpoint health and delivery di
 | Payload section | Fields | Purpose | Default state | Control |
 | --- | --- | --- | --- | --- |
 | `schema_version`, `event`, `timestamp`, `event_id` | Schema version, event name, UTC timestamp, UUID | Identify and order an event | Always included | Event name is restricted by the CLI |
-| `machine_id` | Namespaced SHA-256-derived UUID from an available platform identifier, or a persisted random UUID fallback | Correlate an endpoint without exposing a raw platform identifier | Always included | No raw `/etc/machine-id`, Windows MachineGuid, or macOS IOPlatformUUID is transmitted; the fallback is stored owner-only |
-| `system` | Hostname, hashed machine ID, OS/release/version, architecture, processor, Python version, boot time, uptime | Describe the host runtime | Always included | Fixed collector |
+| `machine_id` | Stable private identifier derived from an available platform identifier or a persisted fallback UUID | Correlate an endpoint without exposing a raw platform identifier | Always included | No raw `/etc/machine-id`, Windows MachineGuid, or macOS IOPlatformUUID is transmitted; the fallback is stored owner-only |
+| `system` | Hostname, stable private identifier derived from an available platform identifier or a persisted fallback UUID, OS/release/version, architecture, processor, Python version, boot time, uptime | Describe the host runtime | Always included | Fixed collector |
 | `users` | Name, terminal, remote host, start time, PID | Describe active sessions | Always included when available | Fixed collector |
 | `cpu` | Physical/logical cores, total/per-core usage, frequency, load average | Diagnose resource pressure | Always included when available | Fixed collector |
 | `memory` | RAM/swap totals, available/used values, percentages | Diagnose memory pressure | Always included when available | Fixed collector |

@@ -41,6 +41,7 @@ On Linux:
 
 ```bash
 dead_letter=/var/lib/monitor-agent/spool/dead-letter
+sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -printf '%f %s %u %g\n' | wc -l
 sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -printf '%f %s %u %g\n'
 sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -exec sha256sum -- {} +
 ```
@@ -49,6 +50,7 @@ On macOS:
 
 ```bash
 dead_letter="/Library/Application Support/MonitorAgent/spool/dead-letter"
+sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -exec stat -f '%N %z %Su %Sg' {} \; | wc -l
 sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -exec stat -f '%N %z %Su %Sg' {} \;
 sudo find "$dead_letter" -maxdepth 1 -type f -name '*.json' -exec shasum -a 256 {} +
 ```
@@ -58,6 +60,7 @@ On Windows, from elevated PowerShell:
 ```powershell
 $deadLetter = "C:\ProgramData\MonitorAgent\spool\dead-letter"
 $records = Get-ChildItem -LiteralPath $deadLetter -File -Filter *.json
+$records.Count
 $records | Select-Object Name, Length, CreationTimeUtc
 $records | ForEach-Object { Get-Acl -LiteralPath $_.FullName | Select-Object Path, Owner }
 $records | ForEach-Object { Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256 }

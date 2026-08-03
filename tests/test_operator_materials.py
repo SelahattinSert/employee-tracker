@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -10,6 +11,22 @@ def _read(path: str) -> str:
 def _ordered(text: str, headings: tuple[str, ...]) -> None:
     positions = [text.index(heading) for heading in headings]
     assert positions == sorted(positions)
+
+
+def _table_rows(text: str, heading: str) -> list[list[str]]:
+    section = text[text.index(heading) :]
+    rows: list[list[str]] = []
+    table_started = False
+    for line in section.splitlines()[1:]:
+        if not line.startswith("|"):
+            if table_started:
+                break
+            continue
+        if set(line.replace("|", "")) <= {"-", " "}:
+            continue
+        table_started = True
+        rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+    return rows[1:]
 
 
 def test_readme_defines_the_operator_contract_in_order() -> None:
@@ -96,6 +113,41 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
     assert "`3` | All collectors fail or time out during `once --no-transmit`" in text
     assert "`4` | A transmitting `once` event is not delivered" in text
 
+    expected_configuration = {
+        "`MONITOR_COLLECTOR_URI`": ("Required for transport", "Valid HTTPS URI", "Operational"),
+        "`MONITOR_API_TOKEN`": ("Required for transport", "Non-empty string", "Secret"),
+        "`MONITOR_CA_BUNDLE`": ("System trust store", "Existing regular-file", "Operational"),
+        "`MONITOR_HEARTBEAT_SEC`": ("`300`", "`30..86400`", "No"),
+        "`MONITOR_STARTUP_DELAY_SEC`": ("`30`", "`0..3600`", "No"),
+        "`MONITOR_CONNECT_TIMEOUT_SEC`": ("`5.0`", "`0.1..300.0`", "No"),
+        "`MONITOR_READ_TIMEOUT_SEC`": ("`15.0`", "`0.1..300.0`", "No"),
+        "`MONITOR_COLLECTION_TIMEOUT_SEC`": ("`30.0`", "`1.0..3600.0`", "No"),
+        "`MONITOR_MAX_COLLECTOR_WORKERS`": ("`4`", "`1..32`", "No"),
+        "`MONITOR_SPOOL_PATH`": ("Platform-specific", "Writable directory", "Sensitive telemetry"),
+        "`MONITOR_SPOOL_MAX_BYTES`": ("`104857600`", "`1048576..10737418240`", "No"),
+        "`MONITOR_SPOOL_MAX_AGE_SEC`": ("`604800`", "`3600..31536000`", "No"),
+        "`MONITOR_REPLAY_BATCH_SIZE`": ("`20`", "`1..1000`", "No"),
+        "`MONITOR_PROCESS_CMDLINE_MODE`": (
+            "`redacted`",
+            "`none`, `redacted`, `full`",
+            "Privacy control",
+        ),
+        "`MONITOR_INCLUDE_NETWORK_CONNECTIONS`": ("`true`", "`true`/`false`", "Privacy control"),
+        "`MONITOR_INCLUDE_SOFTWARE`": ("`true`", "`true`/`false`", "Privacy control"),
+        "`MONITOR_LOG_PATH`": ("Platform-specific", "Writable file path", "Operational"),
+        "`MONITOR_LOG_FORMAT`": ("`text`", "`text`, `json`", "No"),
+        "`MONITOR_LOG_LEVEL`": ("`INFO`", "Standard Python logging level", "No"),
+    }
+    rows = _table_rows(text, "## Required configuration")
+    by_variable = {row[0]: row for row in rows}
+    assert set(by_variable) == set(expected_configuration)
+    for variable, expected_cells in expected_configuration.items():
+        row = by_variable[variable]
+        assert len(row) == 4
+        assert all(row)
+        for cell, expected in zip(row[1:], expected_cells, strict=True):
+            assert expected in cell
+
 
 def test_release_security_and_privacy_materials_cover_required_controls() -> None:
     changelog = _read("CHANGELOG.md")
@@ -158,8 +210,32 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
         "never transmitted",
         "all network adapter, connection, and I/O telemetry",
         "per-record `source`",
+        (
+            "stable private identifier derived from an available platform identifier "
+            "or a persisted fallback UUID"
+        ),
     ):
         assert value in privacy
+    expected_payload_sections = {
+        "`schema_version`, `event`, `timestamp`, `event_id`",
+        "`machine_id`",
+        "`system`",
+        "`users`",
+        "`cpu`",
+        "`memory`",
+        "`disks`",
+        "`network`",
+        "`processes`",
+        "`software`",
+        "`agent`",
+    }
+    rows = _table_rows(privacy, "## Payload inventory")
+    by_section = {row[0]: row for row in rows}
+    assert set(by_section) == expected_payload_sections
+    for row in rows:
+        assert len(row) == 5
+        assert all(row)
+    assert "hashed machine ID" not in privacy
 
 
 def test_migration_preserves_recovery_material_and_v2_spool() -> None:
@@ -204,8 +280,30 @@ def test_migration_preserves_recovery_material_and_v2_spool() -> None:
         "approved secret manager has injected",
         "MONITOR_SPOOL_PATH",
         "abort if it already exists",
+        "service-state.env",
+        "enabled=true",
+        "active=true",
+        "state_code=",
+        "running=",
+        "launchctl print-disabled system",
+        "loaded=",
+        "disabled=",
+        'case "$prior_enabled" in',
+        'case "$prior_active" in',
+        "Enable-ScheduledTask -TaskName MonitorAgent",
+        "Disable-ScheduledTask -TaskName MonitorAgent",
+        'if ($priorState.running -eq "true")',
+        'case "$prior_disabled" in',
+        "launchctl disable system/com.company.monitor-agent",
+        "launchctl enable system/com.company.monitor-agent",
+        "launchctl kickstart -k system/com.company.monitor-agent",
     ):
         assert value in text
+    assert not re.search(
+        r"(?im)^.*(?:rm|Remove-Item).*(?:MonitorAgent/spool|MonitorAgent\\spool).*$", text
+    )
+    assert 'rm -rf "/Library/Application Support/MonitorAgent"' not in text
+    assert "Remove-Item -Recurse -Force C:\\ProgramData\\MonitorAgent" not in text
 
 
 def test_operations_matches_delivery_and_recovery_behavior() -> None:
@@ -251,5 +349,8 @@ def test_operations_matches_delivery_and_recovery_behavior() -> None:
         "shasum -a 256",
         "Get-FileHash",
         "Never use `cat`, `type`, `Get-Content`",
+        "-printf '%f %s %u %g\\n' | wc -l",
+        "-exec stat -f '%N %z %Su %Sg' {} \\; | wc -l",
+        "$records.Count",
     ):
         assert value.casefold() in normalized
