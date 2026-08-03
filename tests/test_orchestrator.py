@@ -285,9 +285,9 @@ def test_each_completed_collector_has_its_own_monotonic_duration() -> None:
 
 def test_global_cycle_deadline_applies_to_queued_work() -> None:
     batch = collect_all(
-        [SleepingCollector("first", 0.04), SleepingCollector("second", 0.04)],
+        [SleepingCollector("first", 0.2), SleepingCollector("second", 0.2)],
         max_workers=1,
-        timeout_sec=0.06,
+        timeout_sec=0.35,
     )
 
     assert batch.results[0].status is CollectorStatus.SUCCESS
