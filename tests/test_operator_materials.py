@@ -410,10 +410,10 @@ def test_migration_rollback_validates_recovery_before_v2_mutation_and_restores_s
             "$statePath =",
             "saved task state is invalid",
             "$requiredBackupPaths = @(",
-            "foreach ($path in $requiredBackupPaths)",
+            "foreach ($requiredPath in $requiredBackupPaths)",
+            "$currentTask = Get-ScheduledTask",
             "if (Test-Path -LiteralPath $displaced)",
             "New-Item -ItemType Directory -Path $displaced",
-            "$currentTask = Get-ScheduledTask",
             "Stop-ScheduledTask -TaskName MonitorAgent",
             "Unregister-ScheduledTask -TaskName MonitorAgent",
         ),
@@ -460,6 +460,85 @@ def test_migration_rollback_validates_recovery_before_v2_mutation_and_restores_s
     assert "true:true|true:false|false:false" in macos
     assert 'case "$prior_loaded" in' in macos
     assert 'case "$prior_disabled" in' in macos
+
+
+def test_migration_rollback_preflight_is_fail_fast_and_never_uses_unsafe_stop() -> None:
+    text = _read("docs/migration-v1-to-v2.md")
+    linux = _fenced_block(text, "### Linux rollback", "bash")
+    assert linux.lstrip().startswith("set -eu")
+    _ordered_commands(
+        linux,
+        (
+            'sudo test -d "$backup/opt/monitor-agent"',
+            'sudo test -f "$backup/etc/monitor-agent/monitor-agent.env"',
+            'sudo test -f "$backup/etc/systemd/system/monitor-agent.service"',
+            "sudo test -d /opt/monitor-agent",
+            "sudo test -f /etc/monitor-agent/monitor-agent.env",
+            "sudo test -f /etc/systemd/system/monitor-agent.service",
+            "sudo install -d -m 0700 /root/monitor-agent-v2-displaced",
+            "sudo systemctl stop monitor-agent.service",
+        ),
+    )
+
+    windows = _fenced_block(text, "### Windows rollback", "powershell")
+    assert windows.lstrip().startswith('$ErrorActionPreference = "Stop"')
+    for path, path_type in (
+        ("$backup\\monitor_agent_task.xml", "Leaf"),
+        ("$backup\\runtime\\venv", "Container"),
+        ("$backup\\runtime\\run-agent.ps1", "Leaf"),
+        ("$backup\\runtime\\monitor_agent_task.xml", "Leaf"),
+        ("$backup\\configuration\\monitor-agent.env", "Leaf"),
+        ("C:\\ProgramData\\MonitorAgent\\venv", "Container"),
+        ("C:\\ProgramData\\MonitorAgent\\run-agent.ps1", "Leaf"),
+        ("C:\\ProgramData\\MonitorAgent\\monitor_agent_task.xml", "Leaf"),
+        ("C:\\ProgramData\\MonitorAgent\\monitor-agent.env", "Leaf"),
+    ):
+        assert f'Path = "{path}"; Type = "{path_type}"' in windows
+    _ordered_commands(
+        windows,
+        (
+            "foreach ($requiredPath in $requiredBackupPaths)",
+            "foreach ($requiredPath in $requiredV2Paths)",
+            "$currentTask = Get-ScheduledTask -TaskName MonitorAgent -ErrorAction Stop",
+            "New-Item -ItemType Directory -Path $displaced",
+            "Stop-ScheduledTask -TaskName MonitorAgent",
+            "Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false",
+        ),
+    )
+    assert "Test-Path -LiteralPath $requiredPath.Path -PathType $requiredPath.Type" in windows
+
+    macos = _fenced_block(text, "### macOS rollback", "bash")
+    assert macos.lstrip().startswith("set -eu")
+    _ordered_commands(
+        macos,
+        (
+            'sudo test -d "$backup/runtime/venv"',
+            'sudo test -f "$backup/runtime/run-agent.sh"',
+            'sudo test -f "$backup/configuration/monitor-agent.env"',
+            'sudo test -f "$backup/LaunchDaemons/com.company.monitor-agent.plist"',
+            'sudo test -d "/Library/Application Support/MonitorAgent/venv"',
+            'sudo test -f "/Library/Application Support/MonitorAgent/run-agent.sh"',
+            'sudo test -f "/Library/Application Support/MonitorAgent/monitor-agent.env"',
+            "sudo test -f /Library/LaunchDaemons/com.company.monitor-agent.plist",
+            "sudo launchctl print system/com.company.monitor-agent",
+            "sudo launchctl bootout system/com.company.monitor-agent",
+        ),
+    )
+    assert "launchctl stop" not in macos
+    macos_idle_branch = macos[macos.index("\n    true:false)\n") :]
+    _ordered_commands(
+        macos_idle_branch,
+        (
+            "true:false)",
+            "sudo launchctl bootstrap system "
+            "/Library/LaunchDaemons/com.company.monitor-agent.plist",
+            'if [ "$prior_disabled" = true ]; then',
+            "sudo launchctl disable system/com.company.monitor-agent",
+            "wait_for_launchdaemon_stopped",
+            'case "$prior_disabled" in',
+        ),
+    )
+    assert "cannot safely restore loaded, enabled, inactive LaunchDaemon" in macos
 
 
 def test_operations_matches_delivery_and_recovery_behavior() -> None:

@@ -38,6 +38,8 @@ sudo cp -a /etc/systemd/system/monitor-agent.service /root/monitor-agent-v1-back
 On Windows, use an elevated PowerShell session to create an ACL-restricted external backup, export the task XML, preserve only the prior runtime, launcher, task XML, and protected environment file, and record its task state. This backup explicitly excludes the v2 spool and logs:
 
 ```powershell
+$ErrorActionPreference = "Stop"
+
 $backup = "C:\SecureBackups\MonitorAgentV1"
 if (Test-Path -LiteralPath $backup) { throw "backup path already exists; aborting" }
 New-Item -ItemType Directory -Path $backup | Out-Null
@@ -207,6 +209,8 @@ Rollback restores the previous executable/runtime path, protected environment, a
 Stop the v2 service, restore the saved runtime, environment, and unit file, then reload and restore the recorded enabled/running state:
 
 ```bash
+set -eu
+
 backup=/root/monitor-agent-v1-backup
 state_file="$backup/service-state.env"
 sudo test -f "$state_file" || { printf '%s\n' 'missing saved service state; aborting' >&2; exit 1; }
@@ -226,6 +230,9 @@ esac
 sudo test -d "$backup/opt/monitor-agent" || { printf '%s\n' 'missing saved runtime; aborting' >&2; exit 1; }
 sudo test -f "$backup/etc/monitor-agent/monitor-agent.env" || { printf '%s\n' 'missing saved environment; aborting' >&2; exit 1; }
 sudo test -f "$backup/etc/systemd/system/monitor-agent.service" || { printf '%s\n' 'missing saved unit; aborting' >&2; exit 1; }
+sudo test -d /opt/monitor-agent || { printf '%s\n' 'missing v2 runtime; aborting' >&2; exit 1; }
+sudo test -f /etc/monitor-agent/monitor-agent.env || { printf '%s\n' 'missing v2 environment; aborting' >&2; exit 1; }
+sudo test -f /etc/systemd/system/monitor-agent.service || { printf '%s\n' 'missing v2 unit; aborting' >&2; exit 1; }
 if sudo test -e /root/monitor-agent-v2-displaced; then
     printf '%s\n' 'v2 recovery path already exists; aborting' >&2
     exit 1
@@ -258,6 +265,8 @@ does not infer service state from the new v2 installation.
 From elevated PowerShell, stop and unregister the v2 task, restore the prior runtime and protected environment from the external backup, then restore the saved task definition and its prior state:
 
 ```powershell
+$ErrorActionPreference = "Stop"
+
 $backup = "C:\SecureBackups\MonitorAgentV1"
 $statePath = "$backup\task-state.env"
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
@@ -274,25 +283,39 @@ if ($stateLines.Count -ne 3 -or
     throw "saved task state is invalid"
 }
 $requiredBackupPaths = @(
-    "$backup\monitor_agent_task.xml",
-    "$backup\runtime\venv",
-    "$backup\runtime\run-agent.ps1",
-    "$backup\runtime\monitor_agent_task.xml",
-    "$backup\configuration\monitor-agent.env"
+    [pscustomobject]@{ Path = "$backup\monitor_agent_task.xml"; Type = "Leaf" },
+    [pscustomobject]@{ Path = "$backup\runtime\venv"; Type = "Container" },
+    [pscustomobject]@{ Path = "$backup\runtime\run-agent.ps1"; Type = "Leaf" },
+    [pscustomobject]@{ Path = "$backup\runtime\monitor_agent_task.xml"; Type = "Leaf" },
+    [pscustomobject]@{ Path = "$backup\configuration\monitor-agent.env"; Type = "Leaf" }
 )
-foreach ($path in $requiredBackupPaths) {
-    if (-not (Test-Path -LiteralPath $path)) { throw "saved task recovery material is missing" }
+foreach ($requiredPath in $requiredBackupPaths) {
+    if (-not (Test-Path -LiteralPath $requiredPath.Path -PathType $requiredPath.Type)) {
+        throw "saved task recovery material is missing or has the wrong type"
+    }
+}
+$requiredV2Paths = @(
+    [pscustomobject]@{ Path = "C:\ProgramData\MonitorAgent\venv"; Type = "Container" },
+    [pscustomobject]@{ Path = "C:\ProgramData\MonitorAgent\run-agent.ps1"; Type = "Leaf" },
+    [pscustomobject]@{ Path = "C:\ProgramData\MonitorAgent\monitor_agent_task.xml"; Type = "Leaf" },
+    [pscustomobject]@{ Path = "C:\ProgramData\MonitorAgent\monitor-agent.env"; Type = "Leaf" }
+)
+foreach ($requiredPath in $requiredV2Paths) {
+    if (-not (Test-Path -LiteralPath $requiredPath.Path -PathType $requiredPath.Type)) {
+        throw "current v2 recovery material is missing or has the wrong type"
+    }
+}
+$currentTask = Get-ScheduledTask -TaskName MonitorAgent -ErrorAction Stop
+if ($currentTask.TaskName -ne "MonitorAgent") {
+    throw "current v2 task identity is invalid"
 }
 $displaced = "C:\SecureBackups\MonitorAgentV2Displaced"
 if (Test-Path -LiteralPath $displaced) { throw "v2 recovery path already exists; aborting" }
 New-Item -ItemType Directory -Path $displaced | Out-Null
 icacls "$displaced" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
 if ($LASTEXITCODE -ne 0) { throw "v2 recovery ACL configuration failed" }
-$currentTask = Get-ScheduledTask -TaskName MonitorAgent -ErrorAction SilentlyContinue
-if ($null -ne $currentTask) {
-    if ([int]$currentTask.State -eq 4) { Stop-ScheduledTask -TaskName MonitorAgent }
-    Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false
-}
+if ([int]$currentTask.State -eq 4) { Stop-ScheduledTask -TaskName MonitorAgent }
+Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\venv -Destination "$displaced\venv"
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\run-agent.ps1 -Destination "$displaced\run-agent.ps1"
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\monitor_agent_task.xml -Destination "$displaced\monitor_agent_task.xml"
@@ -328,6 +351,8 @@ spool is never moved or deleted.
 Unload the v2 LaunchDaemon, restore the backed-up runtime, environment, and plist, then load the prior definition and restore its recorded running state:
 
 ```bash
+set -eu
+
 backup=/var/root/MonitorAgentV1Backup
 state_file="$backup/launchd-state.env"
 sudo test -f "$state_file" || { printf '%s\n' 'missing saved LaunchDaemon state; aborting' >&2; exit 1; }
@@ -354,6 +379,61 @@ sudo test -d "$backup/runtime/venv" || { printf '%s\n' 'missing saved runtime; a
 sudo test -f "$backup/runtime/run-agent.sh" || { printf '%s\n' 'missing saved launcher; aborting' >&2; exit 1; }
 sudo test -f "$backup/configuration/monitor-agent.env" || { printf '%s\n' 'missing saved environment; aborting' >&2; exit 1; }
 sudo test -f "$backup/LaunchDaemons/com.company.monitor-agent.plist" || { printf '%s\n' 'missing saved plist; aborting' >&2; exit 1; }
+sudo test -d "/Library/Application Support/MonitorAgent/venv" || { printf '%s\n' 'missing v2 runtime; aborting' >&2; exit 1; }
+sudo test -f "/Library/Application Support/MonitorAgent/run-agent.sh" || { printf '%s\n' 'missing v2 launcher; aborting' >&2; exit 1; }
+sudo test -f "/Library/Application Support/MonitorAgent/monitor-agent.env" || { printf '%s\n' 'missing v2 environment; aborting' >&2; exit 1; }
+sudo test -f /Library/LaunchDaemons/com.company.monitor-agent.plist || { printf '%s\n' 'missing v2 plist; aborting' >&2; exit 1; }
+current_launchd_output=$(sudo launchctl print system/com.company.monitor-agent 2>&1) || {
+    printf '%s\n' 'unable to validate current v2 LaunchDaemon; aborting' >&2
+    exit 1
+}
+case "$current_launchd_output" in
+    *"state = "*) ;;
+    *) printf '%s\n' 'invalid current v2 LaunchDaemon state; aborting' >&2; exit 1 ;;
+esac
+
+read_backup_plist_boolean() {
+    plist_key=$1
+    if plist_value=$(sudo /usr/libexec/PlistBuddy -c "Print :$plist_key" \
+        "$backup/LaunchDaemons/com.company.monitor-agent.plist" 2>/dev/null); then
+        case "$plist_value" in
+            true|false) printf '%s\n' "$plist_value" ;;
+            *) printf '%s\n' invalid ;;
+        esac
+    else
+        printf '%s\n' false
+    fi
+}
+
+wait_for_launchdaemon_stopped() {
+    attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        restored_launchd_output=$(sudo launchctl print system/com.company.monitor-agent 2>&1) || {
+            printf '%s\n' 'restored LaunchDaemon unloaded unexpectedly; manual recovery required' >&2
+            exit 1
+        }
+        case "$restored_launchd_output" in
+            *"state = running"*)
+                sleep 1
+                attempts=$((attempts + 1))
+                ;;
+            *) return 0 ;;
+        esac
+    done
+    printf '%s\n' 'restored LaunchDaemon did not stop; manual recovery required' >&2
+    exit 1
+}
+
+if [ "$prior_loaded:$prior_running:$prior_disabled" = "true:false:false" ]; then
+    backup_keep_alive=$(read_backup_plist_boolean KeepAlive)
+    backup_run_at_load=$(read_backup_plist_boolean RunAtLoad)
+    case "$backup_keep_alive:$backup_run_at_load" in
+        true:*|*:true|invalid:*|*:invalid)
+            printf '%s\n' 'cannot safely restore loaded, enabled, inactive LaunchDaemon; aborting' >&2
+            exit 1
+            ;;
+    esac
+fi
 if sudo test -e /var/root/MonitorAgentV2Displaced; then
     printf '%s\n' 'v2 recovery path already exists; aborting' >&2
     exit 1
@@ -381,7 +461,10 @@ case "$prior_loaded:$prior_running" in
         ;;
     true:false)
         sudo launchctl bootstrap system /Library/LaunchDaemons/com.company.monitor-agent.plist
-        sudo launchctl stop com.company.monitor-agent
+        if [ "$prior_disabled" = true ]; then
+            sudo launchctl disable system/com.company.monitor-agent
+        fi
+        wait_for_launchdaemon_stopped
         ;;
     false:false) ;;
 esac
