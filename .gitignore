@@ -1,4 +1,6 @@
 .worktrees/
+CODEX.md
+docs/
 .coverage
 .mypy_cache/
 .pytest_cache/
