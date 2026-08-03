@@ -29,6 +29,19 @@ def _table_rows(text: str, heading: str) -> list[list[str]]:
     return rows[1:]
 
 
+def _fenced_block(text: str, heading: str, language: str) -> str:
+    start = text.index(heading)
+    fence = f"```{language}"
+    block_start = text.index(fence, start) + len(fence)
+    block_end = text.index("```", block_start)
+    return text[block_start:block_end]
+
+
+def _ordered_commands(block: str, commands: tuple[str, ...]) -> None:
+    positions = [block.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
 def test_readme_defines_the_operator_contract_in_order() -> None:
     text = _read("README.md")
     _ordered(
@@ -216,25 +229,90 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
         ),
     ):
         assert value in privacy
-    expected_payload_sections = {
-        "`schema_version`, `event`, `timestamp`, `event_id`",
-        "`machine_id`",
-        "`system`",
-        "`users`",
-        "`cpu`",
-        "`memory`",
-        "`disks`",
-        "`network`",
-        "`processes`",
-        "`software`",
-        "`agent`",
+    expected_payload_rows = {
+        "`schema_version`, `event`, `timestamp`, `event_id`": (
+            "Schema version, event name, UTC timestamp, UUID",
+            "Identify and order an event",
+            "Always included",
+            "Event name is restricted by the CLI",
+        ),
+        "`machine_id`": (
+            "Stable private identifier derived from an available platform identifier "
+            "or a persisted fallback UUID",
+            "Correlate an endpoint without exposing a raw platform identifier",
+            "Always included",
+            "No raw `/etc/machine-id`, Windows MachineGuid, or macOS IOPlatformUUID "
+            "is transmitted; the fallback is stored owner-only",
+        ),
+        "`system`": (
+            "Hostname, stable private identifier derived from an available platform "
+            "identifier or a persisted fallback UUID, OS/release/version, architecture, "
+            "processor, Python version, boot time, uptime",
+            "Describe the host runtime",
+            "Always included",
+            "Fixed collector",
+        ),
+        "`users`": (
+            "Name, terminal, remote host, start time, PID",
+            "Describe active sessions",
+            "Always included when available",
+            "Fixed collector",
+        ),
+        "`cpu`": (
+            "Physical/logical cores, total/per-core usage, frequency, load average",
+            "Diagnose resource pressure",
+            "Always included when available",
+            "Fixed collector",
+        ),
+        "`memory`": (
+            "RAM/swap totals, available/used values, percentages",
+            "Diagnose memory pressure",
+            "Always included when available",
+            "Fixed collector",
+        ),
+        "`disks`": (
+            "Device, mount point, filesystem, total/used/free capacity, percentage",
+            "Diagnose storage pressure",
+            "Always included when available",
+            "Fixed collector",
+        ),
+        "`network`": (
+            "Active adapter/interface data, IPv4, MAC, speed, MTU, connection "
+            "endpoints/status/PID/fd, aggregate I/O counters",
+            "Diagnose connectivity and interface health",
+            "Enabled",
+            "`MONITOR_INCLUDE_NETWORK_CONNECTIONS` controls all network adapter, "
+            "connection, and I/O telemetry",
+        ),
+        "`processes`": (
+            "PID, name, user, status, CPU, RSS, executable, command line, start time; "
+            "maximum 100 records",
+            "Diagnose process health",
+            "Enabled",
+            "`MONITOR_PROCESS_CMDLINE_MODE` controls command-line treatment",
+        ),
+        "`software`": (
+            "Platform package/application name and version, per-record `source`",
+            "Inventory installed software",
+            "Enabled",
+            "`MONITOR_INCLUDE_SOFTWARE`; collector status remains in `agent`",
+        ),
+        "`agent`": (
+            "Package/Python/platform/collection-duration/identity-source metadata; "
+            "collector status, duration, sanitized error code and message",
+            "Explain collection quality and agent state",
+            "Always included",
+            "Sanitized collector metadata only",
+        ),
     }
     rows = _table_rows(privacy, "## Payload inventory")
     by_section = {row[0]: row for row in rows}
-    assert set(by_section) == expected_payload_sections
-    for row in rows:
+    assert set(by_section) == set(expected_payload_rows)
+    for section, expected_cells in expected_payload_rows.items():
+        row = by_section[section]
         assert len(row) == 5
         assert all(row)
+        assert tuple(row[1:]) == expected_cells
     assert "hashed machine ID" not in privacy
 
 
@@ -304,6 +382,84 @@ def test_migration_preserves_recovery_material_and_v2_spool() -> None:
     )
     assert 'rm -rf "/Library/Application Support/MonitorAgent"' not in text
     assert "Remove-Item -Recurse -Force C:\\ProgramData\\MonitorAgent" not in text
+
+
+def test_migration_rollback_validates_recovery_before_v2_mutation_and_restores_states() -> None:
+    text = _read("docs/migration-v1-to-v2.md")
+    linux = _fenced_block(text, "### Linux rollback", "bash")
+    _ordered_commands(
+        linux,
+        (
+            "service-state.env",
+            "invalid saved service state; aborting",
+            '"$backup/opt/monitor-agent"',
+            '"$backup/etc/monitor-agent/monitor-agent.env"',
+            '"$backup/etc/systemd/system/monitor-agent.service"',
+            "if sudo test -e /root/monitor-agent-v2-displaced; then",
+            "sudo systemctl stop monitor-agent.service",
+        ),
+    )
+    assert "state_lines=$(sudo awk 'END { print NR }' \"$state_file\")" in linux
+    assert 'case "$prior_enabled:$prior_active" in' in linux
+    assert "true:true|true:false|false:true|false:false" in linux
+
+    windows = _fenced_block(text, "### Windows rollback", "powershell")
+    _ordered_commands(
+        windows,
+        (
+            "$statePath =",
+            "saved task state is invalid",
+            "$requiredBackupPaths = @(",
+            "foreach ($path in $requiredBackupPaths)",
+            "if (Test-Path -LiteralPath $displaced)",
+            "New-Item -ItemType Directory -Path $displaced",
+            "$currentTask = Get-ScheduledTask",
+            "Stop-ScheduledTask -TaskName MonitorAgent",
+            "Unregister-ScheduledTask -TaskName MonitorAgent",
+        ),
+    )
+    _ordered_commands(
+        windows,
+        (
+            "Register-ScheduledTask -TaskName MonitorAgent",
+            'if ($priorState.running -eq "true")',
+            'if ($priorState.enabled -eq "false") { Enable-ScheduledTask -TaskName MonitorAgent }',
+            "Start-ScheduledTask -TaskName MonitorAgent",
+            'if ($priorState.enabled -eq "true")',
+            "Disable-ScheduledTask -TaskName MonitorAgent",
+        ),
+    )
+    assert "state_code -notmatch '^[0-9]+$'" in windows
+    assert "[bool]::Parse($priorState.running)" in windows
+    assert '"enabled,running,state_code"' in windows
+
+    macos = _fenced_block(text, "### macOS rollback", "bash")
+    _ordered_commands(
+        macos,
+        (
+            "launchd-state.env",
+            "invalid saved LaunchDaemon state; aborting",
+            '"$backup/runtime/venv"',
+            '"$backup/configuration/monitor-agent.env"',
+            '"$backup/LaunchDaemons/com.company.monitor-agent.plist"',
+            "if sudo test -e /var/root/MonitorAgentV2Displaced; then",
+            "sudo launchctl bootout system/com.company.monitor-agent",
+        ),
+    )
+    _ordered_commands(
+        macos,
+        (
+            "true) sudo launchctl enable system/com.company.monitor-agent",
+            "sudo launchctl bootstrap system "
+            "/Library/LaunchDaemons/com.company.monitor-agent.plist",
+            "sudo launchctl kickstart -k system/com.company.monitor-agent",
+            "true) sudo launchctl disable system/com.company.monitor-agent",
+        ),
+    )
+    assert 'case "$prior_loaded:$prior_running" in' in macos
+    assert "true:true|true:false|false:false" in macos
+    assert 'case "$prior_loaded" in' in macos
+    assert 'case "$prior_disabled" in' in macos
 
 
 def test_operations_matches_delivery_and_recovery_behavior() -> None:

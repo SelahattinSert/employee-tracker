@@ -207,26 +207,38 @@ Rollback restores the previous executable/runtime path, protected environment, a
 Stop the v2 service, restore the saved runtime, environment, and unit file, then reload and restore the recorded enabled/running state:
 
 ```bash
-sudo systemctl stop monitor-agent.service
-prior_enabled=$(sudo sed -n -E 's/^enabled=(true|false)$/\1/p' /root/monitor-agent-v1-backup/service-state.env)
-prior_active=$(sudo sed -n -E 's/^active=(true|false)$/\1/p' /root/monitor-agent-v1-backup/service-state.env)
-case "$prior_enabled" in
-    true|false) ;;
-    *) printf '%s\n' 'invalid saved enabled state; aborting' >&2; exit 1 ;;
+backup=/root/monitor-agent-v1-backup
+state_file="$backup/service-state.env"
+sudo test -f "$state_file" || { printf '%s\n' 'missing saved service state; aborting' >&2; exit 1; }
+state_lines=$(sudo awk 'END { print NR }' "$state_file")
+if [ "$state_lines" -ne 2 ] || \
+    [ "$(sudo grep -Ec '^enabled=(true|false)$' "$state_file")" -ne 1 ] || \
+    [ "$(sudo grep -Ec '^active=(true|false)$' "$state_file")" -ne 1 ]; then
+    printf '%s\n' 'invalid saved service state; aborting' >&2
+    exit 1
+fi
+prior_enabled=$(sudo sed -n -E 's/^enabled=(true|false)$/\1/p' "$state_file")
+prior_active=$(sudo sed -n -E 's/^active=(true|false)$/\1/p' "$state_file")
+case "$prior_enabled:$prior_active" in
+    true:true|true:false|false:true|false:false) ;;
+    *) printf '%s\n' 'invalid saved service state; aborting' >&2; exit 1 ;;
 esac
-case "$prior_active" in
-    true|false) ;;
-    *) printf '%s\n' 'invalid saved running state; aborting' >&2; exit 1 ;;
-esac
-sudo test ! -e /root/monitor-agent-v2-displaced
+sudo test -d "$backup/opt/monitor-agent" || { printf '%s\n' 'missing saved runtime; aborting' >&2; exit 1; }
+sudo test -f "$backup/etc/monitor-agent/monitor-agent.env" || { printf '%s\n' 'missing saved environment; aborting' >&2; exit 1; }
+sudo test -f "$backup/etc/systemd/system/monitor-agent.service" || { printf '%s\n' 'missing saved unit; aborting' >&2; exit 1; }
+if sudo test -e /root/monitor-agent-v2-displaced; then
+    printf '%s\n' 'v2 recovery path already exists; aborting' >&2
+    exit 1
+fi
 sudo install -d -m 0700 /root/monitor-agent-v2-displaced
+sudo systemctl stop monitor-agent.service
 sudo mv /opt/monitor-agent /root/monitor-agent-v2-displaced/monitor-agent
 sudo mv /etc/monitor-agent/monitor-agent.env /root/monitor-agent-v2-displaced/monitor-agent.env
 sudo mv /etc/systemd/system/monitor-agent.service /root/monitor-agent-v2-displaced/monitor-agent.service
-sudo cp -a /root/monitor-agent-v1-backup/opt/monitor-agent /opt/
+sudo cp -a "$backup/opt/monitor-agent" /opt/
 sudo install -d -m 0700 /etc/monitor-agent
-sudo cp -a /root/monitor-agent-v1-backup/etc/monitor-agent/monitor-agent.env /etc/monitor-agent/
-sudo cp -a /root/monitor-agent-v1-backup/etc/systemd/system/monitor-agent.service /etc/systemd/system/
+sudo cp -a "$backup/etc/monitor-agent/monitor-agent.env" /etc/monitor-agent/
+sudo cp -a "$backup/etc/systemd/system/monitor-agent.service" /etc/systemd/system/
 sudo systemctl daemon-reload
 case "$prior_enabled" in
     true) sudo systemctl enable monitor-agent.service ;;
@@ -246,29 +258,51 @@ does not infer service state from the new v2 installation.
 From elevated PowerShell, stop and unregister the v2 task, restore the prior runtime and protected environment from the external backup, then restore the saved task definition and its prior state:
 
 ```powershell
-$priorState = ConvertFrom-StringData -String (Get-Content -LiteralPath C:\SecureBackups\MonitorAgentV1\task-state.env -Raw)
-if ($priorState.enabled -notin @("true", "false") -or $priorState.running -notin @("true", "false")) {
+$backup = "C:\SecureBackups\MonitorAgentV1"
+$statePath = "$backup\task-state.env"
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    throw "saved task state is missing"
+}
+$stateLines = @(Get-Content -LiteralPath $statePath)
+$priorState = ConvertFrom-StringData -String (Get-Content -LiteralPath $statePath -Raw)
+if ($stateLines.Count -ne 3 -or
+    $priorState.Keys.Count -ne 3 -or
+    ((@($priorState.Keys | Sort-Object) -join ",") -ne "enabled,running,state_code") -or
+    $priorState.enabled -notin @("true", "false") -or
+    $priorState.running -notin @("true", "false") -or
+    $priorState.state_code -notmatch '^[0-9]+$') {
     throw "saved task state is invalid"
 }
-$currentTask = Get-ScheduledTask -TaskName MonitorAgent -ErrorAction SilentlyContinue
-if ($null -ne $currentTask) {
-    if ([int]$currentTask.State -eq 4) { Stop-ScheduledTask -TaskName MonitorAgent }
-    Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false
+$requiredBackupPaths = @(
+    "$backup\monitor_agent_task.xml",
+    "$backup\runtime\venv",
+    "$backup\runtime\run-agent.ps1",
+    "$backup\runtime\monitor_agent_task.xml",
+    "$backup\configuration\monitor-agent.env"
+)
+foreach ($path in $requiredBackupPaths) {
+    if (-not (Test-Path -LiteralPath $path)) { throw "saved task recovery material is missing" }
 }
 $displaced = "C:\SecureBackups\MonitorAgentV2Displaced"
 if (Test-Path -LiteralPath $displaced) { throw "v2 recovery path already exists; aborting" }
 New-Item -ItemType Directory -Path $displaced | Out-Null
 icacls "$displaced" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
 if ($LASTEXITCODE -ne 0) { throw "v2 recovery ACL configuration failed" }
+$currentTask = Get-ScheduledTask -TaskName MonitorAgent -ErrorAction SilentlyContinue
+if ($null -ne $currentTask) {
+    if ([int]$currentTask.State -eq 4) { Stop-ScheduledTask -TaskName MonitorAgent }
+    Unregister-ScheduledTask -TaskName MonitorAgent -Confirm:$false
+}
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\venv -Destination "$displaced\venv"
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\run-agent.ps1 -Destination "$displaced\run-agent.ps1"
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\monitor_agent_task.xml -Destination "$displaced\monitor_agent_task.xml"
 Move-Item -LiteralPath C:\ProgramData\MonitorAgent\monitor-agent.env -Destination "$displaced\monitor-agent.env"
-Copy-Item -Recurse -Force C:\SecureBackups\MonitorAgentV1\runtime\venv C:\ProgramData\MonitorAgent\venv
-Copy-Item -Force C:\SecureBackups\MonitorAgentV1\runtime\run-agent.ps1, C:\SecureBackups\MonitorAgentV1\runtime\monitor_agent_task.xml C:\ProgramData\MonitorAgent
-Copy-Item -Force C:\SecureBackups\MonitorAgentV1\configuration\monitor-agent.env C:\ProgramData\MonitorAgent\monitor-agent.env
-Register-ScheduledTask -TaskName MonitorAgent -Xml (Get-Content C:\SecureBackups\MonitorAgentV1\monitor_agent_task.xml -Raw) -Force
+Copy-Item -Recurse -Force "$backup\runtime\venv" C:\ProgramData\MonitorAgent\venv
+Copy-Item -Force "$backup\runtime\run-agent.ps1", "$backup\runtime\monitor_agent_task.xml" C:\ProgramData\MonitorAgent
+Copy-Item -Force "$backup\configuration\monitor-agent.env" C:\ProgramData\MonitorAgent\monitor-agent.env
+Register-ScheduledTask -TaskName MonitorAgent -Xml (Get-Content "$backup\monitor_agent_task.xml" -Raw) -Force
 if ($priorState.running -eq "true") {
+    if ($priorState.enabled -eq "false") { Enable-ScheduledTask -TaskName MonitorAgent }
     Start-ScheduledTask -TaskName MonitorAgent
 } else {
     Stop-ScheduledTask -TaskName MonitorAgent -ErrorAction SilentlyContinue
@@ -294,9 +328,20 @@ spool is never moved or deleted.
 Unload the v2 LaunchDaemon, restore the backed-up runtime, environment, and plist, then load the prior definition and restore its recorded running state:
 
 ```bash
-prior_loaded=$(sudo sed -n -E 's/^loaded=(true|false)$/\1/p' /var/root/MonitorAgentV1Backup/launchd-state.env)
-prior_running=$(sudo sed -n -E 's/^running=(true|false)$/\1/p' /var/root/MonitorAgentV1Backup/launchd-state.env)
-prior_disabled=$(sudo sed -n -E 's/^disabled=(true|false)$/\1/p' /var/root/MonitorAgentV1Backup/launchd-state.env)
+backup=/var/root/MonitorAgentV1Backup
+state_file="$backup/launchd-state.env"
+sudo test -f "$state_file" || { printf '%s\n' 'missing saved LaunchDaemon state; aborting' >&2; exit 1; }
+state_lines=$(sudo awk 'END { print NR }' "$state_file")
+if [ "$state_lines" -ne 3 ] || \
+    [ "$(sudo grep -Ec '^loaded=(true|false)$' "$state_file")" -ne 1 ] || \
+    [ "$(sudo grep -Ec '^running=(true|false)$' "$state_file")" -ne 1 ] || \
+    [ "$(sudo grep -Ec '^disabled=(true|false)$' "$state_file")" -ne 1 ]; then
+    printf '%s\n' 'invalid saved LaunchDaemon state; aborting' >&2
+    exit 1
+fi
+prior_loaded=$(sudo sed -n -E 's/^loaded=(true|false)$/\1/p' "$state_file")
+prior_running=$(sudo sed -n -E 's/^running=(true|false)$/\1/p' "$state_file")
+prior_disabled=$(sudo sed -n -E 's/^disabled=(true|false)$/\1/p' "$state_file")
 case "$prior_loaded:$prior_running" in
     true:true|true:false|false:false) ;;
     *) printf '%s\n' 'invalid saved LaunchDaemon state; aborting' >&2; exit 1 ;;
@@ -305,22 +350,29 @@ case "$prior_disabled" in
     true|false) ;;
     *) printf '%s\n' 'invalid saved LaunchDaemon enable state; aborting' >&2; exit 1 ;;
 esac
+sudo test -d "$backup/runtime/venv" || { printf '%s\n' 'missing saved runtime; aborting' >&2; exit 1; }
+sudo test -f "$backup/runtime/run-agent.sh" || { printf '%s\n' 'missing saved launcher; aborting' >&2; exit 1; }
+sudo test -f "$backup/configuration/monitor-agent.env" || { printf '%s\n' 'missing saved environment; aborting' >&2; exit 1; }
+sudo test -f "$backup/LaunchDaemons/com.company.monitor-agent.plist" || { printf '%s\n' 'missing saved plist; aborting' >&2; exit 1; }
+if sudo test -e /var/root/MonitorAgentV2Displaced; then
+    printf '%s\n' 'v2 recovery path already exists; aborting' >&2
+    exit 1
+fi
+sudo install -d -m 0700 /var/root/MonitorAgentV2Displaced
 if sudo launchctl print system/com.company.monitor-agent >/dev/null 2>&1; then
     sudo launchctl bootout system/com.company.monitor-agent
 fi
-sudo test ! -e /var/root/MonitorAgentV2Displaced
-sudo install -d -m 0700 /var/root/MonitorAgentV2Displaced
 sudo mv "/Library/Application Support/MonitorAgent/venv" /var/root/MonitorAgentV2Displaced/venv
 sudo mv "/Library/Application Support/MonitorAgent/run-agent.sh" /var/root/MonitorAgentV2Displaced/run-agent.sh
 sudo mv "/Library/Application Support/MonitorAgent/monitor-agent.env" /var/root/MonitorAgentV2Displaced/monitor-agent.env
 sudo mv /Library/LaunchDaemons/com.company.monitor-agent.plist /var/root/MonitorAgentV2Displaced/com.company.monitor-agent.plist
-sudo cp -a /var/root/MonitorAgentV1Backup/runtime/venv "/Library/Application Support/MonitorAgent/venv"
-sudo cp -a /var/root/MonitorAgentV1Backup/runtime/run-agent.sh "/Library/Application Support/MonitorAgent/run-agent.sh"
-sudo cp -a /var/root/MonitorAgentV1Backup/configuration/monitor-agent.env "/Library/Application Support/MonitorAgent/monitor-agent.env"
-sudo cp -a /var/root/MonitorAgentV1Backup/LaunchDaemons/com.company.monitor-agent.plist /Library/LaunchDaemons/com.company.monitor-agent.plist
-case "$prior_disabled" in
-    true) sudo launchctl disable system/com.company.monitor-agent ;;
-    false) sudo launchctl enable system/com.company.monitor-agent ;;
+sudo cp -a "$backup/runtime/venv" "/Library/Application Support/MonitorAgent/venv"
+sudo cp -a "$backup/runtime/run-agent.sh" "/Library/Application Support/MonitorAgent/run-agent.sh"
+sudo cp -a "$backup/configuration/monitor-agent.env" "/Library/Application Support/MonitorAgent/monitor-agent.env"
+sudo cp -a "$backup/LaunchDaemons/com.company.monitor-agent.plist" /Library/LaunchDaemons/com.company.monitor-agent.plist
+case "$prior_loaded" in
+    true) sudo launchctl enable system/com.company.monitor-agent ;;
+    false) ;;
 esac
 case "$prior_loaded:$prior_running" in
     true:true)
@@ -332,6 +384,10 @@ case "$prior_loaded:$prior_running" in
         sudo launchctl stop com.company.monitor-agent
         ;;
     false:false) ;;
+esac
+case "$prior_disabled" in
+    true) sudo launchctl disable system/com.company.monitor-agent ;;
+    false) sudo launchctl enable system/com.company.monitor-agent ;;
 esac
 ```
 
