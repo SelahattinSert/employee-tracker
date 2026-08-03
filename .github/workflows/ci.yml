@@ -123,7 +123,13 @@ jobs:
             bash -n "$script" || exit $?
           done
       - run: shellcheck deploy/linux/install.sh deploy/linux/uninstall.sh
-      - run: systemd-analyze verify deploy/linux/monitor-agent.service
+      - name: Verify systemd unit against staged runtime
+        run: |
+          staged_root="$(mktemp -d)"
+          install -Dm644 deploy/linux/monitor-agent.service "$staged_root/etc/systemd/system/monitor-agent.service"
+          install -Dm755 /bin/true "$staged_root/opt/monitor-agent/venv/bin/monitor-agent"
+          install -Dm600 /dev/null "$staged_root/etc/monitor-agent/monitor-agent.env"
+          systemd-analyze verify --root="$staged_root" --recursive-errors=yes /etc/systemd/system/monitor-agent.service
 
   deployment-windows:
     runs-on: windows-2025

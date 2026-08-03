@@ -48,6 +48,14 @@ def test_pytest_enforces_line_and_branch_coverage() -> None:
     assert "--cov-fail-under=90" in addopts
 
 
+def test_package_metadata_uses_project_readme() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert config["project"]["readme"] == "README.md"
+    assert (project_root / config["project"]["readme"]).is_file()
+
+
 def test_entrypoint_exits_with_success(monkeypatch, capsys) -> None:
     monkeypatch.setattr(sys, "argv", ["monitor-agent", "version"])
 
