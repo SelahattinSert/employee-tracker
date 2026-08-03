@@ -54,6 +54,6 @@ def test_systemd_unit_is_verified_against_staged_runtime_paths() -> None:
 def test_matrix_test_job_excludes_platform_deployment_harnesses() -> None:
     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 
-    assert "python -m pytest --ignore=tests/deploy" in workflow
+    assert "python -m pytest --no-cov --ignore=tests/deploy" in workflow
     assert "--ignore=tests/test_spool.py" in workflow
     assert "matrix.os == 'windows-2025'" in workflow

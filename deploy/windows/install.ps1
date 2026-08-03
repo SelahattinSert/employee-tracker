@@ -471,8 +471,7 @@ function Test-RollbackState {
     }
     if ($InstallRootWasPresent -and
         $Journal.InstallRoot.Restriction.Attempted -and
-        -not (Test-FileSystemSecuritySnapshot
-            $Journal.InstallRoot.SecuritySnapshot)) {
+        -not (Test-FileSystemSecuritySnapshot $Journal.InstallRoot.SecuritySnapshot)) {
         return $false
     }
 

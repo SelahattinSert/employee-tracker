@@ -49,6 +49,7 @@ def test_resource_collector_preserves_schema_units_rounding_and_one_cpu_sample(
     monkeypatch.setattr(
         "monitor_agent.collectors.resources.psutil.cpu_freq",
         lambda: SimpleNamespace(current=2400.25),
+        raising=False,
     )
     monkeypatch.setattr(
         "monitor_agent.collectors.resources.psutil.getloadavg",
@@ -120,7 +121,9 @@ def test_resource_collector_handles_empty_cpu_samples_and_optional_metrics(
         "monitor_agent.collectors.resources.psutil.cpu_percent",
         lambda interval, percpu: [],
     )
-    monkeypatch.setattr("monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None)
+    monkeypatch.setattr(
+        "monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None, raising=False
+    )
     monkeypatch.delattr(psutil, "getloadavg", raising=False)
     install_memory_fakes(monkeypatch)
     install_empty_disk_fake(monkeypatch)
@@ -152,7 +155,9 @@ def test_resource_collector_uses_sample_count_when_logical_count_is_unavailable(
         "monitor_agent.collectors.resources.psutil.cpu_percent",
         lambda interval, percpu: [1, 2, 3],
     )
-    monkeypatch.setattr("monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None)
+    monkeypatch.setattr(
+        "monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None, raising=False
+    )
     monkeypatch.delattr(psutil, "getloadavg", raising=False)
     install_memory_fakes(monkeypatch)
     install_empty_disk_fake(monkeypatch)
@@ -176,7 +181,9 @@ def test_resource_collector_isolates_each_inaccessible_disk_without_leaking(
         "monitor_agent.collectors.resources.psutil.cpu_percent",
         lambda interval, percpu: [0.0],
     )
-    monkeypatch.setattr("monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None)
+    monkeypatch.setattr(
+        "monitor_agent.collectors.resources.psutil.cpu_freq", lambda: None, raising=False
+    )
     monkeypatch.delattr(psutil, "getloadavg", raising=False)
     install_memory_fakes(monkeypatch)
     partitions = [
