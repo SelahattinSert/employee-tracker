@@ -82,7 +82,7 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
         "docs/migration-v1-to-v2.md",
         "docs/operations.md",
         "schema_version",
-        "1.0",
+        "1.1",
         "SECURITY.md",
         "PRIVACY.md",
     ):
@@ -121,6 +121,13 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
         "MONITOR_PROCESS_CMDLINE_MODE",
         "MONITOR_INCLUDE_NETWORK_CONNECTIONS",
         "MONITOR_INCLUDE_SOFTWARE",
+        "MONITOR_INCLUDE_ACTIVE_WINDOW",
+        "MONITOR_AUDIT_PATHS",
+        "MONITOR_AUDIT_MAX_FILES",
+        "MONITOR_AUDIT_MAX_FILE_BYTES",
+        "MONITOR_SCREENSHOT_ENABLED",
+        "MONITOR_SCREENSHOT_MAX_BYTES",
+        "MONITOR_EMPLOYEE_NOTICE_ACK",
         "MONITOR_LOG_PATH",
         "MONITOR_LOG_FORMAT",
         "MONITOR_LOG_LEVEL",
@@ -154,6 +161,37 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
         ),
         "`MONITOR_INCLUDE_NETWORK_CONNECTIONS`": ("`true`", "`true`/`false`", "Privacy control"),
         "`MONITOR_INCLUDE_SOFTWARE`": ("`true`", "`true`/`false`", "Privacy control"),
+        "`MONITOR_INCLUDE_ACTIVE_WINDOW`": (
+            "`false`",
+            "`true`/`false`",
+            "Sensitive telemetry",
+        ),
+        "`MONITOR_AUDIT_PATHS`": (
+            "Empty",
+            "separated paths",
+            "Sensitive telemetry",
+        ),
+        "`MONITOR_AUDIT_MAX_FILES`": ("`50`", "`1..1000`", "Collection bound"),
+        "`MONITOR_AUDIT_MAX_FILE_BYTES`": (
+            "`10485760`",
+            "`1024..1073741824`",
+            "Collection bound",
+        ),
+        "`MONITOR_SCREENSHOT_ENABLED`": (
+            "`false`",
+            "`true`/`false`",
+            "Highly sensitive telemetry",
+        ),
+        "`MONITOR_SCREENSHOT_MAX_BYTES`": (
+            "`5242880`",
+            "`1024..52428800`",
+            "Collection bound",
+        ),
+        "`MONITOR_EMPLOYEE_NOTICE_ACK`": (
+            "`false`",
+            "Must be `true`",
+            "Compliance control",
+        ),
         "`MONITOR_LOG_PATH`": ("Platform-specific", "Writable file path", "Operational"),
         "`MONITOR_LOG_FORMAT`": ("`text`", "`text`, `json`", "No"),
         "`MONITOR_LOG_LEVEL`": ("`INFO`", "Standard Python logging level", "No"),
@@ -171,7 +209,8 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
 
 def test_release_security_and_privacy_materials_cover_required_controls() -> None:
     changelog = _read("CHANGELOG.md")
-    assert changelog.startswith("# Changelog\n\n## 2.0.0 - 2026-07-20\n")
+    assert changelog.startswith("# Changelog\n\n## Unreleased\n")
+    assert "## 2.0.0 - 2026-07-20" in changelog
     for line in (
         "- Installable cross-platform package and operational CLI.",
         "- Failure-isolated collectors with structured status metadata.",
@@ -211,6 +250,9 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
         "network",
         "processes",
         "software",
+        "active_window",
+        "file_audit",
+        "screenshot",
         "agent",
     ):
         assert f"`{section}`" in privacy
@@ -303,6 +345,28 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
             "Inventory installed software",
             "Enabled",
             "`MONITOR_INCLUDE_SOFTWARE`; collector status remains in `agent`",
+        ),
+        "`active_window`": (
+            "Foreground title, application name, and PID when the platform exposes them",
+            "Identify the application currently receiving user attention",
+            "Disabled",
+            "`MONITOR_INCLUDE_ACTIVE_WINDOW=true` and `MONITOR_EMPLOYEE_NOTICE_ACK=true`",
+        ),
+        "`file_audit`": (
+            "Path, size, modification time, and SHA-256; maximum file count and "
+            "file size are bounded",
+            "Detect changes in explicitly configured files",
+            "Disabled",
+            "`MONITOR_AUDIT_PATHS`, `MONITOR_AUDIT_MAX_FILES`, "
+            "`MONITOR_AUDIT_MAX_FILE_BYTES`, and "
+            "`MONITOR_EMPLOYEE_NOTICE_ACK=true`",
+        ),
+        "`screenshot`": (
+            "Capture timestamp, PNG media type, byte count, and Base64-encoded PNG",
+            "Capture an explicitly authorized interactive screen",
+            "Disabled",
+            "`MONITOR_SCREENSHOT_ENABLED=true`, `MONITOR_SCREENSHOT_MAX_BYTES`, "
+            "and `MONITOR_EMPLOYEE_NOTICE_ACK=true`",
         ),
         "`agent`": (
             "Package/Python/platform/collection-duration/identity-source metadata; "

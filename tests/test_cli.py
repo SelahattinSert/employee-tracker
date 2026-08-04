@@ -689,7 +689,14 @@ def test_build_collectors_uses_fixed_order_and_configuration(
     calls: list[tuple[str, object]] = []
 
     def factory(name: str) -> Callable[..., Collector]:
-        def create(argument: object = None) -> Collector:
+        def create(*arguments: object) -> Collector:
+            argument: object
+            if not arguments:
+                argument = None
+            elif len(arguments) == 1:
+                argument = arguments[0]
+            else:
+                argument = arguments
             calls.append((name, argument))
             return cast(Collector, SimpleNamespace(name=name))
 
@@ -701,6 +708,9 @@ def test_build_collectors_uses_fixed_order_and_configuration(
     monkeypatch.setattr(registry, "NetworkCollector", factory("network"))
     monkeypatch.setattr(registry, "ProcessesCollector", factory("processes"))
     monkeypatch.setattr(registry, "SoftwareCollector", factory("software"))
+    monkeypatch.setattr(registry, "ActiveWindowCollector", factory("active_window"))
+    monkeypatch.setattr(registry, "FileAuditCollector", factory("file_audit"))
+    monkeypatch.setattr(registry, "ScreenshotCollector", factory("screenshot"))
     identity = MachineIdentity("machine-value", "test-source")
     agent_config = replace(
         config(tmp_path),
@@ -718,6 +728,9 @@ def test_build_collectors_uses_fixed_order_and_configuration(
         "network",
         "processes",
         "software",
+        "active_window",
+        "file_audit",
+        "screenshot",
     ]
     assert calls == [
         ("system", identity),
@@ -726,6 +739,15 @@ def test_build_collectors_uses_fixed_order_and_configuration(
         ("network", False),
         ("processes", "none"),
         ("software", False),
+        ("active_window", False),
+        (
+            "file_audit",
+            ((), 50, 10485760),
+        ),
+        (
+            "screenshot",
+            (False, 5242880),
+        ),
     ]
 
 

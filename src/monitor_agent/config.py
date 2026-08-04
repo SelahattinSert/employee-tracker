@@ -33,6 +33,13 @@ class AgentConfig:
     process_cmdline_mode: ProcessCmdlineMode
     include_network_connections: bool
     include_software: bool
+    include_active_window: bool
+    audit_paths: tuple[Path, ...]
+    audit_max_files: int
+    audit_max_file_bytes: int
+    screenshot_enabled: bool
+    screenshot_max_bytes: int
+    employee_notice_acknowledged: bool
     log_path: Path | None
     log_format: Literal["text", "json"]
     log_level: str
@@ -76,6 +83,12 @@ def _parse_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     if normalized in {"false", "0", "no"}:
         return False
     raise ConfigError(f"{name} must be true or false (also accepted: 1/0 or yes/no)")
+
+
+def _parse_paths(env: Mapping[str, str], name: str, platform_name: str) -> tuple[Path, ...]:
+    raw_value = env.get(name, "")
+    separator = ";" if platform_name == "win32" else ":"
+    return tuple(Path(value.strip()) for value in raw_value.split(separator) if value.strip())
 
 
 def _default_spool_path(platform_name: str) -> Path:
@@ -146,6 +159,18 @@ def load_config(
 
     spool_path_value = source.get("MONITOR_SPOOL_PATH")
     log_path_value = source.get("MONITOR_LOG_PATH")
+    include_active_window = _parse_bool(source, "MONITOR_INCLUDE_ACTIVE_WINDOW", False)
+    audit_paths = _parse_paths(source, "MONITOR_AUDIT_PATHS", platform)
+    screenshot_enabled = _parse_bool(source, "MONITOR_SCREENSHOT_ENABLED", False)
+    employee_notice_acknowledged = _parse_bool(
+        source,
+        "MONITOR_EMPLOYEE_NOTICE_ACK",
+        False,
+    )
+    if (
+        include_active_window or audit_paths or screenshot_enabled
+    ) and not employee_notice_acknowledged:
+        raise ConfigError("sensitive telemetry requires MONITOR_EMPLOYEE_NOTICE_ACK=true")
 
     return AgentConfig(
         collector_uri=collector_uri,
@@ -174,6 +199,31 @@ def load_config(
             source, "MONITOR_INCLUDE_NETWORK_CONNECTIONS", True
         ),
         include_software=_parse_bool(source, "MONITOR_INCLUDE_SOFTWARE", True),
+        include_active_window=include_active_window,
+        audit_paths=audit_paths,
+        audit_max_files=_parse_int(
+            source,
+            "MONITOR_AUDIT_MAX_FILES",
+            50,
+            1,
+            1000,
+        ),
+        audit_max_file_bytes=_parse_int(
+            source,
+            "MONITOR_AUDIT_MAX_FILE_BYTES",
+            10485760,
+            1024,
+            1073741824,
+        ),
+        screenshot_enabled=screenshot_enabled,
+        screenshot_max_bytes=_parse_int(
+            source,
+            "MONITOR_SCREENSHOT_MAX_BYTES",
+            5242880,
+            1024,
+            52428800,
+        ),
+        employee_notice_acknowledged=employee_notice_acknowledged,
         log_path=Path(log_path_value) if log_path_value else _default_log_path(platform),
         log_format=log_format,
         log_level=source.get("MONITOR_LOG_LEVEL", "INFO").upper(),

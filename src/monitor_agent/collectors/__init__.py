@@ -27,7 +27,14 @@ def build_collectors(
         NetworkCollector(config.include_network_connections),
         ProcessesCollector(config.process_cmdline_mode),
         SoftwareCollector(config.include_software),
-        ActiveWindowCollector(),
-        FileAuditCollector(),
-        ScreenshotCollector(),
+        ActiveWindowCollector(config.include_active_window),
+        FileAuditCollector(
+            config.audit_paths,
+            config.audit_max_files,
+            config.audit_max_file_bytes,
+        ),
+        ScreenshotCollector(
+            config.screenshot_enabled,
+            config.screenshot_max_bytes,
+        ),
     ]
