@@ -78,6 +78,45 @@ def _replace_function(text: str, name: str, replacement: str) -> str:
     return text.replace(_function(text, name), replacement)
 
 
+def _path_event_index(
+    events: list[str],
+    *,
+    prefix: str,
+    expected_path: Path,
+    suffix: str = "",
+) -> int:
+    candidates: list[str] = []
+    for index, event in enumerate(events):
+        if not event.startswith(prefix) or (suffix and not event.endswith(suffix)):
+            continue
+        end = -len(suffix) if suffix else None
+        candidate = event[len(prefix) : end]
+        candidates.append(candidate)
+        try:
+            if os.path.samefile(candidate, expected_path):
+                return index
+        except OSError:
+            continue
+    raise AssertionError(
+        f"no {prefix!r} event resolves to {expected_path!s}; candidates={candidates!r}"
+    )
+
+
+def test_path_event_index_resolves_filesystem_aliases(tmp_path: Path) -> None:
+    expected_path = tmp_path / "canonical"
+    expected_path.mkdir()
+    alias_path = tmp_path / "alias"
+    alias_path.symlink_to(expected_path, target_is_directory=True)
+
+    index = _path_event_index(
+        ["connect", f"acl:{alias_path}", "stop"],
+        prefix="acl:",
+        expected_path=expected_path,
+    )
+
+    assert index == 1
+
+
 def test_task_xml_is_utf8_schema_14_and_has_one_complete_action() -> None:
     raw = TASK_XML.read_bytes()
     assert raw.startswith(b'<?xml version="1.0" encoding="UTF-8"?>')
@@ -1228,22 +1267,11 @@ else {
                 "restrict-install-root",
                 "prior-task-stop",
             }:
-                restored_roots = [
-                    line.removeprefix("restore-security:").removesuffix(":prior-security")
-                    for line in task_log.splitlines()
-                    if line.startswith("restore-security:") and line.endswith(":prior-security")
-                ]
-                assert restored_roots, (
-                    boundary,
-                    position,
-                    mode,
-                    task_log,
-                    result.stdout,
-                    result.stderr,
-                )
-                assert any(
-                    os.path.samefile(restored_root, install_root)
-                    for restored_root in restored_roots
+                _path_event_index(
+                    task_log.splitlines(),
+                    prefix="restore-security:",
+                    expected_path=install_root,
+                    suffix=":prior-security",
                 )
 
         absent_failure, absent_root, absent_log = run_installer(
@@ -1287,7 +1315,11 @@ else {
         assert (success_root / "venv" / "replacement.txt").exists()
         assert not (success_root.parent / ".monitor-agent-recovery").exists()
         success_events = success_log.splitlines()
-        assert success_events.index(f"acl:{success_root}") < success_events.index("stop")
+        assert _path_event_index(
+            success_events,
+            prefix="acl:",
+            expected_path=success_root,
+        ) < success_events.index("stop")
 
         def run_uninstaller(
             mode: str,

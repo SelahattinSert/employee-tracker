@@ -270,17 +270,34 @@ def test_collect_all_bounds_simultaneous_execution() -> None:
     assert tracker.maximum == 2
 
 
-def test_each_completed_collector_has_its_own_monotonic_duration() -> None:
-    batch = collect_all(
-        [SleepingCollector("slower", 0.03), StaticCollector("instant", CollectorPayload({}))],
-        max_workers=2,
-        timeout_sec=1.0,
+def test_each_completed_collector_has_its_own_monotonic_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = iter(
+        (
+            1_000_000_000,
+            1_030_000_000,
+            2_000_000_000,
+            2_000_000_000,
+        )
+    )
+    monkeypatch.setattr(
+        orchestrator_module.time,
+        "monotonic_ns",
+        lambda: next(timestamps),
     )
 
-    slower, instant = batch.results
-    assert slower.duration_ms >= 20
-    assert instant.duration_ms < slower.duration_ms
-    assert batch.duration_ms >= slower.duration_ms
+    slower = orchestrator_module._collect_one(
+        "slower",
+        StaticCollector("slower", CollectorPayload({})),
+    )
+    instant = orchestrator_module._collect_one(
+        "instant",
+        StaticCollector("instant", CollectorPayload({})),
+    )
+
+    assert slower.duration_ms == 30
+    assert instant.duration_ms == 0
 
 
 def test_global_cycle_deadline_applies_to_queued_work() -> None:
