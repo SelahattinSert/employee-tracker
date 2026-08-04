@@ -948,6 +948,7 @@ $global:FailureMode = $FailureMode
 $global:TaskLogPath = $TaskLog
 $global:PartialRegistrationUsed = $false
 $global:LateCrashUsed = $false
+$global:ReadinessFailureUsed = $false
 $global:ObserveReadiness = $false
 $global:ReadinessSequence = @()
 $global:SecurityState = @{}
@@ -981,7 +982,9 @@ function New-FakeTask {
             }
             $this.State = 4
         }
-        elseif ($global:FailureBoundary -eq "readiness") {
+        elseif ($global:FailureBoundary -eq "readiness" -and
+            -not $global:ReadinessFailureUsed) {
+            $global:ReadinessFailureUsed = $true
             $this.State = 3
         }
         else {
