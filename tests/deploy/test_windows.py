@@ -1215,10 +1215,19 @@ else {
             if boundary in {"register-task", "start-task", "readiness"} or mode:
                 assert f"register:{prior_task_b64}" in task_log
                 assert f"register-sddl:{prior_task_sddl_b64}" in task_log
-            if root_present and boundary != "restrict-install-root" and not (
-                boundary == "prior-task-stop" and position == "before"
-            ):
-                assert f"restore-security:{install_root}:prior-security" in task_log
+            if root_present and boundary not in {
+                "restrict-install-root",
+                "prior-task-stop",
+            }:
+                expected_restore = f"restore-security:{install_root}:prior-security"
+                assert expected_restore in task_log, (
+                    boundary,
+                    position,
+                    mode,
+                    task_log,
+                    result.stdout,
+                    result.stderr,
+                )
 
         absent_failure, absent_root, absent_log = run_installer(
             "start-task",

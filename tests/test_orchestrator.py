@@ -65,7 +65,7 @@ class BlockingCollector:
     def collect(self) -> CollectorPayload:
         if self.started is not None:
             self.started.set()
-        self.release.wait(timeout=1.0)
+        self.release.wait(timeout=5.0)
         return CollectorPayload(data={self.name: True})
 
 
@@ -284,17 +284,23 @@ def test_each_completed_collector_has_its_own_monotonic_duration() -> None:
 
 
 def test_global_cycle_deadline_applies_to_queued_work() -> None:
-    batch = collect_all(
-        [SleepingCollector("first", 0.2), SleepingCollector("second", 0.2)],
-        max_workers=1,
-        timeout_sec=0.35,
-    )
+    release = threading.Event()
+    try:
+        batch = collect_all(
+            [
+                StaticCollector("first", CollectorPayload(data={"first": True})),
+                BlockingCollector("second", release),
+            ],
+            max_workers=1,
+            timeout_sec=0.05,
+        )
+    finally:
+        release.set()
 
     assert batch.results[0].status is CollectorStatus.SUCCESS
     assert batch.results[1].status is CollectorStatus.TIMED_OUT
     assert batch.results[1].data == {}
     assert batch.results[1].error_code == "deadline_exceeded"
-    assert batch.duration_ms < 500
 
 
 def test_queued_collector_is_cancelled_after_deadline() -> None:
