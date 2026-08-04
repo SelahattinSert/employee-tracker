@@ -267,11 +267,92 @@ def collect_software() -> list[dict[str, Any]]:
     return packages
 
 
-def _reg_val(key, name: str) -> str | None:
+def collect_active_window() -> dict[str, Any]:
+    """
+    Active foreground window title and application tracking.
+    High-signal compliance alternative to raw keystroke logging.
+    """
+    win_info: dict[str, Any] = {"title": None, "app": None, "pid": None}
     try:
-        import winreg
-        return winreg.QueryValueEx(key, name)[0]
-    except OSError:
+        if sys.platform == "linux":
+            import subprocess
+            out = subprocess.check_output(["xdotool", "getactivewindow", "getwindowname"],
+                                           stderr=subprocess.DEVNULL, text=True).strip()
+            win_info["title"] = out if out else None
+        elif sys.platform == "win32":
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            win_info["title"] = buf.value if buf.value else None
+        elif sys.platform == "darwin":
+            import subprocess
+            cmd = 'tell application "System Events" to get name of first process whose frontmost is true'
+            out = subprocess.check_output(["osascript", "-e", cmd],
+                                           stderr=subprocess.DEVNULL, text=True).strip()
+            win_info["app"] = out if out else None
+    except Exception:
+        pass
+    return win_info
+
+
+def collect_file_audit() -> list[dict[str, Any]]:
+    """
+    File Integrity Monitoring (FIM) and content metadata collector for audit paths.
+    Configured via MONITOR_AUDIT_PATHS environment variable (colon-separated).
+    """
+    audit_paths_env = os.environ.get("MONITOR_AUDIT_PATHS", "")
+    if not audit_paths_env:
+        return []
+    
+    records = []
+    paths = [Path(p.strip()) for p in audit_paths_env.split(":") if p.strip()]
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            target_files = [p] if p.is_file() else list(p.rglob("*"))[:50]
+            for f in target_files:
+                if f.is_file():
+                    st = f.stat()
+                    sha = hashlib.sha256()
+                    with open(f, "rb") as fh:
+                        while chunk := fh.read(8192):
+                            sha.update(chunk)
+                    records.append({
+                        "path": str(f),
+                        "size_bytes": st.st_size,
+                        "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                        "sha256": sha.hexdigest(),
+                    })
+        except Exception as e:
+            log.warning("File audit error on %s: %s", p, e)
+    return records
+
+
+def collect_screenshot() -> dict[str, Any] | None:
+    """
+    Desktop snapshot collector for visual audit trails.
+    Enabled via MONITOR_SCREENSHOT_ENABLED=1.
+    """
+    if os.environ.get("MONITOR_SCREENSHOT_ENABLED", "0") != "1":
+        return None
+    try:
+        import base64
+        import io
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return {
+            "captured_at": datetime.now(tz=timezone.utc).isoformat(),
+            "format": "image/png",
+            "size_bytes": buf.tell(),
+            "data_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        }
+    except Exception as e:
+        log.warning("Screenshot capture failed: %s", e)
         return None
 
 
@@ -279,7 +360,7 @@ def _reg_val(key, name: str) -> str | None:
 
 def build_payload(event: str) -> dict[str, Any]:
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "event":          event,
         "timestamp":      datetime.now(tz=timezone.utc).isoformat(),
         "machine_id":     MACHINE_ID,
@@ -291,6 +372,9 @@ def build_payload(event: str) -> dict[str, Any]:
         "network":        collect_network(),
         "processes":      collect_processes(),
         "software":       collect_software(),
+        "active_window":  collect_active_window(),
+        "file_audit":     collect_file_audit(),
+        "screenshot":     collect_screenshot(),
     }
 
 
