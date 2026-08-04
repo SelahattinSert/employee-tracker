@@ -948,13 +948,6 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
             "    if ($global:FailureBoundary -eq $Name -and "
             '$global:FailurePosition -eq "after") { throw "injected" }',
         )
-        transformed_install = transformed_install.replace(
-            "catch {\n    if ($DeploymentCommitted) {",
-            "catch {\n    Add-Content -LiteralPath $global:TaskLogPath -Value "
-            '("failure:" + $_.Exception.Message)\n'
-            "    if ($DeploymentCommitted) {",
-        )
-
         transformed_uninstall = uninstaller.replace(
             '$InstallRoot = "C:\\ProgramData\\MonitorAgent"',
             "$InstallRoot = __TEST_INSTALL_ROOT__",
