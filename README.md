@@ -4,9 +4,11 @@ Monitor Agent 2.0 is a cross-platform endpoint telemetry agent that collects bou
 
 ## What the agent collects
 
-The agent collects system, user-session, resource, disk, network, process, and installed-software telemetry. It adds collector status metadata so a denied or timed-out source does not hide the rest of an event.
+The agent collects system, user-session, resource, disk, network, process, and installed-software telemetry. It can also collect explicitly enabled active-window metadata, bounded file-integrity metadata, and screenshots. It adds collector status metadata so a denied or timed-out source does not hide the rest of an event.
 
-It does not collect screenshots, keystrokes, file contents, browser content, or employee scoring. Raw platform machine identifiers are never transmitted; an available platform identifier is namespaced and reduced with SHA-256. If that source is unavailable, a persisted owner-only random UUID supplies the stable `machine_id`. Process command lines default to secret redaction.
+Active-window, file-audit, and screenshot collectors are disabled until their specific controls are configured and `MONITOR_EMPLOYEE_NOTICE_ACK=true` confirms that the required employee notice has been completed. File audit reads bounded files locally to compute SHA-256 but transmits no file contents. Screenshot payloads can contain any visible screen content and receive no password-field or application-content redaction. The agent does not collect keystrokes, clipboard contents, browser history, cookies, DOM data, or employee scoring.
+
+Raw platform machine identifiers are never transmitted; an available platform identifier is namespaced and reduced with SHA-256. If that source is unavailable, a persisted owner-only random UUID supplies the stable `machine_id`. Process command lines default to secret redaction.
 
 ## Supported platforms
 
@@ -57,6 +59,13 @@ Store configuration in the owner-restricted environment file consumed by the pla
 | `MONITOR_PROCESS_CMDLINE_MODE` | `redacted` | `none`, `redacted`, `full` | Privacy control |
 | `MONITOR_INCLUDE_NETWORK_CONNECTIONS` | `true` | `true`/`false`, `1`/`0`, `yes`/`no`; controls all network adapter, connection, and I/O telemetry | Privacy control |
 | `MONITOR_INCLUDE_SOFTWARE` | `true` | `true`/`false`, `1`/`0`, `yes`/`no` | Privacy control |
+| `MONITOR_INCLUDE_ACTIVE_WINDOW` | `false` | `true`/`false`; requires employee notice acknowledgement | Sensitive telemetry |
+| `MONITOR_AUDIT_PATHS` | Empty | `:`-separated paths on Linux/macOS; `;`-separated paths on Windows | Sensitive telemetry |
+| `MONITOR_AUDIT_MAX_FILES` | `50` | `1..1000` integer | Collection bound |
+| `MONITOR_AUDIT_MAX_FILE_BYTES` | `10485760` | `1024..1073741824` integer | Collection bound |
+| `MONITOR_SCREENSHOT_ENABLED` | `false` | `true`/`false`; requires employee notice acknowledgement | Highly sensitive telemetry |
+| `MONITOR_SCREENSHOT_MAX_BYTES` | `5242880` | `1024..52428800` integer | Collection bound |
+| `MONITOR_EMPLOYEE_NOTICE_ACK` | `false` | Must be `true` before any optional sensitive collector is enabled | Compliance control |
 | `MONITOR_LOG_PATH` | Platform-specific | Writable file path | Operational |
 | `MONITOR_LOG_FORMAT` | `text` | `text`, `json` | No |
 | `MONITOR_LOG_LEVEL` | `INFO` | Standard Python logging level | No |
@@ -133,7 +142,7 @@ Follow the [v1 to v2 migration procedure](docs/migration-v1-to-v2.md) for prefli
 
 ## Telemetry schema compatibility
 
-Telemetry remains at `schema_version` `1.0`. The legacy top-level fields remain present: `schema_version`, `event`, `timestamp`, `machine_id`, `system`, `users`, `cpu`, `memory`, `disks`, `network`, `processes`, and `software`. Version 2 adds `event_id` and `agent` metadata without removing legacy fields.
+Telemetry uses `schema_version` `1.1`. The legacy top-level fields remain present: `schema_version`, `event`, `timestamp`, `machine_id`, `system`, `users`, `cpu`, `memory`, `disks`, `network`, `processes`, and `software`. Schema 1.1 adds `active_window`, `file_audit`, and `screenshot`; disabled collectors retain stable empty or null values. Version 2 also includes `event_id` and `agent` metadata.
 
 ## Security and privacy
 

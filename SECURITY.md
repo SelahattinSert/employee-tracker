@@ -12,6 +12,12 @@ Linux runs as root, Windows runs as SYSTEM, and macOS runs as root because host-
 
 The spool contains undelivered telemetry. Treat it as sensitive operational data, keep it owner-only, and do not copy record bodies into tickets or chat.
 
+## Interactive capture controls
+
+Active-window and screenshot collection are disabled by default and require `MONITOR_EMPLOYEE_NOTICE_ACK=true` in addition to their feature-specific controls. The acknowledgement records operator intent; it does not provide a technical guarantee that passwords or private content are absent. Screenshots are unredacted pixels and must be handled as highly sensitive data.
+
+System services and scheduled tasks may not have access to an interactive desktop. A missing GUI session is reported as partial collector output. Do not weaken service isolation or desktop permissions to hide that status.
+
 ## Dependency and release checks
 
 Run these checks before approving a build:

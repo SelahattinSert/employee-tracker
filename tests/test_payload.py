@@ -11,7 +11,7 @@ from monitor_agent.models import CollectionBatch, CollectorResult, CollectorStat
 from monitor_agent.payload import build_payload
 
 
-def test_payload_preserves_v1_schema_and_adds_agent_metadata() -> None:
+def test_payload_emits_v1_1_schema_and_adds_agent_metadata() -> None:
     batch = CollectionBatch(
         results=(
             CollectorResult("system", CollectorStatus.SUCCESS, 4, {"system": {"hostname": "host"}}),
@@ -35,7 +35,7 @@ def test_payload_preserves_v1_schema_and_adds_agent_metadata() -> None:
         event_id=UUID("12345678-1234-5678-9234-567812345678"),
     )
 
-    assert payload["schema_version"] == "1.0"
+    assert payload["schema_version"] == "1.1"
     assert set(
         [
             "event",
@@ -49,6 +49,9 @@ def test_payload_preserves_v1_schema_and_adds_agent_metadata() -> None:
             "network",
             "processes",
             "software",
+            "active_window",
+            "file_audit",
+            "screenshot",
         ]
     ).issubset(payload)
     assert payload["event_id"] == "12345678-1234-5678-9234-567812345678"
@@ -112,10 +115,34 @@ def test_payload_generates_a_uuid4_when_event_id_is_absent(monkeypatch: pytest.M
 def test_payload_merges_only_known_sections_from_success_and_partial_mapping_data() -> None:
     system_data = {"system": {"hostname": "host"}, "unexpected": "ignored"}
     network_data = {"network": {"adapters": [{"name": "eth0"}]}}
+    active_window_data = {
+        "active_window": {"title": "Quarterly report", "app": "writer", "pid": 42}
+    }
+    file_audit_data = {
+        "file_audit": [
+            {
+                "path": "/srv/reports/q4.pdf",
+                "size_bytes": 128,
+                "modified": "2026-08-04T09:30:00+00:00",
+                "sha256": "a" * 64,
+            }
+        ]
+    }
+    screenshot_data = {
+        "screenshot": {
+            "captured_at": "2026-08-04T09:30:00+00:00",
+            "format": "image/png",
+            "size_bytes": 3,
+            "data_b64": "UE5H",
+        }
+    }
     batch = CollectionBatch(
         (
             CollectorResult("system", CollectorStatus.SUCCESS, 1, system_data),
             CollectorResult("network", CollectorStatus.PARTIAL, 2, network_data),
+            CollectorResult("active_window", CollectorStatus.SUCCESS, 2, active_window_data),
+            CollectorResult("file_audit", CollectorStatus.SUCCESS, 2, file_audit_data),
+            CollectorResult("screenshot", CollectorStatus.SUCCESS, 2, screenshot_data),
             CollectorResult("cpu", CollectorStatus.SUCCESS, 3, ["not a mapping"]),
             CollectorResult("software", CollectorStatus.FAILED, 4, {"software": ["leak"]}),
             CollectorResult("users", CollectorStatus.TIMED_OUT, 5, {"users": ["leak"]}),
@@ -132,6 +159,9 @@ def test_payload_merges_only_known_sections_from_success_and_partial_mapping_dat
     assert payload["software"] == []
     assert payload["users"] == []
     assert payload["disks"] == []
+    assert payload["active_window"] == active_window_data["active_window"]
+    assert payload["file_audit"] == file_audit_data["file_audit"]
+    assert payload["screenshot"] == screenshot_data["screenshot"]
     assert "unexpected" not in payload
 
 

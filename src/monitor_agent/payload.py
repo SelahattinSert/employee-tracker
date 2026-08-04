@@ -23,6 +23,9 @@ _SECTION_NAMES = (
     "network",
     "processes",
     "software",
+    "active_window",
+    "file_audit",
+    "screenshot",
 )
 
 
@@ -36,6 +39,9 @@ def _default_sections() -> dict[str, JSONValue]:
         "network": {"adapters": [], "connections": [], "io": {}},
         "processes": [],
         "software": [],
+        "active_window": {"title": None, "app": None, "pid": None},
+        "file_audit": [],
+        "screenshot": None,
     }
 
 
@@ -76,7 +82,7 @@ def build_payload(
                 sections[section_name] = copy.deepcopy(data[section_name])
 
     payload: dict[str, JSONValue] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "event": event,
         "timestamp": _timestamp(now),
         "machine_id": identity.value,

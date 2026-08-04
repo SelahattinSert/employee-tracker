@@ -31,6 +31,13 @@ def test_load_config_defaults() -> None:
     assert config.process_cmdline_mode == "redacted"
     assert config.include_network_connections is True
     assert config.include_software is True
+    assert config.include_active_window is False
+    assert config.audit_paths == ()
+    assert config.audit_max_files == 50
+    assert config.audit_max_file_bytes == 10485760
+    assert config.screenshot_enabled is False
+    assert config.screenshot_max_bytes == 5242880
+    assert config.employee_notice_acknowledged is False
     assert config.log_path is None
     assert config.log_format == "text"
     assert config.log_level == "INFO"
@@ -55,6 +62,13 @@ def test_agent_config_is_frozen_slotted_and_has_exact_fields() -> None:
         "process_cmdline_mode",
         "include_network_connections",
         "include_software",
+        "include_active_window",
+        "audit_paths",
+        "audit_max_files",
+        "audit_max_file_bytes",
+        "screenshot_enabled",
+        "screenshot_max_bytes",
+        "employee_notice_acknowledged",
         "log_path",
         "log_format",
         "log_level",
@@ -80,6 +94,9 @@ def test_agent_config_repr_omits_api_token() -> None:
         ("MONITOR_MAX_COLLECTOR_WORKERS", "0", "between 1 and 32"),
         ("MONITOR_PROCESS_CMDLINE_MODE", "raw", "none, redacted, or full"),
         ("MONITOR_INCLUDE_SOFTWARE", "sometimes", "true or false"),
+        ("MONITOR_INCLUDE_ACTIVE_WINDOW", "sometimes", "true or false"),
+        ("MONITOR_SCREENSHOT_ENABLED", "sometimes", "true or false"),
+        ("MONITOR_EMPLOYEE_NOTICE_ACK", "sometimes", "true or false"),
     ],
 )
 def test_invalid_values_are_rejected(name: str, value: str, message: str) -> None:
@@ -100,6 +117,9 @@ def test_invalid_values_are_rejected(name: str, value: str, message: str) -> Non
         ("MONITOR_SPOOL_MAX_BYTES", "1048576", "10737418240"),
         ("MONITOR_SPOOL_MAX_AGE_SEC", "3600", "31536000"),
         ("MONITOR_REPLAY_BATCH_SIZE", "1", "1000"),
+        ("MONITOR_AUDIT_MAX_FILES", "1", "1000"),
+        ("MONITOR_AUDIT_MAX_FILE_BYTES", "1024", "1073741824"),
+        ("MONITOR_SCREENSHOT_MAX_BYTES", "1024", "52428800"),
     ],
 )
 def test_numeric_boundaries_are_accepted(name: str, minimum: str, maximum: str) -> None:
@@ -119,6 +139,9 @@ def test_numeric_boundaries_are_accepted(name: str, minimum: str, maximum: str) 
         ("MONITOR_SPOOL_MAX_BYTES", "1048575", "between 1048576 and 10737418240"),
         ("MONITOR_SPOOL_MAX_AGE_SEC", "31536001", "between 3600 and 31536000"),
         ("MONITOR_REPLAY_BATCH_SIZE", "0", "between 1 and 1000"),
+        ("MONITOR_AUDIT_MAX_FILES", "1001", "between 1 and 1000"),
+        ("MONITOR_AUDIT_MAX_FILE_BYTES", "1023", "between 1024 and 1073741824"),
+        ("MONITOR_SCREENSHOT_MAX_BYTES", "52428801", "between 1024 and 52428800"),
     ],
 )
 def test_invalid_numeric_settings_are_rejected(name: str, value: str, message: str) -> None:
@@ -187,6 +210,13 @@ def test_all_overrides_are_loaded(tmp_path: Path) -> None:
             "MONITOR_PROCESS_CMDLINE_MODE": "full",
             "MONITOR_INCLUDE_NETWORK_CONNECTIONS": "no",
             "MONITOR_INCLUDE_SOFTWARE": "0",
+            "MONITOR_INCLUDE_ACTIVE_WINDOW": "yes",
+            "MONITOR_AUDIT_PATHS": "/srv/reports:/var/lib/app",
+            "MONITOR_AUDIT_MAX_FILES": "75",
+            "MONITOR_AUDIT_MAX_FILE_BYTES": "20971520",
+            "MONITOR_SCREENSHOT_ENABLED": "true",
+            "MONITOR_SCREENSHOT_MAX_BYTES": "6291456",
+            "MONITOR_EMPLOYEE_NOTICE_ACK": "true",
             "MONITOR_LOG_PATH": "/tmp/monitor-agent.log",
             "MONITOR_LOG_FORMAT": "json",
             "MONITOR_LOG_LEVEL": "debug",
@@ -211,6 +241,13 @@ def test_all_overrides_are_loaded(tmp_path: Path) -> None:
         process_cmdline_mode="full",
         include_network_connections=False,
         include_software=False,
+        include_active_window=True,
+        audit_paths=(Path("/srv/reports"), Path("/var/lib/app")),
+        audit_max_files=75,
+        audit_max_file_bytes=20971520,
+        screenshot_enabled=True,
+        screenshot_max_bytes=6291456,
+        employee_notice_acknowledged=True,
         log_path=Path("/tmp/monitor-agent.log"),
         log_format="json",
         log_level="DEBUG",
@@ -304,6 +341,40 @@ def test_ca_bundle_must_be_an_existing_regular_file(tmp_path: Path, path_kind: s
 def test_process_cmdline_modes_are_accepted(mode: str) -> None:
     config = load_config(BASE_ENV | {"MONITOR_PROCESS_CMDLINE_MODE": mode}, platform_name="linux")
     assert config.process_cmdline_mode == mode
+
+
+@pytest.mark.parametrize(
+    "sensitive_setting",
+    [
+        {"MONITOR_INCLUDE_ACTIVE_WINDOW": "true"},
+        {"MONITOR_AUDIT_PATHS": "/srv/reports"},
+        {"MONITOR_SCREENSHOT_ENABLED": "true"},
+    ],
+)
+def test_sensitive_collectors_require_employee_notice_ack(
+    sensitive_setting: dict[str, str],
+) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"requires MONITOR_EMPLOYEE_NOTICE_ACK=true",
+    ):
+        load_config(BASE_ENV | sensitive_setting, platform_name="linux")
+
+
+def test_windows_audit_paths_use_semicolon_without_splitting_drive_letters() -> None:
+    config = load_config(
+        BASE_ENV
+        | {
+            "MONITOR_AUDIT_PATHS": r"C:\Users\Alice\Reports;D:\Shared",
+            "MONITOR_EMPLOYEE_NOTICE_ACK": "true",
+        },
+        platform_name="win32",
+    )
+
+    assert config.audit_paths == (
+        Path(r"C:\Users\Alice\Reports"),
+        Path(r"D:\Shared"),
+    )
 
 
 def test_invalid_log_format_is_rejected() -> None:

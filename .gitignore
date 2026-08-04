@@ -1,5 +1,6 @@
 .worktrees/
 CODEX.md
+/GEMINI.md
 docs/
 .coverage
 .mypy_cache/

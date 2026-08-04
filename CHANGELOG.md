@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Telemetry schema 1.1 sections for opt-in active-window, bounded file-audit, and screenshot data.
+- Explicit employee-notice acknowledgement and size/count bounds for sensitive collectors.
+- Pillow 12.3.0 in canonical package metadata and the hash-locked deployment dependency set.
+
+### Fixed
+- New collector data now survives payload construction and reports disabled or partial states honestly.
+- Windows audit path parsing preserves drive letters by using the platform path-list separator.
+- Screenshot and active-window failures no longer appear as successful empty captures.
+
 ## 2.0.0 - 2026-07-20
 
 ### Added
