@@ -805,9 +805,9 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
 """
     staged_commands_start = '    py "-$PythonVersion" -m venv $StageVenv\n'
     staged_commands_end = '    if ($LASTEXITCODE -ne 0) { Fail "wheel installation failed" }\n'
-    staged_replacement = """    New-Item -ItemType Directory -LiteralPath (
-        Join-Path $StageVenv "Scripts"
-    ) -Force | Out-Null
+    staged_replacement = """    [System.IO.Directory]::CreateDirectory(
+        (Join-Path $StageVenv "Scripts")
+    ) | Out-Null
     [System.IO.File]::WriteAllText($StagePython, "python")
     [System.IO.File]::WriteAllText(
         (Join-Path $StageVenv "replacement.txt"),

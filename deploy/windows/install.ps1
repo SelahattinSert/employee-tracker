@@ -365,7 +365,7 @@ function Copy-SafeTreeItem {
         return
     }
     if (-not (Test-Path -LiteralPath $Destination)) {
-        New-Item -ItemType Directory -LiteralPath $Destination -Force | Out-Null
+        [System.IO.Directory]::CreateDirectory($Destination) | Out-Null
     }
     Assert-SafeDirectory $Destination "rollback destination"
     foreach ($Child in (Get-ChildItem -LiteralPath $Source -Force)) {
@@ -677,11 +677,11 @@ try {
     }
 
     $FailureCategory = "staging"
-    New-Item -ItemType Directory -LiteralPath $RecoveryRoot -Force | Out-Null
+    [System.IO.Directory]::CreateDirectory($RecoveryRoot) | Out-Null
     Set-RestrictedAcl $RecoveryRoot
-    New-Item -ItemType Directory -LiteralPath $TransactionRoot -Force | Out-Null
+    [System.IO.Directory]::CreateDirectory($TransactionRoot) | Out-Null
     Set-RestrictedAcl $TransactionRoot
-    New-Item -ItemType Directory -LiteralPath $BackupRoot -Force | Out-Null
+    [System.IO.Directory]::CreateDirectory($BackupRoot) | Out-Null
     Set-RestrictedAcl $BackupRoot
 
     $StageVenv = Join-Path $TransactionRoot "venv"
@@ -734,8 +734,7 @@ try {
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         [void](Invoke-JournaledMutation -Name "install-root" `
             -State $Journal.InstallRoot -Action {
-                New-Item -ItemType Directory -LiteralPath $InstallRoot -Force |
-                    Out-Null
+                [System.IO.Directory]::CreateDirectory($InstallRoot) | Out-Null
             })
     }
     Assert-SafeDirectory $InstallRoot "install root"
@@ -798,8 +797,7 @@ try {
             $Journal.StateDirectories[$StateDirectory] = $StateDirectoryJournal
             [void](Invoke-JournaledMutation -Name "create-state-directory" `
                 -State $StateDirectoryJournal -Action {
-                    New-Item -ItemType Directory -LiteralPath $StatePath -Force |
-                    Out-Null
+                    [System.IO.Directory]::CreateDirectory($StatePath) | Out-Null
                 })
         }
         Assert-SafeDirectory $StatePath $StateDirectory
