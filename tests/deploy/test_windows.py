@@ -1011,7 +1011,7 @@ $Folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
         if ($global:FailureMode -eq "query-fail") {
             throw [Runtime.InteropServices.COMException]::new("query", -1)
         }
-        throw [Runtime.InteropServices.COMException]::new("absent", -2147024894)
+        return $null
     }
     if ($global:ObserveReadiness -and $global:ReadinessSequence.Count -gt 0) {
         $this.Task.State = [int]$global:ReadinessSequence[0]

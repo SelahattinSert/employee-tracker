@@ -360,15 +360,26 @@ def test_future_that_finishes_during_deadline_classification_is_not_dropped(
 
 
 def test_timeout_returns_without_waiting_for_running_collector() -> None:
-    started = time.monotonic()
+    release = threading.Event()
+    finished = threading.Event()
 
-    batch = collect_all(
-        [SleepingCollector("slow", 0.25)],
-        max_workers=1,
-        timeout_sec=0.02,
-    )
+    class ObservableBlockingCollector:
+        name = "slow"
 
-    elapsed = time.monotonic() - started
+        def collect(self) -> CollectorPayload:
+            release.wait(timeout=5.0)
+            finished.set()
+            return CollectorPayload(data={})
+
+    try:
+        batch = collect_all(
+            [ObservableBlockingCollector()],
+            max_workers=1,
+            timeout_sec=0.02,
+        )
+        assert not finished.is_set()
+    finally:
+        release.set()
+
     assert batch.results[0].status is CollectorStatus.TIMED_OUT
     assert batch.results[0].error_message == "collector deadline exceeded"
-    assert elapsed < 0.15
