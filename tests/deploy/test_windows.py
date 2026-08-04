@@ -1178,7 +1178,7 @@ else {
             ("prior-task-stop", True),
             ("remove-prior-file", True),
             ("publish-file", True),
-            ("create-state-directory", True),
+            ("create-state-directory", False),
             ("register-task", True),
             ("start-task", True),
         )
