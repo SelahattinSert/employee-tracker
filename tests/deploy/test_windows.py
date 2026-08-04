@@ -1225,14 +1225,22 @@ else {
                 "restrict-install-root",
                 "prior-task-stop",
             }:
-                expected_restore = f"restore-security:{install_root}:prior-security"
-                assert expected_restore in task_log, (
+                restored_roots = [
+                    line.removeprefix("restore-security:").removesuffix(":prior-security")
+                    for line in task_log.splitlines()
+                    if line.startswith("restore-security:") and line.endswith(":prior-security")
+                ]
+                assert restored_roots, (
                     boundary,
                     position,
                     mode,
                     task_log,
                     result.stdout,
                     result.stderr,
+                )
+                assert any(
+                    os.path.samefile(restored_root, install_root)
+                    for restored_root in restored_roots
                 )
 
         absent_failure, absent_root, absent_log = run_installer(
