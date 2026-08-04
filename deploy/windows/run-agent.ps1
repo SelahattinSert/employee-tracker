@@ -1,0 +1,166 @@
+param(
+    [ValidateSet("run", "check-config", "health")]
+    [string]$Command = "run",
+    [string]$InstallRoot = "C:\ProgramData\MonitorAgent",
+    [string]$PathValidationRoot
+)
+
+$ErrorActionPreference = "Stop"
+$PathValidationRequested = $PSBoundParameters.ContainsKey("PathValidationRoot")
+$ConfigPath = Join-Path $InstallRoot "monitor-agent.env"
+$AgentPath = Join-Path $InstallRoot "venv\Scripts\monitor-agent.exe"
+$KnownEnvironmentKeys = @(
+    "MONITOR_COLLECTOR_URI",
+    "MONITOR_API_TOKEN",
+    "MONITOR_CA_BUNDLE",
+    "MONITOR_HEARTBEAT_SEC",
+    "MONITOR_STARTUP_DELAY_SEC",
+    "MONITOR_CONNECT_TIMEOUT_SEC",
+    "MONITOR_READ_TIMEOUT_SEC",
+    "MONITOR_COLLECTION_TIMEOUT_SEC",
+    "MONITOR_MAX_COLLECTOR_WORKERS",
+    "MONITOR_SPOOL_PATH",
+    "MONITOR_SPOOL_MAX_BYTES",
+    "MONITOR_SPOOL_MAX_AGE_SEC",
+    "MONITOR_REPLAY_BATCH_SIZE",
+    "MONITOR_PROCESS_CMDLINE_MODE",
+    "MONITOR_INCLUDE_NETWORK_CONNECTIONS",
+    "MONITOR_INCLUDE_SOFTWARE",
+    "MONITOR_LOG_PATH",
+    "MONITOR_LOG_FORMAT",
+    "MONITOR_LOG_LEVEL"
+)
+
+function Test-ReparsePoint {
+    param([Parameter(Mandatory = $true)][System.IO.FileSystemInfo]$Item)
+    return (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Test-RegularFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $Item = Get-Item -LiteralPath $Path -Force
+    return -not (Test-ReparsePoint $Item)
+}
+
+function Clear-KnownEnvironment {
+    foreach ($Name in $KnownEnvironmentKeys) {
+        [Environment]::SetEnvironmentVariable($Name, $null, "Process")
+    }
+}
+
+function Assert-LivePathConfiguration {
+    $ExpectedSpoolPath = "C:\ProgramData\MonitorAgent\spool"
+    $ExpectedLogPath = "C:\ProgramData\MonitorAgent\logs\monitor-agent.log"
+    if (-not $SeenEnvironmentKeys.Contains("MONITOR_SPOOL_PATH") -or
+        -not $SeenEnvironmentKeys.Contains("MONITOR_LOG_PATH") -or
+        [Environment]::GetEnvironmentVariable(
+            "MONITOR_SPOOL_PATH",
+            "Process"
+        ) -cne $ExpectedSpoolPath -or
+        [Environment]::GetEnvironmentVariable(
+            "MONITOR_LOG_PATH",
+            "Process"
+        ) -cne $ExpectedLogPath) {
+        throw "Invalid Monitor Agent environment entry"
+    }
+}
+
+function Set-PathValidationOverride {
+    if (-not $PathValidationRequested) { return }
+    if ($Command -ne "check-config") {
+        throw "Path validation override is only available for check-config"
+    }
+    if ([string]::IsNullOrWhiteSpace($PathValidationRoot)) {
+        throw "Invalid path validation root"
+    }
+
+    $ExpectedTransactionRoot = "C:\ProgramData\.monitor-agent-recovery\transaction"
+    $ExpectedValidationRoot = Join-Path $InstallRoot "path-validation"
+    try {
+        $NormalizedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+        $NormalizedTransactionRoot =
+            [System.IO.Path]::GetFullPath($ExpectedTransactionRoot)
+        $NormalizedExpectedRoot =
+            [System.IO.Path]::GetFullPath($ExpectedValidationRoot)
+        $NormalizedValidationRoot =
+            [System.IO.Path]::GetFullPath($PathValidationRoot)
+    }
+    catch {
+        throw "Invalid path validation root"
+    }
+    if ([string]::Equals(
+            $NormalizedInstallRoot,
+            $NormalizedTransactionRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -eq $false -or -not [string]::Equals(
+            $NormalizedValidationRoot,
+            $NormalizedExpectedRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Invalid path validation root"
+    }
+
+    $InstallRootItem = Get-Item -LiteralPath $InstallRoot -Force
+    if (-not $InstallRootItem.PSIsContainer -or
+        (Test-ReparsePoint $InstallRootItem)) {
+        throw "Invalid path validation root"
+    }
+    if (Test-Path -LiteralPath $PathValidationRoot) {
+        $ValidationRootItem = Get-Item -LiteralPath $PathValidationRoot -Force
+        if (-not $ValidationRootItem.PSIsContainer -or
+            (Test-ReparsePoint $ValidationRootItem)) {
+            throw "Invalid path validation root"
+        }
+    }
+
+    $ValidationSpoolPath = Join-Path $PathValidationRoot "spool"
+    $ValidationLogDirectory = Join-Path $PathValidationRoot "logs"
+    $ValidationLogPath = Join-Path $ValidationLogDirectory "monitor-agent.log"
+    [Environment]::SetEnvironmentVariable("MONITOR_SPOOL_PATH",
+        $ValidationSpoolPath,
+        "Process"
+    )
+    [Environment]::SetEnvironmentVariable("MONITOR_LOG_PATH",
+        $ValidationLogPath,
+        "Process"
+    )
+}
+
+if (-not (Test-RegularFile $ConfigPath)) {
+    throw "Monitor Agent configuration is missing"
+}
+if (-not (Test-RegularFile $AgentPath)) {
+    throw "Monitor Agent executable is missing"
+}
+
+Clear-KnownEnvironment
+$SeenEnvironmentKeys = New-Object `
+    -TypeName "System.Collections.Generic.HashSet[string]" `
+    -ArgumentList ([System.StringComparer]::Ordinal)
+foreach ($Line in Get-Content -LiteralPath $ConfigPath -Encoding UTF8) {
+    if ($Line.IndexOf([char]0) -ge 0) {
+        throw "Invalid Monitor Agent environment entry"
+    }
+    $Trimmed = $Line.Trim()
+    if ($Trimmed.Length -eq 0 -or $Trimmed.StartsWith("#")) {
+        continue
+    }
+    $TrimmedParts = $Trimmed.Split("=", 2)
+    $Parts = $Line.Split("=", 2)
+    if ($TrimmedParts.Count -ne 2 -or $Parts.Count -ne 2 -or $Parts[0] -ne $Parts[0].Trim() -or
+        $Parts[0] -cnotmatch "^[A-Z][A-Z0-9_]+$" -or
+        $KnownEnvironmentKeys -cnotcontains $Parts[0] -or
+        $SeenEnvironmentKeys.Contains($Parts[0])) {
+        throw "Invalid Monitor Agent environment entry"
+    }
+    [void]$SeenEnvironmentKeys.Add($Parts[0])
+    [Environment]::SetEnvironmentVariable($Parts[0], $Parts[1], "Process")
+}
+
+Assert-LivePathConfiguration
+Set-PathValidationOverride
+& $AgentPath $Command
+exit $LASTEXITCODE

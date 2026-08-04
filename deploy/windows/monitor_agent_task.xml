@@ -1,22 +1,38 @@
-<!-- deploy/windows/monitor_agent_task.xml -->
-<!-- Import via: schtasks /create /xml monitor_agent_task.xml /tn "MonitorAgent" -->
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Monitor Agent 2.0 endpoint telemetry</Description>
+  </RegistrationInfo>
   <Triggers>
-    <BootTrigger><Enabled>true</Enabled><Delay>PT30S</Delay></BootTrigger>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT30S</Delay>
+    </BootTrigger>
   </Triggers>
   <Principals>
-    <Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal>
+    <Principal id="System">
+      <UserId>S-1-5-18</UserId>
+      <LogonType>ServiceAccount</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
   </Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT30S</Interval>
+      <Count>5</Count>
+    </RestartOnFailure>
+    <Enabled>true</Enabled>
     <Hidden>false</Hidden>
   </Settings>
-  <Actions>
+  <Actions Context="System">
     <Exec>
-      <Command>C:\Python311\python.exe</Command>
-      <Arguments>C:\ProgramData\Monitor\agent\monitor_agent.py</Arguments>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\ProgramData\MonitorAgent\run-agent.ps1"</Arguments>
     </Exec>
   </Actions>
 </Task>
