@@ -6,13 +6,22 @@ install time (or read from -TokenFile), written to a temporary owner-only config
 handed to install.ps1 and deleted again. A private CA certificate is optional; when a
 file named ca.crt sits next to Install.cmd (or -CaFile is given) it is installed under
 C:\ProgramData\MonitorAgentCA and referenced through MONITOR_CA_BUNDLE.
+
+Screenshots, active-window titles and file audit are sensitive telemetry. Setup asks once
+whether employees have been notified (default yes); only then are those collectors and the
+MONITOR_EMPLOYEE_NOTICE_ACK compliance flag written as enabled. For unattended installs
+pass -EmployeesNotified or -NoEmployeesNotified. The agent code keeps these collectors off
+by default, so a plain "monitor-agent" run never collects them unless this file enables it.
 #>
 param(
     [string]$ServerUrl,
     [string]$TokenFile,
     [string]$CaFile,
     [ValidateSet("3.11", "3.12", "3.13", "3.14")]
-    [string]$PythonVersion
+    [string]$PythonVersion,
+    [switch]$EmployeesNotified,
+    [switch]$NoEmployeesNotified,
+    [string]$AuditPaths
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +32,8 @@ $EnvironmentExample = Join-Path $ScriptRoot "monitor-agent.env.example"
 $CaTargetDirectory = "C:\ProgramData\MonitorAgentCA"
 $CaTargetPath = Join-Path $CaTargetDirectory "ca.crt"
 $DefaultIngestPath = "/api/v1/telemetry"
+# Watched by default when sensitive collection is enabled; bounded by MONITOR_AUDIT_MAX_FILES.
+$DefaultAuditPaths = "C:\Users"
 $SupportedPythonVersions = @("3.14", "3.13", "3.12", "3.11")
 
 function Fail {
@@ -122,29 +133,41 @@ function New-OwnerOnlyDirectory {
     return $Directory.FullName
 }
 
+function Read-EmployeesNotified {
+    if ($NoEmployeesNotified) { return $false }
+    if ($EmployeesNotified) { return $true }
+    $ErrorActionPreference = "Continue"
+    Write-Host ""
+    Write-Host "Screenshots, active-window titles and file audit are sensitive telemetry."
+    Write-Host "Collecting them without telling employees may be unlawful. Enable them only"
+    Write-Host "after employees have been notified in line with local law and your policy."
+    $Answer = Read-Host "Have employees been notified? Enable these collectors? [Y/n]"
+    return ($Answer.Trim() -notmatch "^[nN]")
+}
+
 function Write-AgentConfiguration {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$CollectorUri,
-        [Parameter(Mandatory = $true)][string]$Token,
-        [string]$CaBundle
+        [Parameter(Mandatory = $true)][hashtable]$Settings
     )
+    $Applied = @{}
     $Lines = New-Object System.Collections.Generic.List[string]
     foreach ($Line in (Get-Content -LiteralPath $EnvironmentExample)) {
-        if ($Line.StartsWith("MONITOR_COLLECTOR_URI=")) {
-            $Lines.Add("MONITOR_COLLECTOR_URI=$CollectorUri")
-        }
-        elseif ($Line.StartsWith("MONITOR_API_TOKEN=")) {
-            $Lines.Add("MONITOR_API_TOKEN=$Token")
-        }
-        elseif ($Line.StartsWith("MONITOR_CA_BUNDLE=")) {
-            continue
+        $Key = $null
+        if ($Line -match "^([A-Z0-9_]+)=") { $Key = $Matches[1] }
+        if ($Key -and $Settings.ContainsKey($Key)) {
+            if ($null -ne $Settings[$Key]) { $Lines.Add("$Key=$($Settings[$Key])") }
+            $Applied[$Key] = $true
         }
         else {
             $Lines.Add($Line)
         }
     }
-    if ($CaBundle) { $Lines.Add("MONITOR_CA_BUNDLE=$CaBundle") }
+    foreach ($Key in $Settings.Keys) {
+        if (-not $Applied.ContainsKey($Key) -and $null -ne $Settings[$Key]) {
+            $Lines.Add("$Key=$($Settings[$Key])")
+        }
+    }
     $Encoding = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllLines($Path, $Lines, $Encoding)
 }
@@ -217,11 +240,30 @@ try {
 
     Test-CollectorConnection -CollectorUri $CollectorUri -CaBundle $CaBundle
 
+    $Notified = Read-EmployeesNotified
+    $Settings = @{
+        "MONITOR_COLLECTOR_URI" = $CollectorUri
+        "MONITOR_API_TOKEN"     = $Token
+    }
+    if ($CaBundle) { $Settings["MONITOR_CA_BUNDLE"] = $CaBundle }
+    if ($Notified) {
+        $AuditValue = if ($AuditPaths) { $AuditPaths } else { $DefaultAuditPaths }
+        $Settings["MONITOR_EMPLOYEE_NOTICE_ACK"] = "true"
+        $Settings["MONITOR_SCREENSHOT_ENABLED"] = "true"
+        $Settings["MONITOR_INCLUDE_ACTIVE_WINDOW"] = "true"
+        $Settings["MONITOR_AUDIT_PATHS"] = $AuditValue
+        Write-Host ("Sensitive collection enabled: screenshots, active window, file audit (" +
+            "$AuditValue).")
+    }
+    else {
+        Write-Host "Sensitive collection left disabled (no employee notice acknowledged)."
+    }
+
     $WorkDirectory = New-OwnerOnlyDirectory
     $ConfigurationPath = Join-Path $WorkDirectory "monitor-agent.env"
-    Write-AgentConfiguration -Path $ConfigurationPath -CollectorUri $CollectorUri `
-        -Token $Token -CaBundle $CaBundle
+    Write-AgentConfiguration -Path $ConfigurationPath -Settings $Settings
     $Token = $null
+    $Settings = $null
 
     $global:LASTEXITCODE = 0
     & $Installer -WheelPath $Wheel.FullName -EnvironmentFile $ConfigurationPath `

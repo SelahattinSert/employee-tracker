@@ -104,6 +104,48 @@ def test_setup_script_takes_secrets_at_install_time_only() -> None:
     assert "& $Installer -WheelPath $Wheel.FullName -EnvironmentFile $ConfigurationPath" in setup
 
 
+def test_setup_enables_sensitive_collectors_after_notice_confirmation() -> None:
+    setup = (WINDOWS / "setup.ps1").read_text(encoding="utf-8")
+    # The notice question defaults to yes (only a leading "n" declines).
+    assert "function Read-EmployeesNotified" in setup
+    assert 'return ($Answer.Trim() -notmatch "^[nN]")' in setup
+    assert "[switch]$EmployeesNotified" in setup
+    assert "[switch]$NoEmployeesNotified" in setup
+    # A confirmed notice turns the collectors and the compliance flag on together.
+    notified_block = setup[
+        setup.index("if ($Notified) {") : setup.index("Write-AgentConfiguration -Path")
+    ]
+    for assignment in (
+        '$Settings["MONITOR_EMPLOYEE_NOTICE_ACK"] = "true"',
+        '$Settings["MONITOR_SCREENSHOT_ENABLED"] = "true"',
+        '$Settings["MONITOR_INCLUDE_ACTIVE_WINDOW"] = "true"',
+        '$Settings["MONITOR_AUDIT_PATHS"] = $AuditValue',
+    ):
+        assert assignment in notified_block
+    assert '$DefaultAuditPaths = "C:\\Users"' in setup
+
+
+def test_agent_code_keeps_sensitive_collectors_off_by_default() -> None:
+    # The installer, not the agent, enables sensitive collection, so a plain run stays safe.
+    import monitor_agent.config as config
+
+    loaded = config.load_config(
+        {
+            "MONITOR_COLLECTOR_URI": "https://collector.internal/api/v1/telemetry",
+            "MONITOR_API_TOKEN": "token",
+        }
+    )
+    assert loaded.screenshot_enabled is False
+    assert loaded.include_active_window is False
+    assert loaded.audit_paths == ()
+    assert loaded.employee_notice_acknowledged is False
+
+    example = (WINDOWS / "monitor-agent.env.example").read_text(encoding="utf-8")
+    assert "MONITOR_SCREENSHOT_ENABLED=false" in example
+    assert "MONITOR_INCLUDE_ACTIVE_WINDOW=false" in example
+    assert "MONITOR_EMPLOYEE_NOTICE_ACK=false" in example
+
+
 def test_launchers_elevate_and_use_crlf() -> None:
     for name, target in (("Install.cmd", "setup.ps1"), ("Uninstall.cmd", "uninstall.ps1")):
         raw = (WINDOWS / name).read_bytes()

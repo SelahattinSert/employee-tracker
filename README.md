@@ -129,13 +129,20 @@ python scripts/build_windows_package.py --ca ca.crt  # also bundle a private CA 
 CI also uploads the zip with the build artifacts. Copy it to the endpoint, extract it and
 double-click `Install.cmd`. It asks for administrator rights, then for the server address
 (`https://host:port`; `/api/v1/telemetry` is added when no path is given) and the agent API
-token (hidden input). The package contains no URL, token or configuration: `setup.ps1`
-writes the configuration to an owner-only temporary folder, passes it to `install.ps1` and
-deletes it. A bundled `ca.crt` is installed to `C:\ProgramData\MonitorAgentCA\ca.crt`
-and set as `MONITOR_CA_BUNDLE`. When Python 3.11-3.14 is missing, setup installs Python
-3.14 for all users with `winget` if available. For unattended installs run
-`deploy\windows\setup.ps1 -ServerUrl https://host:8443 -TokenFile C:\secure\token.txt`
-from an elevated PowerShell. `Uninstall.cmd` removes the tasks and runtimes.
+token (hidden input). It then asks once whether employees have been notified (default yes);
+answering yes writes `MONITOR_SCREENSHOT_ENABLED`, `MONITOR_INCLUDE_ACTIVE_WINDOW`,
+`MONITOR_AUDIT_PATHS` (default `C:\Users`) and the `MONITOR_EMPLOYEE_NOTICE_ACK` compliance
+flag as enabled, so a normal install collects screenshots, active-window titles and file
+audit, while answering no leaves them off. The agent code keeps these collectors off by
+default, so only this install-time choice turns them on; enable them only after employees
+have been notified as local law requires. The package contains no URL, token or
+configuration: `setup.ps1` writes the configuration to an owner-only temporary folder,
+passes it to `install.ps1` and deletes it. A bundled `ca.crt` is installed to
+`C:\ProgramData\MonitorAgentCA\ca.crt` and set as `MONITOR_CA_BUNDLE`. When Python
+3.11-3.14 is missing, setup installs Python 3.14 for all users with `winget` if available.
+For unattended installs run `deploy\windows\setup.ps1 -ServerUrl https://host:8443
+-TokenFile C:\secure\token.txt -EmployeesNotified` (or `-NoEmployeesNotified`) from an
+elevated PowerShell. `Uninstall.cmd` removes the tasks and runtimes.
 
 Windows, manual install from elevated PowerShell:
 
