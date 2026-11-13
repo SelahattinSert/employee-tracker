@@ -138,7 +138,7 @@ jobs:
         run: |
           staged_root="$(mktemp -d)"
           install -Dm644 deploy/linux/monitor-agent.service "$staged_root/etc/systemd/system/monitor-agent.service"
-          install -Dm755 /bin/true "$staged_root/opt/monitor-agent/venv/bin/monitor-agent"
+          install -Dm755 /bin/true "$staged_root/opt/monitor-agent/venv/bin/python"
           install -Dm600 /dev/null "$staged_root/etc/monitor-agent/monitor-agent.env"
           for target in sysinit.target network-online.target multi-user.target; do
             target_path="$staged_root/usr/lib/systemd/system/$target"
