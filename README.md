@@ -161,6 +161,30 @@ sudo deploy/macos/install.sh dist/monitor_agent-2.0.0-py3-none-any.whl /secure/p
 sudo launchctl print system/com.company.monitor-agent
 ```
 
+Linux and macOS, one-click package:
+
+```bash
+python scripts/build_unix_package.py --os linux             # dist/MonitorAgent-Linux-2.0.0.tar.gz
+python scripts/build_unix_package.py --os macos --ca ca.crt # bundle a private CA certificate too
+```
+
+CI also uploads these archives with the build artifacts. Copy the archive to the endpoint and
+extract it. On Linux run `./Install.sh` (or "Run as Program"); on macOS double-click
+`Install.command`. The wizard asks for administrator rights (re-running with `sudo`), then for
+the server address (`https://host:port`; `/api/v1/telemetry` is added when no path is given) and
+the agent API token (hidden input). It then asks once whether employees have been notified
+(default yes); answering yes enables `MONITOR_SCREENSHOT_ENABLED`, `MONITOR_INCLUDE_ACTIVE_WINDOW`,
+`MONITOR_AUDIT_PATHS` (default `/home` on Linux, `/Users` on macOS) and the
+`MONITOR_EMPLOYEE_NOTICE_ACK` compliance flag, while answering no leaves them off. The agent code
+keeps these collectors off by default, so only this install-time choice turns them on; enable
+them only after employees have been notified as local law requires. The package ships no URL,
+token or configuration: `setup.sh` writes the configuration to an owner-only temporary file,
+passes it to the platform `install.sh` and deletes it. A bundled `ca.crt` is installed under a
+protected directory and set as `MONITOR_CA_BUNDLE`. For unattended installs run
+`sudo deploy/linux/setup.sh --server-url https://host:8443 --token-file /secure/token
+--employees-notified` (or `--no-employees-notified`); `--audit-paths` and `--python` are also
+accepted. The existing `uninstall.sh` scripts remove the service.
+
 ### Session helper
 
 The system service cannot see a user's desktop, so screenshot and active-window collection comes from `monitor-agent session-helper`, which each installer starts in every graphical login. Set `MONITOR_SESSION_SOURCE=helper` in the service configuration (the examples do). The helper uses its own runtime that standard users can read and execute; it never reads the service configuration or API token. It authenticates the service with a random per-login key in an owner-only file and exchanges only bounded JSON.
