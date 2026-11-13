@@ -111,6 +111,10 @@ jobs:
           PY
       - name: Build Windows installation package
         run: python scripts/build_windows_package.py --wheel dist/monitor_agent-2.0.0-py3-none-any.whl --output dist
+      - name: Build Linux installation package
+        run: python scripts/build_unix_package.py --os linux --wheel dist/monitor_agent-2.0.0-py3-none-any.whl --output dist
+      - name: Build macOS installation package
+        run: python scripts/build_unix_package.py --os macos --wheel dist/monitor_agent-2.0.0-py3-none-any.whl --output dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: monitor-agent-2.0.0
@@ -132,10 +136,11 @@ jobs:
       - run: python -m pytest tests/deploy/test_linux.py -q --no-cov
       - name: Parse Linux deployment scripts
         run: |
-          for script in deploy/linux/install.sh deploy/linux/uninstall.sh; do
+          for script in deploy/linux/install.sh deploy/linux/uninstall.sh deploy/linux/setup.sh deploy/linux/Install.sh deploy/common/setup-wizard.sh; do
             bash -n "$script" || exit $?
           done
       - run: shellcheck deploy/linux/install.sh deploy/linux/uninstall.sh
+      - run: shellcheck -s sh deploy/common/setup-wizard.sh deploy/linux/setup.sh deploy/macos/setup.sh deploy/linux/Install.sh deploy/macos/Install.command
       - name: Verify systemd unit against staged runtime
         run: |
           staged_root="$(mktemp -d)"
@@ -197,7 +202,7 @@ jobs:
       - run: python -m pytest tests/deploy/test_macos.py -q --no-cov
       - name: Parse macOS deployment scripts
         run: |
-          for script in deploy/macos/install.sh deploy/macos/run-agent.sh deploy/macos/uninstall.sh; do
+          for script in deploy/macos/install.sh deploy/macos/run-agent.sh deploy/macos/uninstall.sh deploy/macos/setup.sh deploy/macos/Install.command deploy/common/setup-wizard.sh; do
             sh -n "$script" || exit $?
           done
       - run: plutil -lint deploy/macos/com.company.monitor-agent.plist deploy/macos/com.company.monitor-agent.session.plist

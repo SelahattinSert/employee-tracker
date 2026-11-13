@@ -7,13 +7,15 @@ def test_deployment_jobs_parse_every_shell_script_individually() -> None:
     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 
     assert (
-        "for script in deploy/linux/install.sh deploy/linux/uninstall.sh; do\n"
+        "for script in deploy/linux/install.sh deploy/linux/uninstall.sh "
+        "deploy/linux/setup.sh deploy/linux/Install.sh deploy/common/setup-wizard.sh; do\n"
         '            bash -n "$script" || exit $?\n'
         "          done"
     ) in workflow
     assert (
         "for script in deploy/macos/install.sh deploy/macos/run-agent.sh "
-        "deploy/macos/uninstall.sh; do\n"
+        "deploy/macos/uninstall.sh deploy/macos/setup.sh deploy/macos/Install.command "
+        "deploy/common/setup-wizard.sh; do\n"
         '            sh -n "$script" || exit $?\n'
         "          done"
     ) in workflow
