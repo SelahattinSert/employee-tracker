@@ -3,6 +3,8 @@ param([switch]$Purge)
 $ErrorActionPreference = "Stop"
 $TaskName = "MonitorAgent"
 $InstallRoot = "C:\ProgramData\MonitorAgent"
+$SessionTaskName = "MonitorAgentSession"
+$SessionRoot = "C:\Program Files\MonitorAgentSession"
 $TaskNotFoundHResult = -2147024894
 $TaskStateQueued = 2
 $TaskStateRunning = 4
@@ -73,6 +75,9 @@ function Assert-SafeTree {
 }
 
 function Assert-UninstallTargetsSafe {
+    if (Assert-SafeManagedPath -Path $SessionRoot -ExpectedDirectory $true) {
+        Assert-SafeTree $SessionRoot "session tree"
+    }
     if (-not (Test-Path -LiteralPath $InstallRoot)) { return }
     [void](Assert-SafeManagedPath -Path $InstallRoot -ExpectedDirectory $true)
     Assert-SafeTree $InstallRoot "install tree"
@@ -176,6 +181,20 @@ try {
         $TaskFolder.DeleteTask($TaskName, 0)
     }
     Verify-TaskAbsent -Folder $TaskFolder
+
+    # The session helper is runtime only; it holds no configuration or telemetry.
+    $SessionTask = Get-RegisteredTask -Folder $TaskFolder -Name $SessionTaskName
+    if ($null -ne $SessionTask) {
+        if ([int]$SessionTask.State -eq $TaskStateRunning -or
+            [int]$SessionTask.State -eq $TaskStateQueued) {
+            $SessionTask.Stop(0)
+        }
+        $TaskFolder.DeleteTask($SessionTaskName, 0)
+    }
+    if ($null -ne (Get-RegisteredTask -Folder $TaskFolder -Name $SessionTaskName)) {
+        Fail "session task is still registered"
+    }
+    Remove-SafePath -Path $SessionRoot -ExpectedDirectory $true
 
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         Write-Host "monitor-agent uninstall: task absent; no runtime files found"

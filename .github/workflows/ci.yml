@@ -198,4 +198,4 @@ jobs:
           for script in deploy/macos/install.sh deploy/macos/run-agent.sh deploy/macos/uninstall.sh; do
             sh -n "$script" || exit $?
           done
-      - run: plutil -lint deploy/macos/com.company.monitor-agent.plist
+      - run: plutil -lint deploy/macos/com.company.monitor-agent.plist deploy/macos/com.company.monitor-agent.session.plist

@@ -250,7 +250,8 @@ def test_corrupt_nonmapping_or_missing_event_id_moves_to_dead_letter(tmp_path: P
 
 def test_load_invalid_uuid_moves_to_dead_letter_and_reject_has_suffix(tmp_path: Path) -> None:
     spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
-    invalid = tmp_path / "20260720T120000000000Z_invalid.json"
+    recent = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    invalid = tmp_path / f"{recent}_invalid.json"
     invalid.write_text(json.dumps({"event_id": "invalid"}), encoding="utf-8")
     assert spool.load(invalid) is None
 
@@ -259,6 +260,44 @@ def test_load_invalid_uuid_moves_to_dead_letter_and_reject_has_suffix(tmp_path: 
     assert rejected.parent == tmp_path / "dead-letter"
     assert rejected.name.endswith(".rejected.json")
     assert json.loads(rejected.read_text(encoding="utf-8"))["event_id"] == event(1)
+    assert spool.stats().dead_letter_count == 2
+
+
+def test_retention_evicts_expired_dead_letter_records_and_finished_markers(
+    tmp_path: Path,
+) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    now = datetime(2099, 7, 20, 12, tzinfo=UTC)
+    old = spool.reject(spool.enqueue(payload(event(1)), now=now - timedelta(hours=2)))
+    fresh = spool.reject(spool.enqueue(payload(event(2)), now=now))
+    dead_letter = tmp_path / "dead-letter"
+    assert len(list(dead_letter.glob(".deadop-*.json"))) == 2
+
+    spool.enforce_retention(now=now)
+
+    assert not old.exists()
+    assert fresh.exists()
+    assert spool.stats().dead_letter_count == 1
+    assert len(list(dead_letter.glob(".deadop-*.json"))) == 1
+
+
+def test_retention_caps_dead_letter_bytes_oldest_first(tmp_path: Path) -> None:
+    spool = Spool(tmp_path, max_bytes=1_048_576, max_age_sec=3600)
+    now = datetime(2099, 7, 20, 12, tzinfo=UTC)
+    large = "x" * 400_000
+    rejected = [
+        spool.reject(
+            spool.enqueue(
+                payload(event(number), blob=large),
+                now=now + timedelta(seconds=number),
+            )
+        )
+        for number in range(1, 4)
+    ]
+
+    spool.enforce_retention(now=now + timedelta(seconds=10))
+
+    assert [path.exists() for path in rejected] == [False, True, True]
     assert spool.stats().dead_letter_count == 2
 
 

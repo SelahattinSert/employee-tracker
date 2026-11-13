@@ -78,6 +78,7 @@ def test_success_statuses_use_json_timeout_tls_and_safe_headers(status: int) -> 
     assert kwargs["json"] == telemetry()
     assert kwargs["timeout"] == (5.0, 15.0)
     assert kwargs["verify"] is True
+    assert kwargs["allow_redirects"] is False
     assert kwargs["headers"] == {
         "Accept": "application/json",
         "Authorization": "Bearer token-value",
@@ -135,7 +136,40 @@ def test_authentication_statuses_are_not_retried(status: int) -> None:
     assert len(session.calls) == 1
 
 
-@pytest.mark.parametrize("status", [300, 399, 400, 422, 499, 600])
+@pytest.mark.parametrize("status", [300, 301, 307, 308, 399, 404, 405, 410])
+def test_redirect_and_missing_endpoint_statuses_keep_records_and_are_not_retried(
+    status: int,
+) -> None:
+    session = FakeSession(iter([response(status), response(200)]))
+
+    result = TelemetryTransport(config(), session=session).send(telemetry())  # type: ignore[arg-type]
+
+    assert result.kind is DeliveryKind.ENDPOINT
+    assert result.status_code == status
+    assert result.attempts == 1
+    assert result.message == "collector endpoint unavailable"
+    assert len(session.calls) == 1
+
+
+def test_stop_aware_sleep_ends_retries_on_shutdown() -> None:
+    session = FakeSession(iter([response(503), response(200)]))
+    delays: list[float] = []
+
+    def stopped(delay: float) -> bool:
+        delays.append(delay)
+        return True
+
+    result = TelemetryTransport(
+        config(), session=session, sleep=stopped, random_value=lambda: 0.5
+    ).send(telemetry())  # type: ignore[arg-type]
+
+    assert result.kind is DeliveryKind.RETRIABLE
+    assert result.attempts == 1
+    assert len(session.calls) == 1
+    assert delays == [0.25]
+
+
+@pytest.mark.parametrize("status", [400, 422, 499, 600])
 def test_unexpected_and_permanent_statuses_are_not_retried(status: int) -> None:
     session = FakeSession(iter([response(status), response(200)]))
 

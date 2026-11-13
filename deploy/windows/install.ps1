@@ -20,6 +20,15 @@ $ProjectRoot = Split-Path -Parent (Split-Path -Parent $ScriptRoot)
 $LockPath = Join-Path $ProjectRoot "requirements.lock"
 $LauncherSource = Join-Path $ScriptRoot "run-agent.ps1"
 $TaskSource = Join-Path $ScriptRoot "monitor_agent_task.xml"
+# The session helper runs as each logged-on user, so it has its own runtime that Users may
+# read and execute; the service runtime and its secret configuration stay restricted.
+$SessionTaskName = "MonitorAgentSession"
+$SessionRoot = "C:\Program Files\MonitorAgentSession"
+$SessionVenv = Join-Path $SessionRoot "venv"
+$SessionTaskSource = Join-Path $ScriptRoot "monitor_agent_session_task.xml"
+$PriorSessionTaskXmlPath = Join-Path $BackupRoot "registered-session-task.xml"
+$UsersSid = "S-1-5-32-545"
+$TaskLogonGroup = 4
 $TaskNotFoundHResult = -2147024894
 $TaskStateQueued = 2
 $TaskStateReady = 3
@@ -55,6 +64,12 @@ $PriorTaskWasPresent = $false
 $PriorTaskWasRunning = $false
 $PriorTaskWasActive = $false
 $TaskFolder = $null
+$SessionRootWasPresent = $false
+$SessionVenvWasPresent = $false
+$PriorSessionTaskXml = $null
+$PriorSessionTaskSddl = $null
+$PriorSessionTaskWasPresent = $false
+$UsersAccount = $null
 
 function Fail {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -214,6 +229,81 @@ function Set-RestrictedAcl {
         foreach ($ExpectedSid in $ExpectedSids) {
             if (-not $ObservedSids.Contains($ExpectedSid)) {
                 Fail "DACL verification failed"
+            }
+        }
+    }
+}
+
+function Set-SessionAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse
+    )
+    $null = @(Get-SafeTreeItems -Path $Path -Label "session ACL tree")
+    $TraversalArguments = @()
+    if ($Recurse) { $TraversalArguments = @("/T", "/C") }
+
+    $ResetArguments = @("/reset")
+    $ResetArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $ResetArguments
+
+    $InheritanceArguments = @("/inheritancelevel:r")
+    $InheritanceArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $InheritanceArguments
+
+    $GrantArguments = @(
+        "/grant:r",
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+        "*S-1-5-32-545:(OI)(CI)RX"
+    )
+    $GrantArguments += $TraversalArguments
+    Invoke-IcaclsChecked -Path $Path -Arguments $GrantArguments
+
+    $FullControlSids = @("S-1-5-18", "S-1-5-32-544")
+    $UsersForbiddenRights = (
+        [Security.AccessControl.FileSystemRights]::Write -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    )
+    foreach ($AclTarget in @(Get-SafeTreeItems -Path $Path -Label "session ACL tree")) {
+        $ObservedAcl = Get-Acl -LiteralPath $AclTarget.FullName
+        if (-not $ObservedAcl.AreAccessRulesProtected) {
+            Fail "session DACL verification failed"
+        }
+        $ObservedSids = New-Object -TypeName "System.Collections.Generic.HashSet[string]"
+        foreach ($Rule in $ObservedAcl.Access) {
+            $Sid = $Rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($Rule.IsInherited -or
+                $Rule.AccessControlType -ne
+                    [Security.AccessControl.AccessControlType]::Allow) {
+                Fail "session DACL verification failed"
+            }
+            if ($FullControlSids -contains $Sid) {
+                $HasFullControl = (
+                    ($Rule.FileSystemRights -band
+                        [Security.AccessControl.FileSystemRights]::FullControl) -eq
+                    [Security.AccessControl.FileSystemRights]::FullControl
+                )
+                if (-not $HasFullControl) { Fail "session DACL verification failed" }
+            }
+            elseif ($Sid -eq $UsersSid) {
+                if (($Rule.FileSystemRights -band $UsersForbiddenRights) -ne 0) {
+                    Fail "session DACL verification failed"
+                }
+            }
+            else {
+                Fail "session DACL verification failed"
+            }
+            [void]$ObservedSids.Add($Sid)
+        }
+        foreach ($ExpectedSid in @("S-1-5-18", "S-1-5-32-544", $UsersSid)) {
+            if (-not $ObservedSids.Contains($ExpectedSid)) {
+                Fail "session DACL verification failed"
             }
         }
     }
@@ -442,6 +532,22 @@ function Resolve-AmbiguousJournal {
             $StateDirectoryJournal.Completed = $true
         }
     }
+    if (-not $SessionRootWasPresent -and $Journal.Session.Root.Attempted -and
+        -not $Journal.Session.Root.Completed -and
+        (Test-Path -LiteralPath $SessionRoot)) {
+        $Journal.Session.Root.Completed = $true
+    }
+    if ($Journal.Session.BackupPrepared -and $Journal.Session.Removal.Attempted -and
+        -not $Journal.Session.Removal.Completed -and
+        -not (Test-Path -LiteralPath $SessionVenv)) {
+        $Journal.Session.Removal.Completed = $true
+    }
+    $StageSessionPath = Join-Path $TransactionRoot "session-venv"
+    if ($Journal.Session.Publish.Attempted -and -not $Journal.Session.Publish.Completed -and
+        -not (Test-Path -LiteralPath $StageSessionPath) -and
+        (Test-Path -LiteralPath $SessionVenv)) {
+        $Journal.Session.Publish.Completed = $true
+    }
 }
 
 function Test-RollbackState {
@@ -485,6 +591,27 @@ function Test-RollbackState {
         if ($ObservedRunning -ne $PriorTaskWasActive) { return $false }
     }
     elseif ($null -ne $ObservedTask) {
+        return $false
+    }
+
+    if ($SessionVenvWasPresent -ne (Test-Path -LiteralPath $SessionVenv)) { return $false }
+    if ($SessionVenvWasPresent -and
+        -not (Test-FileSystemSecurityTree $Journal.Session.SecuritySnapshots)) {
+        return $false
+    }
+    if (-not $SessionRootWasPresent -and $Journal.Session.Root.Attempted -and
+        (Test-Path -LiteralPath $SessionRoot)) {
+        return $false
+    }
+    $ObservedSessionTask = Get-RegisteredTask -Folder $TaskFolder -Name $SessionTaskName
+    if ($PriorSessionTaskWasPresent) {
+        if ($null -eq $ObservedSessionTask) { return $false }
+        if ($ObservedSessionTask.GetSecurityDescriptor($TaskSecurityInformation) -ne
+            $PriorSessionTaskSddl) {
+            return $false
+        }
+    }
+    elseif ($null -ne $ObservedSessionTask) {
         return $false
     }
     return $true
@@ -594,6 +721,58 @@ function Invoke-Rollback {
         }
     }
 
+    if ($Journal.Session.TaskRegistration.Attempted) {
+        try {
+            $CurrentSessionTask = Get-RegisteredTask -Folder $TaskFolder -Name $SessionTaskName
+            if ($null -ne $CurrentSessionTask) {
+                $TaskFolder.DeleteTask($SessionTaskName, 0)
+            }
+            if ($PriorSessionTaskWasPresent) {
+                $RestoredSessionTaskXml =
+                    [System.IO.File]::ReadAllText($PriorSessionTaskXmlPath)
+                [void]$TaskFolder.RegisterTask(
+                    $SessionTaskName,
+                    $RestoredSessionTaskXml,
+                    $TaskRestoreFlags,
+                    $UsersAccount,
+                    $null,
+                    $TaskLogonGroup,
+                    $PriorSessionTaskSddl
+                )
+            }
+        }
+        catch { $RollbackFailed = $true }
+    }
+    if ($Journal.Session.Publish.Completed) {
+        try {
+            Remove-SafePath $SessionVenv
+        }
+        catch { $RollbackFailed = $true }
+    }
+    if ($Journal.Session.BackupPrepared -and $Journal.Session.Removal.Attempted) {
+        try {
+            Restore-BackupPath -Source (Join-Path $BackupRoot "session-venv") `
+                -Destination $SessionVenv
+            Restore-FileSystemSecurityTree $Journal.Session.SecuritySnapshots
+        }
+        catch { $RollbackFailed = $true }
+    }
+    if (-not $SessionRootWasPresent -and $Journal.Session.Root.Attempted) {
+        try {
+            if ((Test-Path -LiteralPath $SessionRoot) -and
+                @(Get-ChildItem -LiteralPath $SessionRoot -Force).Count -eq 0) {
+                Remove-SafePath $SessionRoot
+            }
+        }
+        catch { $RollbackFailed = $true }
+    }
+    elseif ($SessionRootWasPresent -and $Journal.Session.Restriction.Attempted) {
+        try {
+            Restore-FileSystemSecuritySnapshot $Journal.Session.RootSecuritySnapshot
+        }
+        catch { $RollbackFailed = $true }
+    }
+
     try {
         if (-not (Test-RollbackState)) { $RollbackFailed = $true }
     }
@@ -623,6 +802,16 @@ $Journal = @{
     PriorFiles = @{}
     PublishedFiles = @{}
     StateDirectories = @{}
+    Session = @{
+        Root = @{ Attempted = $false; Completed = $false }
+        RootSecuritySnapshot = $null
+        Restriction = @{ Attempted = $false; Completed = $false }
+        SecuritySnapshots = @()
+        BackupPrepared = $false
+        Removal = @{ Attempted = $false; Completed = $false }
+        Publish = @{ Attempted = $false; Completed = $false }
+        TaskRegistration = @{ Attempted = $false; Completed = $false }
+    }
 }
 foreach ($Name in $ManagedNames) {
     $Journal.PriorFiles[$Name] = @{
@@ -650,6 +839,7 @@ try {
     Assert-RegularFile $LockPath "lock file"
     Assert-RegularFile $LauncherSource "launcher template"
     Assert-RegularFile $TaskSource "task template"
+    Assert-RegularFile $SessionTaskSource "session task template"
     if (-not (Test-PathCommand "py") -or
         -not (Test-PathCommand "schtasks.exe") -or
         -not (Test-PathCommand "icacls.exe")) {
@@ -666,6 +856,20 @@ try {
     if (Test-Path -LiteralPath $RecoveryRoot) {
         Fail "recovery-required at C:\ProgramData\.monitor-agent-recovery"
     }
+    Assert-SafeDirectory $SessionRoot "session root"
+    Assert-SafeTree $SessionRoot "session tree"
+    $SessionRootWasPresent = Test-Path -LiteralPath $SessionRoot
+    if ($SessionRootWasPresent) {
+        $Journal.Session.RootSecuritySnapshot = Get-FileSystemSecuritySnapshot $SessionRoot
+    }
+    Assert-SafeManagedPath $SessionVenv "venv"
+    $SessionVenvWasPresent = Test-Path -LiteralPath $SessionVenv
+    if ($SessionVenvWasPresent) {
+        $Journal.Session.SecuritySnapshots = Get-FileSystemSecurityTree $SessionVenv
+    }
+    $UsersAccount = (
+        New-Object Security.Principal.SecurityIdentifier($UsersSid)
+    ).Translate([Security.Principal.NTAccount]).Value
     foreach ($Name in $ManagedNames) {
         $LivePath = Join-Path $InstallRoot $Name
         Assert-SafeManagedPath $LivePath $Name
@@ -709,6 +913,16 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "wheel installation failed" }
     & $StageLauncher -Command check-config -InstallRoot $TransactionRoot -PathValidationRoot $StagePathValidationRoot
     if ($LASTEXITCODE -ne 0) { Fail "staged configuration validation failed" }
+    $StageSessionVenv = Join-Path $TransactionRoot "session-venv"
+    $StageSessionPython = Join-Path $StageSessionVenv "Scripts\python.exe"
+    py "-$PythonVersion" -m venv $StageSessionVenv
+    if ($LASTEXITCODE -ne 0) { Fail "session virtual environment creation failed" }
+    Assert-RegularFile $StageSessionPython "staged session Python executable"
+    & $StageSessionPython -m pip install --require-hashes -r $StageLock
+    if ($LASTEXITCODE -ne 0) { Fail "session locked dependency installation failed" }
+    & $StageSessionPython -m pip install --no-deps --force-reinstall $StageWheel
+    if ($LASTEXITCODE -ne 0) { Fail "session wheel installation failed" }
+    Assert-RegularFile (Join-Path $StageSessionVenv "Scripts\pythonw.exe") "staged session helper"
     Assert-SafeTree $TransactionRoot "staged tree"
 
     $FailureCategory = "prior-task-capture"
@@ -727,6 +941,20 @@ try {
         $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($PriorTaskXmlPath, $PriorTaskXml, $Utf8WithoutBom)
         Set-RestrictedAcl $PriorTaskXmlPath
+    }
+    $PriorSessionTask = Get-RegisteredTask -Folder $TaskFolder -Name $SessionTaskName
+    $PriorSessionTaskWasPresent = $null -ne $PriorSessionTask
+    if ($PriorSessionTaskWasPresent) {
+        $PriorSessionTaskXml = $PriorSessionTask.Xml
+        $PriorSessionTaskSddl =
+            $PriorSessionTask.GetSecurityDescriptor($TaskSecurityInformation)
+        $SessionXmlEncoding = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText(
+            $PriorSessionTaskXmlPath,
+            $PriorSessionTaskXml,
+            $SessionXmlEncoding
+        )
+        Set-RestrictedAcl $PriorSessionTaskXmlPath
     }
 
     $MutationStarted = $true
@@ -839,6 +1067,48 @@ try {
         Fail "replacement task readiness failed"
     }
 
+    $FailureCategory = "session-helper"
+    if (-not (Test-Path -LiteralPath $SessionRoot)) {
+        [void](Invoke-JournaledMutation -Name "session-root" `
+            -State $Journal.Session.Root -Action {
+                [System.IO.Directory]::CreateDirectory($SessionRoot) | Out-Null
+            })
+    }
+    Assert-SafeDirectory $SessionRoot "session root"
+    [void](Invoke-JournaledMutation -Name "session-root-acl" `
+        -State $Journal.Session.Restriction -Action {
+            Set-SessionAcl $SessionRoot
+        })
+    if ($SessionVenvWasPresent) {
+        $SessionBackupPath = Join-Path $BackupRoot "session-venv"
+        Copy-SafeTree -Source $SessionVenv -Destination $SessionBackupPath
+        Set-RestrictedAcl $SessionBackupPath -Recurse
+        $Journal.Session.BackupPrepared = $true
+        [void](Invoke-JournaledMutation -Name "remove-prior-session-runtime" `
+            -State $Journal.Session.Removal -Action {
+                Remove-SafePath $SessionVenv
+            })
+    }
+    [void](Invoke-JournaledMutation -Name "publish-session-runtime" `
+        -State $Journal.Session.Publish -Action {
+            Move-Item -LiteralPath $StageSessionVenv -Destination $SessionVenv
+        })
+    Set-SessionAcl $SessionVenv -Recurse
+    $SessionTaskXml = [System.IO.File]::ReadAllText($SessionTaskSource)
+    $SessionTask = Invoke-JournaledMutation -Name "register-session-task" `
+        -State $Journal.Session.TaskRegistration -Action {
+            $TaskFolder.RegisterTask(
+                $SessionTaskName,
+                $SessionTaskXml,
+                $TaskCreateOrUpdate,
+                $UsersAccount,
+                $null,
+                $TaskLogonGroup,
+                $null
+            )
+        }
+    if ($null -eq $SessionTask) { Fail "session task registration failed" }
+
     $DeploymentCommitted = $true
     $FailureCategory = "cleanup"
     Remove-SafePath $TransactionRoot
@@ -876,4 +1146,7 @@ catch {
     exit 1
 }
 
-if ($Succeeded) { Write-Host "monitor-agent install: task deployed" }
+if ($Succeeded) {
+    Write-Host "monitor-agent install: task deployed"
+    Write-Host "monitor-agent install: session helper starts at each user's next logon"
+}

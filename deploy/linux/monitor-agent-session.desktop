@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor Agent Session Helper
+Comment=Provides screen and active-window telemetry to the Monitor Agent service
+Exec=/opt/monitor-agent/venv/bin/python -m monitor_agent session-helper
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

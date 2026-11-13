@@ -17,11 +17,14 @@ from monitor_agent.models import DeliveryKind, DeliveryResult, JSONValue
 _REQUIRED_HEADER_FIELDS = ("event_id", "event", "machine_id", "schema_version")
 _SUCCESS_MESSAGE = "delivered"
 _AUTHENTICATION_MESSAGE = "authentication failed"
+_ENDPOINT_MESSAGE = "collector endpoint unavailable"
 _PERMANENT_MESSAGE = "delivery rejected"
 _STATUS_FAILURE_MESSAGE = "delivery failed"
 _TIMEOUT_MESSAGE = "request timed out"
 _CONNECTION_MESSAGE = "connection failed"
 _REQUEST_MESSAGE = "request failed"
+# Redirects and missing endpoints describe a collector configuration fault, not a bad record.
+_ENDPOINT_STATUSES = frozenset({404, 405, 410})
 
 
 def _current_time() -> datetime:
@@ -35,7 +38,7 @@ class TelemetryTransport:
         *,
         session: requests.Session | None = None,
         max_attempts: int = 4,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], object] = time.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
         if not config.collector_uri or not config.api_token:
@@ -65,6 +68,7 @@ class TelemetryTransport:
                     headers=headers,
                     timeout=(self._config.connect_timeout_sec, self._config.read_timeout_sec),
                     verify=True if self._config.ca_bundle is None else str(self._config.ca_bundle),
+                    allow_redirects=False,
                 )
             except requests.Timeout:
                 result = DeliveryResult(DeliveryKind.RETRIABLE, None, attempt, _TIMEOUT_MESSAGE)
@@ -85,7 +89,9 @@ class TelemetryTransport:
 
             if result.kind is not DeliveryKind.RETRIABLE or attempt == self._max_attempts:
                 return result
-            self._sleep(self._retry_delay(attempt, retry_after))
+            # A stop-aware sleep (for example ``threading.Event.wait``) returns True on shutdown.
+            if self._sleep(self._retry_delay(attempt, retry_after)) is True:
+                return result
 
         raise AssertionError("retry loop must return a delivery result")
 
@@ -122,6 +128,10 @@ class TelemetryTransport:
             return DeliveryKind.SUCCESS
         if status_code in {401, 403}:
             return DeliveryKind.AUTHENTICATION
+        if status_code is not None and (
+            300 <= status_code <= 399 or status_code in _ENDPOINT_STATUSES
+        ):
+            return DeliveryKind.ENDPOINT
         if status_code in {408, 425, 429} or (
             status_code is not None and 500 <= status_code <= 599
         ):
@@ -134,6 +144,8 @@ class TelemetryTransport:
             return _SUCCESS_MESSAGE
         if kind is DeliveryKind.AUTHENTICATION:
             return _AUTHENTICATION_MESSAGE
+        if kind is DeliveryKind.ENDPOINT:
+            return _ENDPOINT_MESSAGE
         if kind is DeliveryKind.PERMANENT:
             return _PERMANENT_MESSAGE
         return _STATUS_FAILURE_MESSAGE

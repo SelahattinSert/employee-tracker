@@ -70,7 +70,13 @@ class AgentRuntime:
                     logger.warning("delivery kind=corrupt status=dead_letter")
                     continue
 
-                result = self.transport.send(payload)
+                try:
+                    result = self.transport.send(payload)
+                except ValueError:
+                    # A record without delivery headers can never be sent; do not block the queue.
+                    logger.warning("delivery kind=invalid status=dead_letter")
+                    self.spool.reject(record)
+                    continue
                 event_id = cast(str, payload["event_id"])
                 self._log_delivery(event_id, result)
                 if result.kind is DeliveryKind.SUCCESS:
@@ -107,9 +113,15 @@ class AgentRuntime:
         self._log_delivery(event_id, result)
         if result.kind is DeliveryKind.SUCCESS:
             return CycleResult(event_id, True, False, result.kind)
-        if result.kind in (DeliveryKind.RETRIABLE, DeliveryKind.AUTHENTICATION):
+        if result.kind in (
+            DeliveryKind.RETRIABLE,
+            DeliveryKind.AUTHENTICATION,
+            DeliveryKind.ENDPOINT,
+        ):
             self._enqueue(payload)
             return CycleResult(event_id, False, True, result.kind)
+        # Keep permanently rejected live events for inspection, as replay does.
+        self.spool.reject(self.spool.enqueue(payload))
         return CycleResult(event_id, False, False, result.kind)
 
     def run(self) -> None:
@@ -136,7 +148,7 @@ class AgentRuntime:
         if self.stop_event.is_set():
             return
 
-        self.run_cycle("startup")
+        self._run_cycle_safely("startup")
         if self.stop_event.is_set():
             return
 
@@ -149,13 +161,20 @@ class AgentRuntime:
             if self.stop_event.is_set():
                 return
 
-            self.run_cycle("heartbeat")
+            self._run_cycle_safely("heartbeat")
             if self.stop_event.is_set():
                 return
 
             now = time.monotonic()
             while next_deadline <= now:
                 next_deadline += interval
+
+    def _run_cycle_safely(self, event: str) -> None:
+        """Keep the service alive when one cycle hits a transient local failure."""
+        try:
+            self.run_cycle(event)
+        except Exception as error:
+            logger.error("cycle event=%s failed error=%s", event, type(error).__name__)
 
     def _enqueue(self, payload: Mapping[str, JSONValue]) -> None:
         self.spool.enqueue(payload)

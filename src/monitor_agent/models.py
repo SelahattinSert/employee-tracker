@@ -11,6 +11,7 @@ class DeliveryKind(StrEnum):
     SUCCESS = "success"
     RETRIABLE = "retriable"
     AUTHENTICATION = "authentication"
+    ENDPOINT = "endpoint"
     PERMANENT = "permanent"
 
 

@@ -13,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy" / "linux"
 SERVICE = DEPLOY / "monitor-agent.service"
+SESSION_DESKTOP = DEPLOY / "monitor-agent-session.desktop"
 INSTALLER = DEPLOY / "install.sh"
 UNINSTALLER = DEPLOY / "uninstall.sh"
 ENV_EXAMPLE = DEPLOY / "monitor-agent.env.example"
@@ -27,8 +28,8 @@ EXPECTED_UNIT = {
     "Service": [
         "Type=simple",
         "EnvironmentFile=/etc/monitor-agent/monitor-agent.env",
-        "ExecStartPre=/opt/monitor-agent/venv/bin/monitor-agent check-config",
-        "ExecStart=/opt/monitor-agent/venv/bin/monitor-agent run",
+        "ExecStartPre=/opt/monitor-agent/venv/bin/python -m monitor_agent check-config",
+        "ExecStart=/opt/monitor-agent/venv/bin/python -m monitor_agent run",
         "Restart=on-failure",
         "RestartSec=30",
         "TimeoutStopSec=45",
@@ -45,7 +46,7 @@ EXPECTED_UNIT = {
         "RestrictSUIDSGID=true",
         "LockPersonality=true",
         "MemoryDenyWriteExecute=true",
-        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "SystemCallArchitectures=native",
         "UMask=0077",
         "ReadWritePaths=/var/lib/monitor-agent",
@@ -69,6 +70,7 @@ EXPECTED_ENVIRONMENT = [
     "MONITOR_SCREENSHOT_ENABLED=false",
     "MONITOR_SCREENSHOT_MAX_BYTES=5242880",
     "MONITOR_EMPLOYEE_NOTICE_ACK=false",
+    "MONITOR_SESSION_SOURCE=helper",
     "MONITOR_LOG_FORMAT=json",
 ]
 
@@ -150,6 +152,7 @@ fail "monitor-agent uninstall: service is still enabled"
 fail "monitor-agent uninstall: unable to verify service disabled"
 ;;
 esac
+rm -f -- /etc/xdg/autostart/monitor-agent-session.desktop
 rm -rf -- /opt/monitor-agent
 rm -f -- /etc/systemd/system/monitor-agent.service
 if [ "$purge" -eq 1 ]; then
@@ -163,6 +166,7 @@ printf '%s\\n' "monitor-agent uninstall: service removed"
 )
 
 ALLOWED_UNINSTALLER_DELETION_LINES = (
+    "rm -f -- /etc/xdg/autostart/monitor-agent-session.desktop",
     "rm -rf -- /opt/monitor-agent",
     "rm -f -- /etc/systemd/system/monitor-agent.service",
     "rm -rf -- /etc/monitor-agent /var/lib/monitor-agent",
@@ -198,6 +202,10 @@ def _write_test_installer(source: Path, destination: Path, stage: Path) -> None:
         "unit_file=/etc/systemd/system/monitor-agent.service": (
             f"unit_file={stage}/etc/systemd/system/monitor-agent.service"
         ),
+        "xdg_autostart_dir=/etc/xdg/autostart": f"xdg_autostart_dir={stage}/etc/xdg/autostart",
+        "autostart_file=/etc/xdg/autostart/monitor-agent-session.desktop": (
+            f"autostart_file={stage}/etc/xdg/autostart/monitor-agent-session.desktop"
+        ),
     }
     for expected, replacement in replacements.items():
         text = _replace_once(text, expected, replacement)
@@ -214,6 +222,9 @@ def _write_test_uninstaller(source: Path, destination: Path, stage: Path) -> Non
         'if [ "$EUID" -ne 0 ] && [ "${MONITOR_AGENT_TEST_BYPASS_ROOT:-}" != 1 ]; then',
     )
     replacements = {
+        "rm -f -- /etc/xdg/autostart/monitor-agent-session.desktop": (
+            f"rm -f -- {stage}/etc/xdg/autostart/monitor-agent-session.desktop"
+        ),
         "rm -rf -- /opt/monitor-agent": f"rm -rf -- {stage}/opt/monitor-agent",
         "rm -f -- /etc/systemd/system/monitor-agent.service": (
             f"rm -f -- {stage}/etc/systemd/system/monitor-agent.service"
@@ -336,6 +347,7 @@ class Harness:
         self.linux = self.project / "deploy" / "linux"
         self.linux.mkdir(parents=True)
         shutil.copy2(SERVICE, self.linux / "monitor-agent.service")
+        shutil.copy2(SESSION_DESKTOP, self.linux / "monitor-agent-session.desktop")
         shutil.copy2(ROOT / "requirements.lock", self.project / "requirements.lock")
         if readme:
             (self.project / "README.md").write_text("deployment guide\n", encoding="utf-8")
@@ -380,6 +392,10 @@ class Harness:
     @property
     def unit(self) -> Path:
         return self.stage / "etc" / "systemd" / "system" / "monitor-agent.service"
+
+    @property
+    def autostart(self) -> Path:
+        return self.stage / "etc" / "xdg" / "autostart" / "monitor-agent-session.desktop"
 
     @property
     def managed_directories(self) -> list[Path]:
@@ -659,7 +675,8 @@ if [ "${FAKE_SWAP_TRIGGER:-}" = "rollback-delete" ] \
 fi
 case " $* " in
     *" /opt/monitor-agent "* | *" /etc/monitor-agent "* | \
-        *" /var/lib/monitor-agent "* | *" /etc/systemd/system/monitor-agent.service "*)
+        *" /var/lib/monitor-agent "* | *" /etc/systemd/system/monitor-agent.service "* | \
+        *" /etc/xdg/autostart/monitor-agent-session.desktop "*)
         exit 0
         ;;
 esac
@@ -1445,6 +1462,8 @@ def test_two_successful_installs_are_fresh_idempotent_and_preserve_state(
     assert stat.S_IMODE(harness.config.stat().st_mode) == 0o600
     assert stat.S_IMODE(harness.state_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(harness.unit.stat().st_mode) == 0o644
+    assert harness.autostart.read_bytes() == SESSION_DESKTOP.read_bytes()
+    assert stat.S_IMODE(harness.autostart.stat().st_mode) == 0o644
     assert _state(harness.service_state) == (1, 1)
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count(" <-m> <venv>") == 2
@@ -1508,10 +1527,31 @@ def test_copied_uninstaller_preserves_config_and_state_by_default_in_order(
         "systemctl <disable> <--now> <--> <monitor-agent.service>",
         "systemctl <is-active> <--> <monitor-agent.service>",
         "systemctl <is-enabled> <--> <monitor-agent.service>",
+        f"rm <-f> <--> <{harness.autostart}>",
         f"rm <-rf> <--> <{harness.runtime}>",
         f"rm <-f> <--> <{harness.unit}>",
         "systemctl <daemon-reload>",
     ]
+
+
+def test_installed_session_helper_autostart_is_removed_by_uninstaller(tmp_path: Path) -> None:
+    harness = Harness(tmp_path)
+    assert harness.install().returncode == 0
+    assert harness.autostart.exists()
+
+    result = harness.uninstall()
+
+    assert result.returncode == 0, result.stderr
+    assert not harness.autostart.exists()
+
+
+def test_session_helper_autostart_runs_the_installed_agent() -> None:
+    lines = SESSION_DESKTOP.read_text(encoding="utf-8").splitlines()
+
+    assert lines[0] == "[Desktop Entry]"
+    assert "Type=Application" in lines
+    assert "Exec=/opt/monitor-agent/venv/bin/python -m monitor_agent session-helper" in lines
+    assert "Terminal=false" in lines
 
 
 def test_copied_uninstaller_purges_only_with_explicit_argument(tmp_path: Path) -> None:

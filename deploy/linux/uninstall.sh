@@ -53,6 +53,7 @@ case "$enabled_status:$enabled_state" in
         ;;
 esac
 
+rm -f -- /etc/xdg/autostart/monitor-agent-session.desktop
 rm -rf -- /opt/monitor-agent
 rm -f -- /etc/systemd/system/monitor-agent.service
 

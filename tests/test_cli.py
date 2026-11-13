@@ -851,11 +851,17 @@ def test_create_runtime_wires_accepted_components(
     collectors = cast(list[Collector], [SimpleNamespace(name="system")])
     transport = SimpleNamespace()
     spool = SimpleNamespace()
-    stop_event = SimpleNamespace()
+    stop_event = SimpleNamespace(wait=lambda timeout: False)
     calls: dict[str, object] = {}
+    transport_sleeps: list[object] = []
     monkeypatch.setattr(cli, "resolve_machine_identity", lambda path: identity)
     monkeypatch.setattr(cli, "build_collectors", lambda value, machine: collectors)
-    monkeypatch.setattr(cli, "TelemetryTransport", lambda value: transport)
+
+    def fake_transport(value: object, *, sleep: object) -> object:
+        transport_sleeps.append(sleep)
+        return transport
+
+    monkeypatch.setattr(cli, "TelemetryTransport", fake_transport)
     monkeypatch.setattr(cli, "Spool", lambda *args: spool)
     monkeypatch.setattr(cli.threading, "Event", lambda: stop_event)
 
@@ -876,3 +882,4 @@ def test_create_runtime_wires_accepted_components(
         "spool": spool,
         "stop_event": stop_event,
     }
+    assert transport_sleeps == [stop_event.wait]

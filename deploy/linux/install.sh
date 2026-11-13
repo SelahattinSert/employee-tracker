@@ -20,6 +20,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 requirements_path="$project_root/requirements.lock"
 service_path="$script_dir/monitor-agent.service"
+session_desktop_path="$script_dir/monitor-agent-session.desktop"
 readme_path="$project_root/README.md"
 python_command=${MONITOR_AGENT_PYTHON:-python3.11}
 
@@ -41,6 +42,9 @@ if [ ! -f "$requirements_path" ] || [ -L "$requirements_path" ]; then
 fi
 if [ ! -f "$service_path" ] || [ -L "$service_path" ]; then
     fail "monitor-agent install: invalid service file"
+fi
+if [ ! -f "$session_desktop_path" ] || [ -L "$session_desktop_path" ]; then
+    fail "monitor-agent install: invalid session helper file"
 fi
 if ! command -v "$python_command" >/dev/null 2>&1; then
     fail "monitor-agent install: Python interpreter not found"
@@ -76,6 +80,8 @@ var_parent=/var
 var_lib_dir=/var/lib
 state_dir=/var/lib/monitor-agent
 unit_file=/etc/systemd/system/monitor-agent.service
+xdg_autostart_dir=/etc/xdg/autostart
+autostart_file=/etc/xdg/autostart/monitor-agent-session.desktop
 
 managed_dirs=(
     "$opt_parent"
@@ -374,6 +380,7 @@ install -d -m 0755 -- "$staged_runtime"
 if [ -f "$readme_path" ]; then
     install -m 0644 -- "$readme_path" "$staged_runtime/README.md"
 fi
+install -m 0644 -- "$session_desktop_path" "$staged_runtime/monitor-agent-session.desktop"
 
 environment_stage=$(mktemp -- "$config_dir/.monitor-agent.env.stage.XXXXXX")
 install -m 0600 -- "$environment_path" "$environment_stage"
@@ -430,6 +437,14 @@ if ! read_active_state || [ "$observed_active" -ne 1 ]; then
 fi
 
 installation_committed=1
+# The session helper runs in each graphical login so screenshots and window data come
+# from the user's desktop; the root service cannot see it.
+if [ -L "$xdg_autostart_dir" ] || [ -L "$autostart_file" ] ||
+    ! install -d -m 0755 -- "$xdg_autostart_dir" ||
+    ! install -m 0644 -- "$install_dir/monitor-agent-session.desktop" "$autostart_file"
+then
+    fail "monitor-agent install: session helper registration failed"
+fi
 if ! cleanup_artifacts; then
     fail "monitor-agent install: cleanup failed"
 fi

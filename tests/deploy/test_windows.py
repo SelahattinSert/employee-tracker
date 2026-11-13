@@ -37,6 +37,14 @@ KNOWN_ENVIRONMENT_KEYS = {
     "MONITOR_PROCESS_CMDLINE_MODE",
     "MONITOR_INCLUDE_NETWORK_CONNECTIONS",
     "MONITOR_INCLUDE_SOFTWARE",
+    "MONITOR_INCLUDE_ACTIVE_WINDOW",
+    "MONITOR_AUDIT_PATHS",
+    "MONITOR_AUDIT_MAX_FILES",
+    "MONITOR_AUDIT_MAX_FILE_BYTES",
+    "MONITOR_SCREENSHOT_ENABLED",
+    "MONITOR_SCREENSHOT_MAX_BYTES",
+    "MONITOR_EMPLOYEE_NOTICE_ACK",
+    "MONITOR_SESSION_SOURCE",
     "MONITOR_LOG_PATH",
     "MONITOR_LOG_FORMAT",
     "MONITOR_LOG_LEVEL",
@@ -185,7 +193,8 @@ def test_launcher_strictly_parses_known_environment_and_runs_entry_point() -> No
     assert "Clear-KnownEnvironment" in text
     assert "Test-RegularFile" in text
     assert "ReparsePoint" in text
-    assert "& $AgentPath $Command" in text
+    assert "& $AgentPath -m monitor_agent $Command" in text
+    assert "monitor-agent.exe" not in text
     assert "exit $LASTEXITCODE" in text
 
 
@@ -223,7 +232,7 @@ def test_launcher_isolates_staged_path_validation_after_strict_live_path_checks(
         '[Environment]::SetEnvironmentVariable($Parts[0], $Parts[1], "Process")',
         "Assert-LivePathConfiguration",
         "Set-PathValidationOverride",
-        "& $AgentPath $Command",
+        "& $AgentPath -m monitor_agent $Command",
     )
 
 
@@ -557,6 +566,11 @@ def test_transformed_real_journal_control_flow_injects_each_boundary_failure() -
         "create-state-directory",
         "register-task",
         "start-task",
+        "session-root",
+        "session-root-acl",
+        "remove-prior-session-runtime",
+        "publish-session-runtime",
+        "register-session-task",
     }
 
     def run_transformed(failure_position: str) -> tuple[bool, bool, bool]:
@@ -1435,6 +1449,19 @@ else {
         assert (removed_root / "spool" / "preserved.txt").exists()
 
 
+def test_launcher_allows_every_key_in_the_shipped_environment_example() -> None:
+    example_keys = {
+        line.split("=", 1)[0]
+        for line in _script(ENV_EXAMPLE).splitlines()
+        if line and not line.startswith("#")
+    }
+    launcher = _script(LAUNCHER)
+
+    assert example_keys <= KNOWN_ENVIRONMENT_KEYS
+    for key in example_keys:
+        assert f'"{key}"' in launcher
+
+
 def test_windows_environment_example_has_safe_baseline_values() -> None:
     values = dict(
         line.split("=", 1)
@@ -1477,13 +1504,14 @@ def test_powershell_parser_and_environment_runtime_are_skipped_without_pwsh() ->
     with tempfile.TemporaryDirectory() as temporary_directory:
         install_root = Path(temporary_directory) / "Monitor Agent With Spaces"
         config = install_root / "monitor-agent.env"
-        expected_agent = install_root / "venv" / "Scripts" / "monitor-agent.exe"
+        expected_agent = install_root / "venv" / "Scripts" / "python.exe"
         expected_agent.parent.mkdir(parents=True)
         expected_agent.write_bytes(b"regular-file-placeholder")
         capture = Path(temporary_directory) / "captured environment.json"
         fake_agent = Path(temporary_directory) / "fake monitor agent.ps1"
         fake_agent.write_text(
-            """param([string]$Command)
+            """param([string]$Module, [string]$Command)
+if ($Module -ne "monitor_agent") { exit 97 }
 $Captured = @{
     Command = $Command
     Collector = $env:MONITOR_COLLECTOR_URI
@@ -1502,7 +1530,7 @@ exit 0
         transformed_launcher.write_text(
             _script(LAUNCHER)
             .replace(
-                '$AgentPath = Join-Path $InstallRoot "venv\\Scripts\\monitor-agent.exe"',
+                '$AgentPath = Join-Path $InstallRoot "venv\\Scripts\\python.exe"',
                 f"$AgentPath = {_ps_literal(fake_agent)}",
             )
             .replace(
@@ -1639,3 +1667,95 @@ exit 0
             assert not capture.exists()
             if rejected_secret is not None:
                 assert rejected_secret not in invalid.stdout + invalid.stderr
+
+
+SESSION_TASK = WINDOWS / "monitor_agent_session_task.xml"
+
+
+def test_session_task_runs_helper_for_each_logged_on_user_with_least_privilege() -> None:
+    root = ElementTree.parse(SESSION_TASK).getroot()
+    assert root.get("version") == "1.4"
+    triggers = root.find(_tag("Triggers"))
+    assert triggers is not None
+    assert [child.tag for child in triggers] == [_tag("LogonTrigger")]
+    principal = root.find(f"{_tag('Principals')}/{_tag('Principal')}")
+    assert principal is not None
+    assert principal.findtext(_tag("GroupId")) == "S-1-5-32-545"
+    assert principal.findtext(_tag("RunLevel")) == "LeastPrivilege"
+    assert principal.find(_tag("UserId")) is None
+    settings = root.find(_tag("Settings"))
+    assert settings is not None
+    assert settings.findtext(_tag("MultipleInstancesPolicy")) == "Parallel"
+    assert settings.findtext(_tag("ExecutionTimeLimit")) == "PT0S"
+    execs = root.findall(f"{_tag('Actions')}/{_tag('Exec')}")
+    assert len(execs) == 1
+    assert execs[0].findtext(_tag("Command")) == (
+        "C:\\Program Files\\MonitorAgentSession\\venv\\Scripts\\pythonw.exe"
+    )
+    assert execs[0].findtext(_tag("Arguments")) == "-m monitor_agent session-helper"
+    assert "ProgramData" not in SESSION_TASK.read_text(encoding="utf-8")
+
+
+def test_session_runtime_acl_grants_users_read_execute_only() -> None:
+    acl_function = _function(_script(INSTALLER), "Set-SessionAcl")
+    assert '"*S-1-5-32-545:(OI)(CI)RX"' in acl_function
+    assert "AreAccessRulesProtected" in acl_function
+    assert "FileSystemRights]::Write" in acl_function
+    assert "FileSystemRights]::Delete" in acl_function
+    assert "ChangePermissions" in acl_function
+    assert "TakeOwnership" in acl_function
+    assert '"*S-1-5-32-545:(OI)(CI)F"' not in acl_function
+
+
+def test_installer_stages_separate_session_runtime_without_configuration() -> None:
+    text = _script(INSTALLER)
+    assert '$SessionRoot = "C:\\Program Files\\MonitorAgentSession"' in text
+    _assert_ordered(
+        text,
+        '$StageSessionVenv = Join-Path $TransactionRoot "session-venv"',
+        "& $StageSessionPython -m pip install --require-hashes -r $StageLock",
+        "& $StageSessionPython -m pip install --no-deps --force-reinstall $StageWheel",
+        '$FailureCategory = "session-helper"',
+        "Set-SessionAcl $SessionRoot",
+        "Move-Item -LiteralPath $StageSessionVenv -Destination $SessionVenv",
+        "Set-SessionAcl $SessionVenv -Recurse",
+        "-State $Journal.Session.TaskRegistration -Action",
+        "$DeploymentCommitted = $true",
+    )
+    session_block = text[text.index('$FailureCategory = "session-helper"') :]
+    session_block = session_block[: session_block.index("$DeploymentCommitted = $true")]
+    assert "monitor-agent.env" not in session_block
+    assert "$TaskLogonGroup" in session_block
+
+
+def test_installer_rolls_back_session_runtime_and_task() -> None:
+    text = _script(INSTALLER)
+    rollback = _function(text, "Invoke-Rollback")
+    verification = _function(text, "Test-RollbackState")
+    assert "$Journal.Session.TaskRegistration.Attempted" in rollback
+    assert "$TaskFolder.DeleteTask($SessionTaskName, 0)" in rollback
+    assert "$PriorSessionTaskXmlPath" in rollback
+    assert "$Journal.Session.Publish.Completed" in rollback
+    assert "Restore-FileSystemSecurityTree $Journal.Session.SecuritySnapshots" in rollback
+    assert "$SessionVenvWasPresent" in verification
+    assert "$PriorSessionTaskWasPresent" in verification
+    _assert_ordered(
+        rollback,
+        "$Journal.Session.TaskRegistration.Attempted",
+        "if (-not (Test-RollbackState))",
+    )
+
+
+def test_uninstaller_removes_session_task_and_runtime_before_install_root_checks() -> None:
+    text = _script(UNINSTALLER)
+    live_flow = text[text.index("try {\n    $Principal") :]
+    _assert_ordered(
+        live_flow,
+        "Verify-TaskAbsent -Folder $TaskFolder",
+        "$TaskFolder.DeleteTask($SessionTaskName, 0)",
+        "Remove-SafePath -Path $SessionRoot -ExpectedDirectory $true",
+        "if (-not (Test-Path -LiteralPath $InstallRoot))",
+    )
+    assert 'Assert-SafeTree $SessionRoot "session tree"' in _function(
+        text, "Assert-UninstallTargetsSafe"
+    )

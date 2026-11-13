@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from collections.abc import Mapping
@@ -9,6 +10,8 @@ from typing import Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
 ProcessCmdlineMode: TypeAlias = Literal["none", "redacted", "full"]
+SessionSource: TypeAlias = Literal["direct", "helper"]
+_LOG_LEVELS = tuple(name for name in logging.getLevelNamesMapping() if name != "NOTSET")
 
 
 class ConfigError(ValueError):
@@ -40,6 +43,7 @@ class AgentConfig:
     screenshot_enabled: bool
     screenshot_max_bytes: int
     employee_notice_acknowledged: bool
+    session_source: SessionSource
     log_path: Path | None
     log_format: Literal["text", "json"]
     log_level: str
@@ -152,10 +156,19 @@ def load_config(
         raise ConfigError("MONITOR_PROCESS_CMDLINE_MODE must be none, redacted, or full")
     process_cmdline_mode = cast(ProcessCmdlineMode, process_cmdline_value)
 
+    session_source_value = source.get("MONITOR_SESSION_SOURCE", "direct")
+    if session_source_value not in {"direct", "helper"}:
+        raise ConfigError("MONITOR_SESSION_SOURCE must be direct or helper")
+    session_source = cast(SessionSource, session_source_value)
+
     log_format_value = source.get("MONITOR_LOG_FORMAT", "text")
     if log_format_value not in {"text", "json"}:
         raise ConfigError("MONITOR_LOG_FORMAT must be text or json")
     log_format = cast(Literal["text", "json"], log_format_value)
+
+    log_level = source.get("MONITOR_LOG_LEVEL", "INFO").upper()
+    if log_level not in _LOG_LEVELS:
+        raise ConfigError(f"MONITOR_LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}")
 
     spool_path_value = source.get("MONITOR_SPOOL_PATH")
     log_path_value = source.get("MONITOR_LOG_PATH")
@@ -224,7 +237,8 @@ def load_config(
             52428800,
         ),
         employee_notice_acknowledged=employee_notice_acknowledged,
+        session_source=session_source,
         log_path=Path(log_path_value) if log_path_value else _default_log_path(platform),
         log_format=log_format,
-        log_level=source.get("MONITOR_LOG_LEVEL", "INFO").upper(),
+        log_level=log_level,
     )

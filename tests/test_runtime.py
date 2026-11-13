@@ -249,12 +249,15 @@ def test_run_cycle_collects_and_builds_one_payload_once(
     assert result.event_id == built_payload["event_id"]
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.AUTHENTICATION, DeliveryKind.RETRIABLE])
+@pytest.mark.parametrize(
+    "kind", [DeliveryKind.AUTHENTICATION, DeliveryKind.ENDPOINT, DeliveryKind.RETRIABLE]
+)
 def test_replay_retains_record_and_stops_on_temporary_delivery_failure(
     tmp_path: Path,
     kind: DeliveryKind,
 ) -> None:
-    transport = FakeTransport([delivery(kind, 401 if kind is DeliveryKind.AUTHENTICATION else 503)])
+    status = {DeliveryKind.AUTHENTICATION: 401, DeliveryKind.ENDPOINT: 404}.get(kind, 503)
+    transport = FakeTransport([delivery(kind, status)])
     agent = runtime(tmp_path, transport)
     blocked = agent.spool.enqueue(queued_payload(1))
     later = agent.spool.enqueue(queued_payload(2))
@@ -327,12 +330,15 @@ def test_run_cycle_spools_live_payload_without_sending_when_backlog_remains(
     assert result.event_id == pending_event_ids[1]
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.AUTHENTICATION, DeliveryKind.RETRIABLE])
+@pytest.mark.parametrize(
+    "kind", [DeliveryKind.AUTHENTICATION, DeliveryKind.ENDPOINT, DeliveryKind.RETRIABLE]
+)
 def test_run_cycle_spools_live_temporary_failure_with_same_event_id(
     tmp_path: Path,
     kind: DeliveryKind,
 ) -> None:
-    transport = FakeTransport([delivery(kind, 401 if kind is DeliveryKind.AUTHENTICATION else 503)])
+    status = {DeliveryKind.AUTHENTICATION: 401, DeliveryKind.ENDPOINT: 404}.get(kind, 503)
+    transport = FakeTransport([delivery(kind, status)])
     agent = runtime(tmp_path, transport)
 
     result = agent.run_cycle("startup")
@@ -349,7 +355,7 @@ def test_run_cycle_spools_live_temporary_failure_with_same_event_id(
     assert queued["event"] == "startup"
 
 
-def test_run_cycle_does_not_spool_permanent_live_rejection(
+def test_run_cycle_dead_letters_permanent_live_rejection(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -362,6 +368,9 @@ def test_run_cycle_does_not_spool_permanent_live_rejection(
     assert result.delivered is False
     assert result.spooled is False
     assert agent.spool.pending() == []
+    dead_letters = list((tmp_path / "dead-letter").glob("*.rejected.json"))
+    assert len(dead_letters) == 1
+    assert json.loads(dead_letters[0].read_text(encoding="utf-8"))["event_id"] == result.event_id
     assert result.event_id in caplog.text
     assert "message that must not be logged" not in caplog.text
     assert "token" not in caplog.text
@@ -503,18 +512,66 @@ def test_run_checks_stop_before_heartbeat_cycle(
     assert transport.close_calls == 1
 
 
-def test_run_closes_transport_once_and_preserves_cycle_error(tmp_path: Path) -> None:
+class _AbortCycle(BaseException):
+    pass
+
+
+def test_run_closes_transport_once_and_preserves_cycle_abort(tmp_path: Path) -> None:
     transport = RaisingCloseTransport([])
     agent = runtime(tmp_path, transport, stop_event=ScriptedEvent([False]))
 
+    def abort_cycle(name: str) -> None:
+        raise _AbortCycle(f"cycle aborted: {name}")
+
+    agent.run_cycle = abort_cycle  # type: ignore[method-assign]
+
+    with pytest.raises(_AbortCycle, match="cycle aborted: startup"):
+        agent.run()
+    assert transport.close_calls == 1
+
+
+def test_run_logs_cycle_error_and_keeps_running(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = FakeTransport([])
+    agent = runtime(tmp_path, transport, stop_event=ScriptedEvent([False, False, True]))
+    cycles: list[str] = []
+
     def fail_cycle(name: str) -> None:
-        raise ValueError(f"cycle failed: {name}")
+        cycles.append(name)
+        raise OSError("disk full: secret detail")
 
     agent.run_cycle = fail_cycle  # type: ignore[method-assign]
 
-    with pytest.raises(ValueError, match="cycle failed: startup"):
-        agent.run()
+    agent.run()
+
+    assert cycles == ["startup", "heartbeat"]
+    assert "cycle event=startup failed error=OSError" in caplog.text
+    assert "secret detail" not in caplog.text
     assert transport.close_calls == 1
+
+
+def test_replay_dead_letters_record_that_cannot_be_sent(tmp_path: Path) -> None:
+    class RejectingTransport(FakeTransport):
+        def send(self, payload: Mapping[str, JSONValue]) -> DeliveryResult:
+            if "machine_id" not in payload:
+                raise ValueError("payload is missing required delivery fields")
+            return super().send(payload)
+
+    transport = RejectingTransport([delivery(DeliveryKind.SUCCESS, 200)])
+    agent = runtime(tmp_path, transport)
+    broken = queued_payload(1)
+    del broken["machine_id"]
+    agent.spool.enqueue(broken, now=datetime(2099, 7, 19, tzinfo=UTC))
+    agent.spool.enqueue(queued_payload(2), now=datetime(2099, 7, 20, tzinfo=UTC))
+
+    assert agent.replay() is True
+
+    assert agent.spool.stats().dead_letter_count == 1
+    assert [payload["event_id"] for payload in transport.payloads] == [
+        queued_payload(2)["event_id"]
+    ]
 
 
 def test_run_propagates_close_error_without_a_primary_error(tmp_path: Path) -> None:

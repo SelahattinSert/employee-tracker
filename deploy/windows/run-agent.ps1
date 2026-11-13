@@ -8,7 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 $PathValidationRequested = $PSBoundParameters.ContainsKey("PathValidationRoot")
 $ConfigPath = Join-Path $InstallRoot "monitor-agent.env"
-$AgentPath = Join-Path $InstallRoot "venv\Scripts\monitor-agent.exe"
+# The venv is built in a staging directory and moved into place, so console-script launchers
+# point at the staging path; the venv interpreter itself stays valid after the move.
+$AgentPath = Join-Path $InstallRoot "venv\Scripts\python.exe"
 $KnownEnvironmentKeys = @(
     "MONITOR_COLLECTOR_URI",
     "MONITOR_API_TOKEN",
@@ -26,6 +28,14 @@ $KnownEnvironmentKeys = @(
     "MONITOR_PROCESS_CMDLINE_MODE",
     "MONITOR_INCLUDE_NETWORK_CONNECTIONS",
     "MONITOR_INCLUDE_SOFTWARE",
+    "MONITOR_INCLUDE_ACTIVE_WINDOW",
+    "MONITOR_AUDIT_PATHS",
+    "MONITOR_AUDIT_MAX_FILES",
+    "MONITOR_AUDIT_MAX_FILE_BYTES",
+    "MONITOR_SCREENSHOT_ENABLED",
+    "MONITOR_SCREENSHOT_MAX_BYTES",
+    "MONITOR_EMPLOYEE_NOTICE_ACK",
+    "MONITOR_SESSION_SOURCE",
     "MONITOR_LOG_PATH",
     "MONITOR_LOG_FORMAT",
     "MONITOR_LOG_LEVEL"
@@ -162,5 +172,5 @@ foreach ($Line in Get-Content -LiteralPath $ConfigPath -Encoding UTF8) {
 
 Assert-LivePathConfiguration
 Set-PathValidationOverride
-& $AgentPath $Command
+& $AgentPath -m monitor_agent $Command
 exit $LASTEXITCODE

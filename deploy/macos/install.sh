@@ -22,6 +22,7 @@ project_root=$(CDPATH=''; export CDPATH; cd -P "$script_dir/../.." && pwd -P) ||
 requirements_path="$project_root/requirements.lock"
 launcher_source="$script_dir/run-agent.sh"
 plist_source="$script_dir/com.company.monitor-agent.plist"
+session_plist_source="$script_dir/com.company.monitor-agent.session.plist"
 python_command=${MONITOR_AGENT_PYTHON:-python3.11}
 
 install_root="/Library/Application Support/MonitorAgent"
@@ -32,12 +33,17 @@ spool_root="$install_root/spool"
 plist_parent="/Library/LaunchDaemons"
 plist_target="/Library/LaunchDaemons/com.company.monitor-agent.plist"
 launchd_label=com.company.monitor-agent
+# The session helper runs as each logged-in user, so it gets its own world-readable runtime
+# copy; the service runtime and its secret configuration stay owner-only.
+session_root="/Library/Application Support/MonitorAgentSession"
+session_plist_parent="/Library/LaunchAgents"
+session_plist_target="/Library/LaunchAgents/com.company.monitor-agent.session.plist"
 
 case "$wheel_path" in
     *.whl) ;;
     *) fail "monitor-agent install: invalid wheel" ;;
 esac
-for input_file in "$wheel_path" "$environment_path" "$requirements_path" "$launcher_source" "$plist_source"; do
+for input_file in "$wheel_path" "$environment_path" "$requirements_path" "$launcher_source" "$plist_source" "$session_plist_source"; do
     if [ ! -f "$input_file" ] || [ -L "$input_file" ]; then
         fail "monitor-agent install: invalid deployment input"
     fi
@@ -105,6 +111,19 @@ verify_owner_mode() {
     fi
 }
 
+ensure_public_directory() {
+    public_path=$1
+    if [ ! -e "$public_path" ]; then
+        install -d -m 0755 "$public_path" || fail "monitor-agent install: directory creation failed"
+        chown root:wheel "$public_path" || fail "monitor-agent install: ownership update failed"
+        chmod 0755 "$public_path" || fail "monitor-agent install: mode update failed"
+    fi
+    if [ ! -d "$public_path" ] || [ -L "$public_path" ]; then
+        fail "monitor-agent install: unsafe deployment target"
+    fi
+    verify_owner_mode "$public_path" 755
+}
+
 ensure_secure_directory() {
     secure_path=$1
     if [ ! -e "$secure_path" ]; then
@@ -137,17 +156,23 @@ read_launchd_state() {
     return 1
 }
 
-for protected_path in "$app_parent" "$install_root" "$spool_root" "$log_parent" "$log_root" "$plist_parent"; do
+for protected_path in "$app_parent" "$install_root" "$spool_root" "$log_parent" "$log_root" "$plist_parent" "$session_root" "$session_plist_parent"; do
     assert_safe_directory_chain "$protected_path"
 done
 assert_safe_regular_target "$plist_target"
-for required_parent in "$app_parent" "$log_parent" "$plist_parent"; do
+assert_safe_regular_target "$session_plist_target"
+for required_parent in "$app_parent" "$log_parent" "$plist_parent" "$session_plist_parent"; do
     if [ ! -d "$required_parent" ] || [ -L "$required_parent" ]; then
         fail "monitor-agent install: unsafe deployment target"
     fi
 done
 if [ -e "$install_root/venv" ] || [ -L "$install_root/venv" ]; then
     if [ ! -d "$install_root/venv" ] || [ -L "$install_root/venv" ]; then
+        fail "monitor-agent install: unsafe deployment target"
+    fi
+fi
+if [ -e "$session_root/venv" ] || [ -L "$session_root/venv" ]; then
+    if [ ! -d "$session_root/venv" ] || [ -L "$session_root/venv" ]; then
         fail "monitor-agent install: unsafe deployment target"
     fi
 fi
@@ -174,11 +199,16 @@ if [ -d "$install_root/venv" ]; then prior_venv=1; else prior_venv=0; fi
 if [ -f "$install_root/run-agent.sh" ]; then prior_launcher=1; else prior_launcher=0; fi
 if [ -f "$install_root/monitor-agent.env" ]; then prior_environment=1; else prior_environment=0; fi
 if [ -f "$plist_target" ]; then prior_plist=1; else prior_plist=0; fi
+if [ -d "$session_root" ]; then prior_session_root=1; else prior_session_root=0; fi
+if [ -d "$session_root/venv" ]; then prior_session_venv=1; else prior_session_venv=0; fi
+if [ -f "$session_plist_target" ]; then prior_session_plist=1; else prior_session_plist=0; fi
 
 transaction_dir=
 backup_root=
 staged_root=
 staged_plist=
+staged_session=
+staged_session_plist=
 mutation_started=0
 daemon_state_mutated=0
 committed=0
@@ -190,6 +220,10 @@ venv_publication_completed=0
 launcher_publication_completed=0
 environment_publication_completed=0
 plist_publication_completed=0
+session_venv_backup_completed=0
+session_plist_backup_completed=0
+session_venv_publication_completed=0
+session_plist_publication_completed=0
 
 restore_launchdaemon() {
     restore_failed=0
@@ -277,7 +311,19 @@ rollback() {
             "$plist_target" "$backup_root/com.company.monitor-agent.plist" \
             "$prior_plist" "$plist_backup_completed" \
             "$plist_publication_completed" || rollback_failed=1
+        restore_component \
+            "$session_root/venv" "$backup_root/session-venv" \
+            "$prior_session_venv" "$session_venv_backup_completed" \
+            "$session_venv_publication_completed" || rollback_failed=1
+        restore_component \
+            "$session_plist_target" "$backup_root/com.company.monitor-agent.session.plist" \
+            "$prior_session_plist" "$session_plist_backup_completed" \
+            "$session_plist_publication_completed" || rollback_failed=1
         restore_launchdaemon || rollback_failed=1
+        if [ "$prior_session_root" -eq 0 ] && [ -d "$session_root" ] &&
+            [ ! -L "$session_root" ]; then
+            rmdir "$session_root" >/dev/null 2>&1 || rollback_failed=1
+        fi
         if [ "$prior_spool_root" -eq 0 ] && [ -d "$spool_root" ] &&
             [ ! -L "$spool_root" ]; then
             rmdir "$spool_root" >/dev/null 2>&1 || rollback_failed=1
@@ -354,6 +400,20 @@ install -d -m 0700 "$staged_root/.path-validation/spool" "$staged_root/.path-val
 chown -R root:wheel "$staged_root/.path-validation" || fail "monitor-agent install: ownership update failed"
 chmod 0700 "$staged_root/.path-validation" "$staged_root/.path-validation/spool" "$staged_root/.path-validation/logs" || fail "monitor-agent install: mode update failed"
 "$staged_root/run-agent.sh" check-config >/dev/null 2>&1 || fail "monitor-agent install: staged configuration failed"
+staged_session="$transaction_dir/session"
+install -d -m 0755 "$staged_session" || fail "monitor-agent install: staging failed"
+"$python_command" -m venv "$staged_session/venv" || fail "monitor-agent install: staging failed"
+"$staged_session/venv/bin/python" -m pip install --require-hashes -r "$requirements_path" || fail "monitor-agent install: dependency installation failed"
+"$staged_session/venv/bin/python" -m pip install --no-deps --force-reinstall "$wheel_path" || fail "monitor-agent install: wheel installation failed"
+chown -R root:wheel "$staged_session" || fail "monitor-agent install: ownership update failed"
+chmod -R go-w "$staged_session" || fail "monitor-agent install: mode update failed"
+chmod 0755 "$staged_session" "$staged_session/venv" || fail "monitor-agent install: mode update failed"
+verify_owner_mode "$staged_session/venv" 755
+staged_session_plist="$transaction_dir/com.company.monitor-agent.session.plist"
+install -m 0644 "$session_plist_source" "$staged_session_plist" || fail "monitor-agent install: staging failed"
+chown root:wheel "$staged_session_plist" || fail "monitor-agent install: ownership update failed"
+verify_owner_mode "$staged_session_plist" 644
+plutil -lint "$staged_session_plist" >/dev/null 2>&1 || fail "monitor-agent install: invalid LaunchAgent plist"
 
 mutation_started=1
 if [ "$prior_loaded" -eq 1 ]; then
@@ -394,6 +454,23 @@ verify_owner_mode "$install_root/run-agent.sh" 700
 verify_owner_mode "$install_root/monitor-agent.env" 600
 verify_owner_mode "$plist_target" 644
 "$install_root/run-agent.sh" check-config >/dev/null 2>&1 || fail "monitor-agent install: live configuration failed"
+ensure_public_directory "$session_root"
+if [ "$prior_session_venv" -eq 1 ]; then
+    mv "$session_root/venv" "$backup_root/session-venv" ||
+        fail "monitor-agent install: publish failed"
+    session_venv_backup_completed=1
+fi
+if [ "$prior_session_plist" -eq 1 ]; then
+    mv "$session_plist_target" "$backup_root/com.company.monitor-agent.session.plist" ||
+        fail "monitor-agent install: publish failed"
+    session_plist_backup_completed=1
+fi
+mv "$staged_session/venv" "$session_root/venv" || fail "monitor-agent install: publish failed"
+session_venv_publication_completed=1
+mv "$staged_session_plist" "$session_plist_target" || fail "monitor-agent install: publish failed"
+session_plist_publication_completed=1
+verify_owner_mode "$session_root/venv" 755
+verify_owner_mode "$session_plist_target" 644
 daemon_state_mutated=1
 launchctl bootstrap system "$plist_target" || fail "monitor-agent install: unable to bootstrap LaunchDaemon"
 launchctl enable system/com.company.monitor-agent || fail "monitor-agent install: unable to enable LaunchDaemon"
@@ -402,3 +479,4 @@ if ! read_launchd_state || [ "$launchd_loaded" -ne 1 ] || [ "$launchd_running" -
 fi
 committed=1
 printf '%s\n' "monitor-agent install: LaunchDaemon installed"
+printf '%s\n' "monitor-agent install: session helper starts at each user's next login"
