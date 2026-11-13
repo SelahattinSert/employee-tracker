@@ -867,6 +867,27 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
         "replacement"
     )
 """
+    session_stage_start = '    py "-$PythonVersion" -m venv $StageSessionVenv\n'
+    session_stage_end = (
+        '    if ($LASTEXITCODE -ne 0) { Fail "session wheel installation failed" }\n'
+    )
+    session_stage_replacement = """    [System.IO.Directory]::CreateDirectory(
+        (Join-Path $StageSessionVenv "Scripts")
+    ) | Out-Null
+    [System.IO.File]::WriteAllText($StageSessionPython, "python")
+    [System.IO.File]::WriteAllText(
+        (Join-Path $StageSessionVenv "Scripts\\pythonw.exe"),
+        "pythonw"
+    )
+"""
+    fake_session_acl = """function Set-SessionAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { throw "missing session ACL target" }
+    Add-Content -LiteralPath $global:TaskLogPath -Value ("session-acl:" + $Path)
+}"""
 
     with tempfile.TemporaryDirectory() as temporary_directory:
         harness_root = Path(temporary_directory)
@@ -934,6 +955,23 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
                 "    if (-not (Test-Path -LiteralPath $Path)) { return }",
             ),
         )
+        transformed_install = transformed_install.replace(
+            '$SessionRoot = "C:\\Program Files\\MonitorAgentSession"',
+            "$SessionRoot = __TEST_SESSION_ROOT__",
+        )
+        transformed_install = _replace_function(
+            transformed_install,
+            "Set-SessionAcl",
+            fake_session_acl,
+        )
+        session_start = transformed_install.index(session_stage_start)
+        session_end = transformed_install.index(session_stage_end, session_start)
+        session_end += len(session_stage_end)
+        transformed_install = (
+            transformed_install[:session_start]
+            + session_stage_replacement
+            + transformed_install[session_end:]
+        )
         stage_start = transformed_install.index(staged_commands_start)
         stage_end = transformed_install.index(staged_commands_end, stage_start)
         stage_end += len(staged_commands_end)
@@ -965,6 +1003,10 @@ def test_real_powershell_control_flow_handles_injected_deployment_failures() -> 
         transformed_uninstall = uninstaller.replace(
             '$InstallRoot = "C:\\ProgramData\\MonitorAgent"',
             "$InstallRoot = __TEST_INSTALL_ROOT__",
+        )
+        transformed_uninstall = transformed_uninstall.replace(
+            '$SessionRoot = "C:\\Program Files\\MonitorAgentSession"',
+            "$SessionRoot = __TEST_SESSION_ROOT__",
         )
         transformed_uninstall = transformed_uninstall.replace(admin_check, "")
         transformed_uninstall = _replace_function(
@@ -1050,9 +1092,11 @@ if (-not [string]::IsNullOrEmpty($PriorTaskXml)) {
 }
 $Folder = [pscustomobject]@{
     Task = $InitialTask
+    SessionTask = $null
 }
 $Folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
     param($Name)
+    if ($Name -eq "MonitorAgentSession") { return $this.SessionTask }
     if ($null -eq $this.Task) {
         if ($global:FailureMode -eq "query-fail") {
             throw [Runtime.InteropServices.COMException]::new("query", -1)
@@ -1074,12 +1118,22 @@ $Folder | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
 }
 $Folder | Add-Member -MemberType ScriptMethod -Name DeleteTask -Value {
     param($Name, $Flags)
+    if ($Name -eq "MonitorAgentSession") {
+        Add-Content -LiteralPath $global:TaskLogPath -Value "delete-session"
+        $this.SessionTask = $null
+        return
+    }
     Add-Content -LiteralPath $global:TaskLogPath -Value "delete"
     if ($global:FailureMode -eq "delete-fail") { throw "injected" }
     $this.Task = $null
 }
 $Folder | Add-Member -MemberType ScriptMethod -Name RegisterTask -Value {
     param($Name, $Xml, $Flags, $User, $Password, $LogonType, $Sddl)
+    if ($Name -eq "MonitorAgentSession") {
+        Add-Content -LiteralPath $global:TaskLogPath -Value "register-session"
+        $this.SessionTask = New-FakeTask -Xml $Xml -State 3 -Sddl ([string]$Sddl)
+        return $this.SessionTask
+    }
     $Encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Xml))
     $EncodedSddl = [Convert]::ToBase64String(
         [Text.Encoding]::UTF8.GetBytes([string]$Sddl)
@@ -1186,6 +1240,9 @@ else {
                 transformed_install.replace(
                     "__TEST_INSTALL_ROOT__",
                     _ps_literal(install_root),
+                ).replace(
+                    "__TEST_SESSION_ROOT__",
+                    _ps_literal(case_dir / "MonitorAgentSession"),
                 ),
                 encoding="utf-8",
             )
@@ -1362,6 +1419,9 @@ else {
                 transformed_uninstall.replace(
                     "__TEST_INSTALL_ROOT__",
                     _ps_literal(install_root),
+                ).replace(
+                    "__TEST_SESSION_ROOT__",
+                    _ps_literal(case_dir / "MonitorAgentSession"),
                 ),
                 encoding="utf-8",
             )
