@@ -119,7 +119,25 @@ sudo systemctl status monitor-agent.service
 sudo journalctl -u monitor-agent.service
 ```
 
-Windows, from elevated PowerShell:
+Windows, one-click package:
+
+```bash
+python scripts/build_windows_package.py            # dist/MonitorAgent-Windows-2.0.0.zip
+python scripts/build_windows_package.py --ca ca.crt  # also bundle a private CA certificate
+```
+
+CI also uploads the zip with the build artifacts. Copy it to the endpoint, extract it and
+double-click `Install.cmd`. It asks for administrator rights, then for the server address
+(`https://host:port`; `/api/v1/telemetry` is added when no path is given) and the agent API
+token (hidden input). The package contains no URL, token or configuration: `setup.ps1`
+writes the configuration to an owner-only temporary folder, passes it to `install.ps1` and
+deletes it. A bundled `ca.crt` is installed to `C:\ProgramData\MonitorAgentCA\ca.crt`
+and set as `MONITOR_CA_BUNDLE`. When Python 3.11-3.14 is missing, setup installs Python
+3.14 for all users with `winget` if available. For unattended installs run
+`deploy\windows\setup.ps1 -ServerUrl https://host:8443 -TokenFile C:\secure\token.txt`
+from an elevated PowerShell. `Uninstall.cmd` removes the tasks and runtimes.
+
+Windows, manual install from elevated PowerShell:
 
 The `deploy/windows/install.ps1` installer is the Windows deployment source.
 
