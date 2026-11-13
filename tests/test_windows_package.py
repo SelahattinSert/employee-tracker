@@ -111,6 +111,12 @@ def test_setup_enables_sensitive_collectors_after_notice_confirmation() -> None:
     assert 'return ($Answer.Trim() -notmatch "^[nN]")' in setup
     assert "[switch]$EmployeesNotified" in setup
     assert "[switch]$NoEmployeesNotified" in setup
+    # The opt-out must stay a real opt-out: -NoEmployeesNotified disables sensitive collection.
+    notice_fn = setup[setup.index("function Read-EmployeesNotified") :]
+    notice_fn = notice_fn[: notice_fn.index("\n}")]
+    assert "if ($NoEmployeesNotified) { return $false }" in notice_fn
+    assert "if ($EmployeesNotified) { return $true }" in notice_fn
+    assert "return $true }\n    if ($EmployeesNotified)" not in notice_fn
     # A confirmed notice turns the collectors and the compliance flag on together.
     notified_block = setup[
         setup.index("if ($Notified) {") : setup.index("Write-AgentConfiguration -Path")

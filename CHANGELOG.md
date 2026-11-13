@@ -8,8 +8,10 @@
 - Pillow 13.0.0 in canonical package metadata and the hash-locked deployment dependency set.
 - One-click Windows package (`scripts/build_windows_package.py`, `Install.cmd`, `setup.ps1`) that asks for the server address and API token at install time and ships no secrets.
 - One-click Linux and macOS packages (`scripts/build_unix_package.py`, `Install.sh`/`Install.command`, `setup.sh`) that ask for the server address, API token and a one-time employee-notice confirmation (default yes, enabling screenshots, active window and file audit) and ship no secrets.
+- `release` workflow that, on a version tag, builds a single-file installer per platform (Windows self-extracting `.exe`, Linux `.run`, macOS `.dmg`) and attaches them to the GitHub Release; `scripts/make_selfextract.sh` builds the Linux self-extractor. Installers ship no secrets.
 
 ### Fixed
+- Windows `setup.ps1` honours `-NoEmployeesNotified` again (it had been inverted to force sensitive collection on); the opt-out now disables screenshots, active window and file audit as documented, and a regression test guards it.
 - New collector data now survives payload construction and reports disabled or partial states honestly.
 - Windows audit path parsing preserves drive letters by using the platform path-list separator.
 - Screenshot and active-window failures no longer appear as successful empty captures.

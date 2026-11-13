@@ -107,6 +107,25 @@ monitor-agent once --event heartbeat --no-transmit
 python -m pytest
 ```
 
+## Download a ready-made installer
+
+Pushing a version tag (`vMAJOR.MINOR.PATCH`) runs the `release` workflow, which builds a
+single-file installer per platform and attaches them to the matching GitHub Release:
+
+| Platform | Asset | Double-click behaviour |
+| --- | --- | --- |
+| Windows | `MonitorAgent-Windows-<ver>-Setup.exe` | Self-extracting `.exe`; runs `Install.cmd` (asks for server address, token and the notice confirmation). |
+| Linux | `MonitorAgent-Linux-<ver>.run` | Self-extracting script; run `sudo ./…​.run` or "Run as Program". |
+| macOS | `MonitorAgent-macOS-<ver>.dmg` | Disk image; open it and double-click `Install.command`. |
+
+The installers contain no server URL, token or configuration; each one runs the platform
+setup wizard, which asks for those at install time. Download assets from the repository's
+**Releases** page (not Packages). To cut a release, tag a commit and push the tag:
+
+```bash
+git tag v2.0.0 && git push origin v2.0.0
+```
+
 ## Install the service
 
 Build the wheel first and provide a protected environment file. Installers require administrator or root privileges because they create service identities, protected runtime paths, and owner-only telemetry storage.
