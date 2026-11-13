@@ -25,6 +25,8 @@ venv_dir="$install_root/venv"
 launcher="$install_root/run-agent.sh"
 config_file="$install_root/monitor-agent.env"
 spool_dir="$install_root/spool"
+session_root="/Library/Application Support/MonitorAgentSession"
+session_plist_target="/Library/LaunchAgents/com.company.monitor-agent.session.plist"
 
 assert_safe_directory_chain() {
     safe_path=$1
@@ -52,7 +54,7 @@ assert_safe_path() {
     if [ -L "$path" ]; then
         fail "monitor-agent uninstall: unsafe deployment target"
     fi
-    if [ -e "$path" ] && [ ! -d "$path" ] && [ "$path" != "$plist_target" ] && [ "$path" != "$launcher" ]; then
+    if [ -e "$path" ] && [ ! -d "$path" ] && [ "$path" != "$plist_target" ] && [ "$path" != "$launcher" ] && [ "$path" != "$session_plist_target" ]; then
         fail "monitor-agent uninstall: unsafe deployment target"
     fi
 }
@@ -71,12 +73,15 @@ read_launchd_state() {
     return 1
 }
 
-for protected_path in "$install_root" "$log_root" "$(dirname "$plist_target")"; do
+for protected_path in "$install_root" "$log_root" "$(dirname "$plist_target")" "$session_root" "$(dirname "$session_plist_target")"; do
     assert_safe_directory_chain "$protected_path"
 done
-for protected_path in "$install_root" "$log_root" "$venv_dir" "$spool_dir"; do
+for protected_path in "$install_root" "$log_root" "$venv_dir" "$spool_dir" "$session_root"; do
     assert_safe_path "$protected_path"
 done
+if [ -L "$session_plist_target" ] || { [ -e "$session_plist_target" ] && [ ! -f "$session_plist_target" ]; }; then
+    fail "monitor-agent uninstall: unsafe deployment target"
+fi
 if [ -L "$plist_target" ] || { [ -e "$plist_target" ] && [ ! -f "$plist_target" ]; }; then
     fail "monitor-agent uninstall: unsafe deployment target"
 fi
@@ -98,6 +103,11 @@ if ! read_launchd_state || [ "$launchd_loaded" -ne 0 ]; then
     fail "monitor-agent uninstall: unable to verify LaunchDaemon removal"
 fi
 
+# Running session helpers stop at logout; removing the LaunchAgent prevents new starts.
+rm -f "$session_plist_target" || fail "monitor-agent uninstall: unable to remove session helper"
+if [ -e "$session_root" ]; then
+    rm -rf "$session_root" || fail "monitor-agent uninstall: unable to remove session helper"
+fi
 if [ -e "$venv_dir" ]; then
     rm -rf "$venv_dir" || fail "monitor-agent uninstall: unable to remove runtime"
 fi

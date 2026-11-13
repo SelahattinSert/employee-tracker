@@ -391,8 +391,10 @@ def test_late_reader_waits_for_empty_concurrent_winner(
     assert UUID(writer_value).version == 4
 
 
-def test_permanently_malformed_fallback_fails_after_bounded_retries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_permanently_malformed_fallback_is_quarantined_and_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     fallback_path = tmp_path / "machine-id"
     fallback_path.write_text("not-a-uuid", encoding="utf-8")
@@ -400,7 +402,25 @@ def test_permanently_malformed_fallback_fails_after_bounded_retries(
     monkeypatch.setattr(identity_module, "_FALLBACK_READ_ATTEMPTS", 3)
     monkeypatch.setattr(identity_module.time, "sleep", retry_delays.append)
 
-    with pytest.raises(RuntimeError, match="concurrent machine identity creation did not complete"):
-        _load_or_create_fallback(tmp_path)
+    value = _load_or_create_fallback(tmp_path)
 
+    assert UUID(value).version == 4
+    assert fallback_path.read_text(encoding="utf-8") == value
+    quarantined = list(tmp_path.glob("machine-id.invalid-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "not-a-uuid"
     assert retry_delays == [identity_module._FALLBACK_READ_DELAY_SEC] * 3
+    assert "machine identity fallback was invalid" in caplog.text
+    assert _load_or_create_fallback(tmp_path) == value
+
+
+def test_fallback_creation_gives_up_after_bounded_replacements(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "machine-id").write_text("not-a-uuid", encoding="utf-8")
+    monkeypatch.setattr(identity_module, "_FALLBACK_READ_ATTEMPTS", 1)
+    monkeypatch.setattr(identity_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(identity_module, "_quarantine_invalid_fallback", lambda path: None)
+
+    with pytest.raises(RuntimeError, match="machine identity could not be created"):
+        _load_or_create_fallback(tmp_path)

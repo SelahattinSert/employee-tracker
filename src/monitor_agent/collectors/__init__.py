@@ -16,6 +16,33 @@ from monitor_agent.config import AgentConfig
 from monitor_agent.identity import MachineIdentity
 
 
+def _active_window_collector(config: AgentConfig) -> Collector:
+    if config.session_source == "helper":
+        # A system service cannot see the desktop; ask the user-session helper instead.
+        from monitor_agent.session import SessionActiveWindowCollector
+
+        return SessionActiveWindowCollector(
+            config.include_active_window,
+            config.collection_timeout_sec,
+        )
+    return ActiveWindowCollector(config.include_active_window)
+
+
+def _screenshot_collector(config: AgentConfig) -> Collector:
+    if config.session_source == "helper":
+        from monitor_agent.session import SessionScreenshotCollector
+
+        return SessionScreenshotCollector(
+            config.screenshot_enabled,
+            config.screenshot_max_bytes,
+            config.collection_timeout_sec,
+        )
+    return ScreenshotCollector(
+        config.screenshot_enabled,
+        config.screenshot_max_bytes,
+    )
+
+
 def build_collectors(
     config: AgentConfig,
     identity: MachineIdentity,
@@ -27,14 +54,11 @@ def build_collectors(
         NetworkCollector(config.include_network_connections),
         ProcessesCollector(config.process_cmdline_mode),
         SoftwareCollector(config.include_software),
-        ActiveWindowCollector(config.include_active_window),
+        _active_window_collector(config),
         FileAuditCollector(
             config.audit_paths,
             config.audit_max_files,
             config.audit_max_file_bytes,
         ),
-        ScreenshotCollector(
-            config.screenshot_enabled,
-            config.screenshot_max_bytes,
-        ),
+        _screenshot_collector(config),
     ]

@@ -183,7 +183,76 @@ class Spool:
 
             if changed:
                 self._fsync_directory(self.root)
+            self._enforce_dead_letter_retention(cutoff)
             return RetentionResult(evicted_count=evicted_count, evicted_bytes=evicted_bytes)
+
+    def _enforce_dead_letter_retention(self, cutoff: datetime) -> None:
+        """Bound dead-letter storage by the same age and byte limits as pending records."""
+        changed = self._remove_finished_operation_markers()
+        records = sorted(
+            (
+                path
+                for path in self._dead_letter.glob("*.json")
+                if not path.name.startswith(".") and self._is_regular_file(path)
+            ),
+            key=lambda path: (self._record_time(path), path.name),
+        )
+        retained: list[tuple[Path, int]] = []
+        for record in records:
+            try:
+                size = self._validated_record_stat(record).st_size
+            except ValueError:
+                continue
+            if self._record_time(record) < cutoff:
+                self._unlink_name(self._dead_letter, record.name)
+                changed = True
+            else:
+                retained.append((record, size))
+
+        retained_bytes = sum(size for _, size in retained)
+        for record, size in retained:
+            if retained_bytes <= self.max_bytes:
+                break
+            self._unlink_name(self._dead_letter, record.name)
+            retained_bytes -= size
+            changed = True
+
+        if changed:
+            self._fsync_directory(self._dead_letter)
+
+    def _remove_finished_operation_markers(self) -> bool:
+        """Drop committed markers whose source and destination records are both gone."""
+        removed = False
+        for marker_path in self._dead_letter.glob(".deadop-*.json"):
+            operation_lock_name = f"{marker_path.stem}.lock"
+            if not self._acquire_artifact_guard(
+                self._dead_letter, operation_lock_name, blocking=False
+            ):
+                continue
+            try:
+                try:
+                    decoded = self._decode_operation_marker(marker_path.name)
+                except (OSError, ValueError):
+                    continue
+                source_name = decoded.get("source")
+                destination_name = decoded.get("destination")
+                if (
+                    decoded.get("committed") is not True
+                    or not isinstance(source_name, str)
+                    or Path(source_name).name != source_name
+                    or not isinstance(destination_name, str)
+                    or Path(destination_name).name != destination_name
+                ):
+                    continue
+                if self._name_exists(self.root, source_name) or self._name_exists(
+                    self._dead_letter, destination_name
+                ):
+                    continue
+                self._unlink_name(self._dead_letter, marker_path.name)
+                removed = True
+            finally:
+                self._release_artifact_guard(self._dead_letter, operation_lock_name)
+        return removed
 
     def stats(self) -> SpoolStats:
         """Return counts and bytes for independently owned spool records."""

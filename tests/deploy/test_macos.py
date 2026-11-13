@@ -13,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 MACOS = ROOT / "deploy" / "macos"
 PLIST = MACOS / "com.company.monitor-agent.plist"
+SESSION_PLIST = MACOS / "com.company.monitor-agent.session.plist"
 LAUNCHER = MACOS / "run-agent.sh"
 INSTALLER = MACOS / "install.sh"
 UNINSTALLER = MACOS / "uninstall.sh"
@@ -35,6 +36,14 @@ KNOWN_KEYS = {
     "MONITOR_PROCESS_CMDLINE_MODE",
     "MONITOR_INCLUDE_NETWORK_CONNECTIONS",
     "MONITOR_INCLUDE_SOFTWARE",
+    "MONITOR_INCLUDE_ACTIVE_WINDOW",
+    "MONITOR_AUDIT_PATHS",
+    "MONITOR_AUDIT_MAX_FILES",
+    "MONITOR_AUDIT_MAX_FILE_BYTES",
+    "MONITOR_SCREENSHOT_ENABLED",
+    "MONITOR_SCREENSHOT_MAX_BYTES",
+    "MONITOR_EMPLOYEE_NOTICE_ACK",
+    "MONITOR_SESSION_SOURCE",
     "MONITOR_LOG_PATH",
     "MONITOR_LOG_FORMAT",
     "MONITOR_LOG_LEVEL",
@@ -64,9 +73,10 @@ def _launcher_harness(tmp_path: Path, environment: str) -> tuple[Path, dict[str,
     (runtime / "monitor-agent.env").write_text(environment, encoding="utf-8")
     output = tmp_path / "agent-output"
     _write_executable(
-        runtime / "venv" / "bin" / "monitor-agent",
+        runtime / "venv" / "bin" / "python",
         "#!/bin/sh\n"
-        'printf "%s|%s|%s|%s" "$1" "$MONITOR_COLLECTOR_URI" '
+        '[ "$1" = -m ] && [ "$2" = monitor_agent ] || exit 97\n'
+        'printf "%s|%s|%s|%s" "$3" "$MONITOR_COLLECTOR_URI" '
         '"$MONITOR_API_TOKEN" "${MONITOR_LOG_LEVEL-unset}" > "$AGENT_OUTPUT"\n',
     )
     fake_bin = tmp_path / "fake-bin"
@@ -103,7 +113,7 @@ def _deployment_harness(
     project = tmp_path / "project"
     macos = project / "deploy" / "macos"
     macos.mkdir(parents=True)
-    for source in (PLIST, LAUNCHER, INSTALLER, UNINSTALLER):
+    for source in (PLIST, SESSION_PLIST, LAUNCHER, INSTALLER, UNINSTALLER):
         shutil.copy2(source, macos / source.name)
     shutil.copy2(ROOT / "requirements.lock", project / "requirements.lock")
     root = tmp_path / "managed"
@@ -111,9 +121,20 @@ def _deployment_harness(
     install_root = app_parent / "MonitorAgent"
     log_root = root / "Library" / "Logs" / "MonitorAgent"
     plist_target = root / "Library" / "LaunchDaemons" / "com.company.monitor-agent.plist"
+    session_root = app_parent / "MonitorAgentSession"
+    session_plist = root / "Library" / "LaunchAgents" / "com.company.monitor-agent.session.plist"
     app_parent.mkdir(parents=True)
     log_root.parent.mkdir(parents=True)
     plist_target.parent.mkdir(parents=True)
+    session_plist.parent.mkdir(parents=True)
+    session_replacements = {
+        'session_root="/Library/Application Support/MonitorAgentSession"': (
+            f'session_root="{session_root}"'
+        ),
+        'session_plist_target="/Library/LaunchAgents/com.company.monitor-agent.session.plist"': (
+            f'session_plist_target="{session_plist}"'
+        ),
+    }
     replacements = {
         'install_root="/Library/Application Support/MonitorAgent"': f'install_root="{install_root}"',
         'app_parent="/Library/Application Support"': f'app_parent="{app_parent}"',
@@ -124,6 +145,10 @@ def _deployment_harness(
         'plist_target="/Library/LaunchDaemons/com.company.monitor-agent.plist"': (
             f'plist_target="{plist_target}"'
         ),
+        'session_plist_parent="/Library/LaunchAgents"': (
+            f'session_plist_parent="{session_plist.parent}"'
+        ),
+        **session_replacements,
     }
     installer = macos / "install.sh"
     installer_text = installer.read_text(encoding="utf-8")
@@ -138,6 +163,7 @@ def _deployment_harness(
         'plist_target="/Library/LaunchDaemons/com.company.monitor-agent.plist"': (
             f'plist_target="{plist_target}"'
         ),
+        **session_replacements,
     }.items():
         uninstaller_text = _replace_once(uninstaller_text, expected, replacement)
     uninstaller.write_text(uninstaller_text, encoding="utf-8")
@@ -184,7 +210,7 @@ def _deployment_harness(
         'case "$format" in\n'
         "  %u) printf '0\\n' ;;\n"
         "  %Lp) case \"$path\" in *monitor-agent.env) printf '600\\n' ;; *plist) printf '644\\n' ;; *) printf '700\\n' ;; esac ;;\n"
-        "  %Su:%Sg:%Lp) case \"$path\" in *monitor-agent.env) printf 'root:wheel:600\\n' ;; *plist) printf 'root:wheel:644\\n' ;; *) printf 'root:wheel:700\\n' ;; esac ;;\n"
+        "  %Su:%Sg:%Lp) case \"$path\" in *monitor-agent.env) printf 'root:wheel:600\\n' ;; *plist) printf 'root:wheel:644\\n' ;; */session/venv | */MonitorAgentSession | */MonitorAgentSession/venv) printf 'root:wheel:755\\n' ;; *) printf 'root:wheel:700\\n' ;; esac ;;\n"
         "  *) exit 1 ;;\n"
         "esac\n",
     )
@@ -198,6 +224,7 @@ def _deployment_harness(
         '  chmod 755 "$3/bin/python"\n'
         "  exit 0\n"
         "fi\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "monitor_agent" ]; then exit 0; fi\n'
         'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
         '  agent="$(dirname "$0")/monitor-agent"\n'
         "  printf '%s\\n' '#!/bin/sh' 'exit 0' > \"$agent\"\n"
@@ -275,7 +302,8 @@ def test_launcher_uses_a_nonexecuting_strict_allowlist_parser() -> None:
     assert text.startswith("#!/bin/sh\nset -eu\n")
     assert "cd -P" in text and "pwd -P" in text
     assert '"$install_root/monitor-agent.env"' in text
-    assert '"$install_root/venv/bin/monitor-agent"' in text
+    assert '"$install_root/venv/bin/python"' in text
+    assert "bin/monitor-agent" not in text
     assert "source " not in text
     assert "eval " not in text
     assert "xargs" not in text
@@ -285,9 +313,18 @@ def test_launcher_uses_a_nonexecuting_strict_allowlist_parser() -> None:
     assert "${line%%=*}" in text and "${line#*=}" in text
     assert 'export "$key=$value"' in text
     assert 'unset "$known_key"' in text
-    assert 'exec "$agent" "$command"' in text
+    assert 'exec "$agent" -m monitor_agent "$command"' in text
     for key in KNOWN_KEYS:
         assert key in text
+
+
+def test_launcher_accepts_the_shipped_environment_example(tmp_path: Path) -> None:
+    launcher, env, output = _launcher_harness(tmp_path, ENV_EXAMPLE.read_text(encoding="utf-8"))
+
+    result = _run(launcher, "health", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_text(encoding="utf-8").startswith("health|")
 
 
 def test_launcher_parses_data_without_interpreting_spaces_or_equals(tmp_path: Path) -> None:
@@ -631,3 +668,120 @@ def test_uninstaller_handles_absence_unexpected_state_default_and_purge(tmp_path
     assert purged.returncode == 0, purged.stderr
     assert not install_root.exists()
     assert not log_root.exists()
+
+
+def _session_paths(tmp_path: Path) -> tuple[Path, Path]:
+    managed = tmp_path / "managed" / "Library"
+    return (
+        managed / "Application Support" / "MonitorAgentSession",
+        managed / "LaunchAgents" / "com.company.monitor-agent.session.plist",
+    )
+
+
+def _prior_daemon(tmp_path: Path) -> None:
+    plist = tmp_path / "managed" / "Library" / "LaunchDaemons" / "com.company.monitor-agent.plist"
+    plist.write_text("old plist", encoding="utf-8")
+
+
+def test_session_launchagent_runs_helper_from_its_own_runtime_in_gui_sessions() -> None:
+    data = plistlib.loads(SESSION_PLIST.read_bytes())
+
+    assert data == {
+        "Label": "com.company.monitor-agent.session",
+        "ProgramArguments": [
+            "/Library/Application Support/MonitorAgentSession/venv/bin/python",
+            "-m",
+            "monitor_agent",
+            "session-helper",
+        ],
+        "LimitLoadToSessionType": "Aqua",
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
+        "ProcessType": "Interactive",
+    }
+    assert "MonitorAgent/" not in SESSION_PLIST.read_text(encoding="utf-8")
+
+
+def test_installer_publishes_separate_session_runtime_and_launchagent(tmp_path: Path) -> None:
+    installer, _, install_root, env, _ = _deployment_harness(tmp_path, loaded=True)
+    session_root, session_plist = _session_paths(tmp_path)
+    _prior_daemon(tmp_path)
+    (session_root / "venv").mkdir(parents=True)
+    (session_root / "venv" / "old").write_text("old helper", encoding="utf-8")
+    session_plist.write_text("old agent", encoding="utf-8")
+
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (session_root / "venv" / "bin" / "python").is_file()
+    assert not (session_root / "venv" / "old").exists()
+    assert session_plist.read_bytes() == SESSION_PLIST.read_bytes()
+    assert not (session_root / "monitor-agent.env").exists()
+    assert "session helper starts at each user's next login" in result.stdout
+    assert not list(install_root.parent.glob(".monitor-agent-transaction.*"))
+
+
+@pytest.mark.parametrize("failed_stage", ["bootstrap", "enable"])
+def test_installer_activation_failure_restores_prior_session_helper(
+    tmp_path: Path, failed_stage: str
+) -> None:
+    installer, _, _, env, _ = _deployment_harness(tmp_path, loaded=True)
+    session_root, session_plist = _session_paths(tmp_path)
+    _prior_daemon(tmp_path)
+    (session_root / "venv").mkdir(parents=True)
+    (session_root / "venv" / "old").write_text("old helper", encoding="utf-8")
+    session_plist.write_text("old agent", encoding="utf-8")
+    env["FAIL_STAGE"] = failed_stage
+
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe deployment target" not in result.stderr
+    assert (tmp_path / "launchd-failed-once").exists()
+    assert (session_root / "venv" / "old").read_text(encoding="utf-8") == "old helper"
+    assert session_plist.read_text(encoding="utf-8") == "old agent"
+
+
+def test_failed_first_install_leaves_no_session_helper(tmp_path: Path) -> None:
+    installer, _, _, env, _ = _deployment_harness(tmp_path)
+    session_root, session_plist = _session_paths(tmp_path)
+    env["FAIL_STAGE"] = "bootstrap"
+
+    result = _run(
+        installer,
+        tmp_path / "monitor_agent-2.0.0-py3-none-any.whl",
+        tmp_path / "managed.env",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "launchd-failed-once").exists()
+    assert not session_root.exists()
+    assert not session_plist.exists()
+
+
+def test_uninstaller_removes_session_helper_without_purge(tmp_path: Path) -> None:
+    _, uninstaller, install_root, env, _ = _deployment_harness(tmp_path)
+    session_root, session_plist = _session_paths(tmp_path)
+    (session_root / "venv").mkdir(parents=True)
+    session_plist.write_text("agent", encoding="utf-8")
+    (install_root).mkdir(parents=True)
+    (install_root / "monitor-agent.env").write_text("MONITOR_API_TOKEN=keep\n", encoding="utf-8")
+
+    result = _run(uninstaller, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not session_root.exists()
+    assert not session_plist.exists()
+    assert (install_root / "monitor-agent.env").is_file()

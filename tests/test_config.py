@@ -69,6 +69,7 @@ def test_agent_config_is_frozen_slotted_and_has_exact_fields() -> None:
         "screenshot_enabled",
         "screenshot_max_bytes",
         "employee_notice_acknowledged",
+        "session_source",
         "log_path",
         "log_format",
         "log_level",
@@ -149,6 +150,19 @@ def test_invalid_numeric_settings_are_rejected(name: str, value: str, message: s
         load_config(BASE_ENV | {name: value}, platform_name="linux")
 
 
+@pytest.mark.parametrize("value", ["verbose", "", "notset"])
+def test_unknown_log_level_is_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match="MONITOR_LOG_LEVEL must be one of"):
+        load_config(BASE_ENV | {"MONITOR_LOG_LEVEL": value}, platform_name="linux")
+
+
+@pytest.mark.parametrize("value", ["warn", "Warning", "critical", "FATAL"])
+def test_standard_log_level_names_are_accepted(value: str) -> None:
+    config = load_config(BASE_ENV | {"MONITOR_LOG_LEVEL": value}, platform_name="linux")
+
+    assert config.log_level == value.upper()
+
+
 @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "YeS"])
 def test_true_boolean_spellings_are_accepted(value: str) -> None:
     config = load_config(
@@ -217,6 +231,7 @@ def test_all_overrides_are_loaded(tmp_path: Path) -> None:
             "MONITOR_SCREENSHOT_ENABLED": "true",
             "MONITOR_SCREENSHOT_MAX_BYTES": "6291456",
             "MONITOR_EMPLOYEE_NOTICE_ACK": "true",
+            "MONITOR_SESSION_SOURCE": "helper",
             "MONITOR_LOG_PATH": "/tmp/monitor-agent.log",
             "MONITOR_LOG_FORMAT": "json",
             "MONITOR_LOG_LEVEL": "debug",
@@ -248,6 +263,7 @@ def test_all_overrides_are_loaded(tmp_path: Path) -> None:
         screenshot_enabled=True,
         screenshot_max_bytes=6291456,
         employee_notice_acknowledged=True,
+        session_source="helper",
         log_path=Path("/tmp/monitor-agent.log"),
         log_format="json",
         log_level="DEBUG",

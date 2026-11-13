@@ -61,8 +61,8 @@ def test_package_and_lock_include_supported_pillow_runtime() -> None:
     config = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
     lock = (project_root / "requirements.lock").read_text(encoding="utf-8")
 
-    assert "pillow==12.3.0" in config["project"]["dependencies"]
-    assert "\npillow==12.3.0 \\" in lock
+    assert "pillow==13.0.0" in config["project"]["dependencies"]
+    assert "\npillow==13.0.0 \\" in lock
 
 
 def test_entrypoint_exits_with_success(monkeypatch, capsys) -> None:

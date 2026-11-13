@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,9 @@ from uuid import UUID, uuid4
 _MACOS_UUID_PATTERN = re.compile(r'"IOPlatformUUID"\s*=\s*"([^"]+)"')
 _FALLBACK_READ_ATTEMPTS = 100
 _FALLBACK_READ_DELAY_SEC = 0.01
+_FALLBACK_CREATE_ATTEMPTS = 3
+
+logger = logging.getLogger(__name__)
 
 
 class _RegistryModule(Protocol):
@@ -86,7 +90,8 @@ def _read_fallback_file(path: Path) -> str:
     return str(parsed)
 
 
-def _read_concurrent_winner(path: Path) -> str:
+def _read_concurrent_winner(path: Path) -> str | None:
+    """Wait for a concurrent creator; return None when the file stays absent or invalid."""
     for _ in range(_FALLBACK_READ_ATTEMPTS):
         try:
             value = _read_fallback_file(path)
@@ -95,24 +100,11 @@ def _read_concurrent_winner(path: Path) -> str:
         else:
             path.chmod(0o600)
             return value
-    raise RuntimeError("concurrent machine identity creation did not complete")
+    return None
 
 
-def _load_or_create_fallback(state_dir: Path) -> str:
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    state_dir.chmod(0o700)
-    path = state_dir / "machine-id"
-
-    try:
-        value = _read_fallback_file(path)
-    except FileNotFoundError:
-        pass
-    except ValueError:
-        return _read_concurrent_winner(path)
-    else:
-        path.chmod(0o600)
-        return value
-
+def _create_fallback_file(path: Path) -> str | None:
+    """Create the fallback identity exclusively; return None if another writer won."""
     candidate = str(uuid4())
     try:
         file_descriptor = os.open(
@@ -121,7 +113,7 @@ def _load_or_create_fallback(state_dir: Path) -> str:
             0o600,
         )
     except FileExistsError:
-        return _read_concurrent_winner(path)
+        return None
 
     with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
         stream.write(candidate)
@@ -129,6 +121,42 @@ def _load_or_create_fallback(state_dir: Path) -> str:
         os.fsync(stream.fileno())
     path.chmod(0o600)
     return candidate
+
+
+def _quarantine_invalid_fallback(path: Path) -> None:
+    """Keep the unreadable identity for inspection and free the canonical name."""
+    quarantine = path.with_name(f"{path.name}.invalid-{uuid4().hex}")
+    try:
+        os.rename(path, quarantine)
+    except FileNotFoundError:
+        return
+    logger.warning("machine identity fallback was invalid and has been replaced")
+
+
+def _load_or_create_fallback(state_dir: Path) -> str:
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_dir.chmod(0o700)
+    path = state_dir / "machine-id"
+
+    for _ in range(_FALLBACK_CREATE_ATTEMPTS):
+        try:
+            value = _read_fallback_file(path)
+        except FileNotFoundError:
+            created = _create_fallback_file(path)
+            if created is not None:
+                return created
+        except ValueError:
+            pass
+        else:
+            path.chmod(0o600)
+            return value
+
+        winner = _read_concurrent_winner(path)
+        if winner is not None:
+            return winner
+        _quarantine_invalid_fallback(path)
+
+    raise RuntimeError("machine identity could not be created")
 
 
 def _hashed_uuid(raw_identifier: str) -> str:

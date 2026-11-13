@@ -35,7 +35,7 @@ def test_systemd_unit_is_verified_against_staged_runtime_paths() -> None:
         "          install -Dm644 deploy/linux/monitor-agent.service "
         '"$staged_root/etc/systemd/system/monitor-agent.service"\n'
         "          install -Dm755 /bin/true "
-        '"$staged_root/opt/monitor-agent/venv/bin/monitor-agent"\n'
+        '"$staged_root/opt/monitor-agent/venv/bin/python"\n'
         "          install -Dm600 /dev/null "
         '"$staged_root/etc/monitor-agent/monitor-agent.env"\n'
         "          for target in sysinit.target network-online.target multi-user.target; do\n"

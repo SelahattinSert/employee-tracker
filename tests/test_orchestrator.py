@@ -400,3 +400,37 @@ def test_timeout_returns_without_waiting_for_running_collector() -> None:
 
     assert batch.results[0].status is CollectorStatus.TIMED_OUT
     assert batch.results[0].error_message == "collector deadline exceeded"
+
+
+def test_hung_collector_is_not_restarted_until_its_previous_call_returns() -> None:
+    release = threading.Event()
+    calls: list[int] = []
+
+    class HangingCollector:
+        name = "hanging"
+
+        def collect(self) -> CollectorPayload:
+            calls.append(1)
+            release.wait(timeout=5.0)
+            return CollectorPayload(data={"ok": True})
+
+    collector = HangingCollector()
+    try:
+        first = collect_all([collector], max_workers=1, timeout_sec=0.02).results[0]
+        second = collect_all([collector], max_workers=1, timeout_sec=0.02).results[0]
+    finally:
+        release.set()
+
+    assert first.error_code == "deadline_exceeded"
+    assert second.status is CollectorStatus.TIMED_OUT
+    assert second.error_code == "collector_still_running"
+    assert calls == [1]
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        third = collect_all([collector], max_workers=1, timeout_sec=1.0).results[0]
+        if third.error_code != "collector_still_running":
+            break
+        time.sleep(0.01)
+    assert third.status is CollectorStatus.SUCCESS
+    assert calls == [1, 1]

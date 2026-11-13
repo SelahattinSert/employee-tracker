@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -13,6 +14,11 @@ from monitor_agent.models import CollectionBatch, CollectorPayload, CollectorRes
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _NANOSECONDS_PER_MILLISECOND = 1_000_000
+
+# Collector calls that outlived an earlier cycle deadline. Python cannot stop a running
+# thread, so a hung collector is not started again until its previous call returns.
+_IN_FLIGHT: dict[int, tuple[Collector, Future[CollectorResult]]] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
 
 
 def _duration_ms(started_ns: int, finished_ns: int) -> int:
@@ -67,6 +73,36 @@ def _deadline_result(name: str, duration_ms: int) -> CollectorResult:
     )
 
 
+def _still_running_result(name: str) -> CollectorResult:
+    return CollectorResult(
+        name=name,
+        status=CollectorStatus.TIMED_OUT,
+        duration_ms=0,
+        data={},
+        error_code="collector_still_running",
+        error_message="previous collector call has not finished",
+    )
+
+
+def _busy_collector_ids() -> set[int]:
+    with _IN_FLIGHT_LOCK:
+        return {key for key, (_, future) in _IN_FLIGHT.items() if not future.done()}
+
+
+def _track(collector: Collector, future: Future[CollectorResult]) -> None:
+    key = id(collector)
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT[key] = (collector, future)
+
+    def forget(done: Future[CollectorResult]) -> None:
+        with _IN_FLIGHT_LOCK:
+            entry = _IN_FLIGHT.get(key)
+            if entry is not None and entry[1] is done:
+                del _IN_FLIGHT[key]
+
+    future.add_done_callback(forget)
+
+
 def _validate_limits(max_workers: int, timeout_sec: float) -> None:
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -94,15 +130,19 @@ def collect_all(
         max_workers=max_workers,
         thread_name_prefix="monitor-agent-collector",
     )
-    future_entries: list[tuple[str, Future[CollectorResult]]] = []
+    future_entries: list[tuple[str, Future[CollectorResult] | None]] = []
+    busy = _busy_collector_ids()
     try:
-        future_entries = [
-            (collector.name, executor.submit(_collect_one, collector.name, collector))
-            for collector in registry
-        ]
+        for collector in registry:
+            if id(collector) in busy:
+                future_entries.append((collector.name, None))
+                continue
+            future = executor.submit(_collect_one, collector.name, collector)
+            _track(collector, future)
+            future_entries.append((collector.name, future))
         remaining_sec = max(0.0, (deadline_ns - time.monotonic_ns()) / _NANOSECONDS_PER_SECOND)
         _, possibly_unfinished = wait(
-            {future for _, future in future_entries},
+            {future for _, future in future_entries if future is not None},
             timeout=remaining_sec,
         )
         unfinished = {future for future in possibly_unfinished if not future.done()}
@@ -113,7 +153,9 @@ def collect_all(
 
         results = tuple(
             (
-                _deadline_result(name, deadline_duration_ms)
+                _still_running_result(name)
+                if future is None
+                else _deadline_result(name, deadline_duration_ms)
                 if future in unfinished
                 else future.result()
             )

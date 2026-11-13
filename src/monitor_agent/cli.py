@@ -45,22 +45,27 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check-config", help="validate configuration")
     subparsers.add_parser("health", help="print operational health")
     subparsers.add_parser("version", help="print package and Python versions")
+    subparsers.add_parser(
+        "session-helper",
+        help="serve screen and active-window capture from this desktop session",
+    )
     return parser
 
 
 def _create_runtime(config: AgentConfig) -> AgentRuntime:
     identity = resolve_machine_identity(config.spool_path.parent)
+    stop_event = threading.Event()
     return AgentRuntime(
         config=config,
         identity=identity,
         collectors=build_collectors(config, identity),
-        transport=TelemetryTransport(config),
+        transport=TelemetryTransport(config, sleep=stop_event.wait),
         spool=Spool(
             config.spool_path,
             config.spool_max_bytes,
             config.spool_max_age_sec,
         ),
-        stop_event=threading.Event(),
+        stop_event=stop_event,
     )
 
 
@@ -208,6 +213,20 @@ def _run_command(config: AgentConfig) -> int:
     return 0
 
 
+def _session_helper_command() -> int:
+    from monitor_agent.session import run_helper
+
+    stop = threading.Event()
+
+    def request_stop(signum: int, frame: FrameType | None) -> None:
+        stop.set()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    return run_helper(stop=stop)
+
+
 def _once_command(config: AgentConfig, event: str, *, no_transmit: bool) -> int:
     if _EVENT_PATTERN.fullmatch(event) is None:
         print("invalid event name", file=sys.stderr)
@@ -238,6 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "version":
         print(f"monitor-agent {__version__} Python {platform.python_version()}")
         return 0
+    if args.command == "session-helper":
+        return _session_helper_command()
     try:
         if args.command == "run":
             return _run_command(_prepare_config(require_transport=True))

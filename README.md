@@ -66,6 +66,7 @@ Store configuration in the owner-restricted environment file consumed by the pla
 | `MONITOR_SCREENSHOT_ENABLED` | `false` | `true`/`false`; requires employee notice acknowledgement | Highly sensitive telemetry |
 | `MONITOR_SCREENSHOT_MAX_BYTES` | `5242880` | `1024..52428800` integer | Collection bound |
 | `MONITOR_EMPLOYEE_NOTICE_ACK` | `false` | Must be `true` before any optional sensitive collector is enabled | Compliance control |
+| `MONITOR_SESSION_SOURCE` | `direct` | `direct` captures in this process; `helper` asks the `session-helper` running in each desktop login (required for the system service) | Operational |
 | `MONITOR_LOG_PATH` | Platform-specific | Writable file path | Operational |
 | `MONITOR_LOG_FORMAT` | `text` | `text`, `json` | No |
 | `MONITOR_LOG_LEVEL` | `INFO` | Standard Python logging level | No |
@@ -84,6 +85,7 @@ TLS verification is always enabled. For a private PKI, set `MONITOR_CA_BUNDLE` t
 | `monitor-agent check-config` | Validate protected configuration and writable paths. |
 | `monitor-agent health` | Print operational health only, without telemetry payload contents. |
 | `monitor-agent version` | Print package and Python versions. |
+| `monitor-agent session-helper` | Run inside a desktop login to serve screenshot and active-window capture to the service. |
 
 | Exit code | Meaning |
 | --- | --- |
@@ -133,6 +135,18 @@ macOS:
 sudo deploy/macos/install.sh dist/monitor_agent-2.0.0-py3-none-any.whl /secure/path/monitor-agent.env
 sudo launchctl print system/com.company.monitor-agent
 ```
+
+### Session helper
+
+The system service cannot see a user's desktop, so screenshot and active-window collection comes from `monitor-agent session-helper`, which each installer starts in every graphical login. Set `MONITOR_SESSION_SOURCE=helper` in the service configuration (the examples do). The helper uses its own runtime that standard users can read and execute; it never reads the service configuration or API token. It authenticates the service with a random per-login key in an owner-only file and exchanges only bounded JSON.
+
+| Platform | Helper runtime | Start mechanism |
+| --- | --- | --- |
+| Linux | `/opt/monitor-agent/venv` | `/etc/xdg/autostart/monitor-agent-session.desktop` |
+| Windows | `C:\Program Files\MonitorAgentSession\venv` | `MonitorAgentSession` scheduled task at each logon (Users group, least privilege) |
+| macOS | `/Library/Application Support/MonitorAgentSession/venv` | `/Library/LaunchAgents/com.company.monitor-agent.session.plist` |
+
+The helper starts at each user's next login after installation. On macOS, grant Screen Recording and Automation permission to the helper's Python through an MDM privacy profile; without it captures return `partial` status. Linux Wayland sessions limit active-window titles to what the installed tools support.
 
 Uninstalling without `--purge` or `-Purge` preserves protected configuration and spool state. Purge removes managed state and is destructive.
 

@@ -15,6 +15,12 @@ def _read(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
+def _read_local_doc(path: str) -> str:
+    if not Path(path).is_file():
+        pytest.skip(f"{path} is maintained locally and is not present")
+    return _read(path)
+
+
 def _ordered(text: str, headings: tuple[str, ...]) -> None:
     positions = [text.index(heading) for heading in headings]
     assert positions == sorted(positions)
@@ -90,7 +96,7 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
     assert "screenshots" in text
     assert "keystrokes" in text
     assert "file contents" in text
-    assert "browser content" in text
+    assert "browser history" in text
     assert "employee scoring" in text
     assert "persisted owner-only random UUID" in text
     assert "permission-protected local spool" in text
@@ -128,6 +134,7 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
         "MONITOR_SCREENSHOT_ENABLED",
         "MONITOR_SCREENSHOT_MAX_BYTES",
         "MONITOR_EMPLOYEE_NOTICE_ACK",
+        "MONITOR_SESSION_SOURCE",
         "MONITOR_LOG_PATH",
         "MONITOR_LOG_FORMAT",
         "MONITOR_LOG_LEVEL",
@@ -192,6 +199,7 @@ def test_readme_defines_the_operator_contract_in_order() -> None:
             "Must be `true`",
             "Compliance control",
         ),
+        "`MONITOR_SESSION_SOURCE`": ("`direct`", "`helper`", "Operational"),
         "`MONITOR_LOG_PATH`": ("Platform-specific", "Writable file path", "Operational"),
         "`MONITOR_LOG_FORMAT`": ("`text`", "`text`, `json`", "No"),
         "`MONITOR_LOG_LEVEL`": ("`INFO`", "Standard Python logging level", "No"),
@@ -265,7 +273,7 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
         "screenshots",
         "keystrokes",
         "file contents",
-        "browser content",
+        "browser history",
         "employee scoring",
         "SHA-256",
         "persisted random UUID",
@@ -388,7 +396,7 @@ def test_release_security_and_privacy_materials_cover_required_controls() -> Non
 
 
 def test_migration_preserves_recovery_material_and_v2_spool() -> None:
-    text = _read("docs/migration-v1-to-v2.md")
+    text = _read_local_doc("docs/migration-v1-to-v2.md")
     for value in (
         "external, owner-restricted backup",
         "service/task/LaunchDaemon definition",
@@ -456,7 +464,7 @@ def test_migration_preserves_recovery_material_and_v2_spool() -> None:
 
 
 def test_migration_rollback_validates_recovery_before_v2_mutation_and_restores_states() -> None:
-    text = _read("docs/migration-v1-to-v2.md")
+    text = _read_local_doc("docs/migration-v1-to-v2.md")
     linux = _fenced_block(text, "### Linux rollback", "bash")
     _ordered_commands(
         linux,
@@ -534,7 +542,7 @@ def test_migration_rollback_validates_recovery_before_v2_mutation_and_restores_s
 
 
 def test_migration_rollback_preflight_is_fail_fast_and_never_uses_unsafe_stop() -> None:
-    text = _read("docs/migration-v1-to-v2.md")
+    text = _read_local_doc("docs/migration-v1-to-v2.md")
     linux = _fenced_block(text, "### Linux rollback", "bash")
     assert linux.lstrip().startswith("set -eu")
     _ordered_commands(
@@ -618,7 +626,7 @@ def test_migration_rollback_preflight_is_fail_fast_and_never_uses_unsafe_stop() 
 
 
 def test_operations_matches_delivery_and_recovery_behavior() -> None:
-    text = _read("docs/operations.md")
+    text = _read_local_doc("docs/operations.md")
     normalized = text.casefold()
     for value in (
         "monitor-agent health",
