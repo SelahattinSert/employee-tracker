@@ -1,0 +1,126 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "Monitor Agent $GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
+
+  linux-run:
+    needs: create-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: python -m pip install "build==1.5.0"
+      - run: python -m build --wheel --outdir dist
+      - name: Build Linux self-extracting installer
+        run: |
+          wheel=$(ls dist/monitor_agent-*.whl)
+          archive=$(python scripts/build_unix_package.py --os linux --wheel "$wheel" --output dist)
+          run=$(sh scripts/make_selfextract.sh "$archive" Install.sh "${archive%.tar.gz}.run")
+          echo "RUN_ASSET=$run" >> "$GITHUB_ENV"
+          echo "WHEEL_ASSET=$wheel" >> "$GITHUB_ENV"
+      - name: Upload Linux installer and wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "$RUN_ASSET" "$WHEEL_ASSET" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  windows-exe:
+    needs: create-release
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: python -m pip install "build==1.5.0"
+      - run: python -m build --wheel --outdir dist
+      - name: Build Windows self-extracting installer
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist/monitor_agent-*.whl | Select-Object -First 1).FullName
+          $zip = python scripts/build_windows_package.py --wheel $wheel --output dist | Select-Object -Last 1
+          $folder = $zip -replace '\.zip$', ''
+          Expand-Archive -LiteralPath $zip -DestinationPath $folder -Force
+          $sfx = Join-Path $env:ProgramFiles "7-Zip\7z.sfx"
+          $sevenzip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          $payload = Join-Path $env:RUNNER_TEMP "payload.7z"
+          & $sevenzip a -t7z $payload (Join-Path $folder '*') | Out-Null
+          $config = Join-Path $env:RUNNER_TEMP "config.txt"
+          $lines = @(
+            ';!@Install@!UTF-8!',
+            'Title="Monitor Agent Setup"',
+            'RunProgram="cmd /c \"Install.cmd\""',
+            ';!@InstallEnd@!'
+          )
+          Set-Content -LiteralPath $config -Value $lines -Encoding Ascii
+          $exe = "$folder-Setup.exe"
+          cmd /c copy /b "`"$sfx`"" + "`"$config`"" + "`"$payload`"" "`"$exe`"" | Out-Null
+          "EXE_ASSET=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Upload Windows installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" "$env:EXE_ASSET" --repo "$env:GITHUB_REPOSITORY" --clobber
+
+  macos-dmg:
+    needs: create-release
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: python -m pip install "build==1.5.0"
+      - run: python -m build --wheel --outdir dist
+      - name: Build macOS disk image
+        run: |
+          wheel=$(ls dist/monitor_agent-*.whl)
+          archive=$(python scripts/build_unix_package.py --os macos --wheel "$wheel" --output dist)
+          staging=$(mktemp -d)
+          tar -xzf "$archive" -C "$staging"
+          volume=$(basename "${archive%.tar.gz}")
+          dmg="dist/$volume.dmg"
+          hdiutil create -volname "Monitor Agent" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          echo "DMG_ASSET=$dmg" >> "$GITHUB_ENV"
+      - name: Upload macOS installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$DMG_ASSET" --repo "$GITHUB_REPOSITORY" --clobber

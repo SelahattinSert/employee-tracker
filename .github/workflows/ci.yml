@@ -141,6 +141,7 @@ jobs:
           done
       - run: shellcheck deploy/linux/install.sh deploy/linux/uninstall.sh
       - run: shellcheck -s sh deploy/common/setup-wizard.sh deploy/linux/setup.sh deploy/macos/setup.sh deploy/linux/Install.sh deploy/macos/Install.command
+      - run: shellcheck scripts/make_selfextract.sh
       - name: Verify systemd unit against staged runtime
         run: |
           staged_root="$(mktemp -d)"
