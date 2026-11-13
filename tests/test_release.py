@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import tarfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MAKE_SELFEXTRACT = ROOT / "scripts" / "make_selfextract.sh"
@@ -30,6 +33,7 @@ def _make_archive(path: Path, launcher: str, marker_line: str) -> None:
         archive.addfile(marker, io.BytesIO(payload))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX self-extractor is executed on Unix only")
 def test_selfextract_runs_launcher_with_args(tmp_path: Path) -> None:
     archive = tmp_path / "pkg.tar.gz"
     _make_archive(archive, "Install.sh", "LAUNCHED")
@@ -58,6 +62,7 @@ def test_selfextract_runs_launcher_with_args(tmp_path: Path) -> None:
     assert "deploy=yes" in body
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX self-extractor is executed on Unix only")
 def test_selfextract_rejects_bad_arguments(tmp_path: Path) -> None:
     archive = tmp_path / "pkg.tar.gz"
     _make_archive(archive, "Install.sh", "X")
@@ -77,6 +82,7 @@ def test_selfextract_rejects_bad_arguments(tmp_path: Path) -> None:
     assert bad_launcher.returncode == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX self-extractor is executed on Unix only")
 def test_selfextract_detects_incomplete_payload(tmp_path: Path) -> None:
     archive = tmp_path / "pkg.tar.gz"
     _make_archive(archive, "Install.sh", "X")

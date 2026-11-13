@@ -11,6 +11,7 @@
 - `release` workflow that, on a version tag, builds a single-file installer per platform (Windows self-extracting `.exe`, Linux `.run`, macOS `.dmg`) and attaches them to the GitHub Release; `scripts/make_selfextract.sh` builds the Linux self-extractor. Installers ship no secrets.
 
 ### Fixed
+- Windows `setup.ps1` honours `-NoEmployeesNotified` again (it had been inverted to force sensitive collection on); the opt-out now disables screenshots, active window and file audit as documented, and a regression test guards it.
 - New collector data now survives payload construction and reports disabled or partial states honestly.
 - Windows audit path parsing preserves drive letters by using the platform path-list separator.
 - Screenshot and active-window failures no longer appear as successful empty captures.

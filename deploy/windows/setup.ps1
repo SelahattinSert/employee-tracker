@@ -134,7 +134,7 @@ function New-OwnerOnlyDirectory {
 }
 
 function Read-EmployeesNotified {
-    if ($NoEmployeesNotified) { return $true }
+    if ($NoEmployeesNotified) { return $false }
     if ($EmployeesNotified) { return $true }
     $ErrorActionPreference = "Continue"
     Write-Host ""
