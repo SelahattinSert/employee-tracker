@@ -77,3 +77,10 @@ def test_release_workflow_builds_the_gui_installer() -> None:
     assert "choco install innosetup" in workflow
     assert "deploy/windows/installer.iss" in workflow
     assert "MonitorAgent-Windows-$version-Setup.exe" in workflow
+
+
+def test_ci_compiles_the_gui_installer() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "Compile the GUI installer" in workflow
+    assert "choco install innosetup" in workflow
+    assert "ISCC.exe" in workflow
