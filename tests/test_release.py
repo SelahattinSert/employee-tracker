@@ -107,7 +107,8 @@ def test_release_workflow_publishes_one_file_installer_per_os() -> None:
     assert "runs-on: windows-2025" in workflow
     assert "runs-on: macos-15" in workflow
     assert "scripts/make_selfextract.sh" in workflow
-    assert "7z.sfx" in workflow
+    assert "ISCC.exe" in workflow
+    assert "deploy/windows/installer.iss" in workflow
     assert "hdiutil create" in workflow
     assert workflow.count("gh release upload") == 3
     assert "gh release create" in workflow

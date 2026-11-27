@@ -187,6 +187,18 @@ jobs:
         run: |
           $task = New-Object System.Xml.XmlDocument
           $task.Load((Resolve-Path -LiteralPath deploy/windows/monitor_agent_task.xml))
+      - name: Compile the GUI installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress --yes
+          $payload = "deploy/windows/payload"
+          New-Item -ItemType Directory -Path $payload -Force | Out-Null
+          Set-Content "$payload/monitor_agent-0.0.0-py3-none-any.whl" "placeholder"
+          Copy-Item requirements.lock $payload
+          Copy-Item deploy/windows/gui-install.ps1 $payload
+          Copy-Item deploy/windows/gui-uninstall.ps1 $payload
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=0.0.0" "/Odist" deploy/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 
   deployment-macos:
     runs-on: macos-15
