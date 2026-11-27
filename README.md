@@ -114,17 +114,27 @@ single-file installer per platform and attaches them to the matching GitHub Rele
 
 | Platform | Asset | Double-click behaviour |
 | --- | --- | --- |
-| Windows | `MonitorAgent-Windows-<ver>-Setup.exe` | Self-extracting `.exe`; runs `Install.cmd` (asks for server address, token and the notice confirmation). |
+| Windows | `MonitorAgent-Windows-<ver>-Setup.exe` | Inno Setup **GUI wizard**: welcome, a page for the server address and API token, an employee-notice page, progress, finish. Installs under `Program Files`. |
 | Linux | `MonitorAgent-Linux-<ver>.run` | Self-extracting script; run `sudo ./…​.run` or "Run as Program". |
 | macOS | `MonitorAgent-macOS-<ver>.dmg` | Disk image; open it and double-click `Install.command`. |
 
-The installers contain no server URL, token or configuration; each one runs the platform
-setup wizard, which asks for those at install time. Download assets from the repository's
-**Releases** page (not Packages). To cut a release, tag a commit and push the tag:
+The installers contain no server URL, token or configuration; each one asks for those at
+install time (the Windows wizard in form fields, the others in the terminal). Download assets
+from the repository's **Releases** page (not Packages). To cut a release, tag a commit and
+push the tag:
 
 ```bash
 git tag v2.0.0 && git push origin v2.0.0
 ```
+
+The Windows wizard installs to `Program Files` and registers the scheduled tasks, so it is not
+blocked by Controlled Folder Access the way a write to `C:\ProgramData` can be. The build is
+unsigned, so SmartScreen or Windows Defender may still warn. This project does not hide from or
+disable Defender; the supported ways to clear a warning are to **sign the installer** with a
+code-signing certificate, or for an administrator to **add an explicit Defender exclusion
+themselves** (for example `Add-MpPreference -ExclusionPath 'C:\Program Files\MonitorAgent'` run
+knowingly in an elevated shell, or the equivalent Group Policy). The installer never does this
+for you.
 
 ## Install the service
 

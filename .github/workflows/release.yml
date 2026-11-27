@@ -69,27 +69,24 @@ jobs:
           python-version: "3.14"
       - run: python -m pip install "build==1.5.0"
       - run: python -m build --wheel --outdir dist
-      - name: Build Windows self-extracting installer
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress --yes
+      - name: Build Windows GUI installer
         shell: pwsh
         run: |
-          $wheel = (Get-ChildItem dist/monitor_agent-*.whl | Select-Object -First 1).FullName
-          $zip = python scripts/build_windows_package.py --wheel $wheel --output dist | Select-Object -Last 1
-          $folder = $zip -replace '\.zip$', ''
-          Expand-Archive -LiteralPath $zip -DestinationPath $folder -Force
-          $sfx = Join-Path $env:ProgramFiles "7-Zip\7z.sfx"
-          $sevenzip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
-          $payload = Join-Path $env:RUNNER_TEMP "payload.7z"
-          & $sevenzip a -t7z $payload (Join-Path $folder '*') | Out-Null
-          $config = Join-Path $env:RUNNER_TEMP "config.txt"
-          $lines = @(
-            ';!@Install@!UTF-8!',
-            'Title="Monitor Agent Setup"',
-            'RunProgram="cmd /c \"Install.cmd\""',
-            ';!@InstallEnd@!'
-          )
-          Set-Content -LiteralPath $config -Value $lines -Encoding Ascii
-          $exe = "$folder-Setup.exe"
-          cmd /c copy /b "`"$sfx`"" + "`"$config`"" + "`"$payload`"" "`"$exe`"" | Out-Null
+          $wheel = Get-ChildItem dist/monitor_agent-*.whl | Select-Object -First 1
+          $version = $wheel.Name -replace '^monitor_agent-', '' -replace '-py3.*$', ''
+          $payload = "deploy/windows/payload"
+          New-Item -ItemType Directory -Path $payload -Force | Out-Null
+          Copy-Item $wheel.FullName $payload
+          Copy-Item requirements.lock $payload
+          Copy-Item deploy/windows/gui-install.ps1 $payload
+          Copy-Item deploy/windows/gui-uninstall.ps1 $payload
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=$version" "/Odist" deploy/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+          $exe = "dist/MonitorAgent-Windows-$version-Setup.exe"
+          if (-not (Test-Path $exe)) { throw "installer was not produced at $exe" }
           "EXE_ASSET=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Upload Windows installer
         shell: pwsh

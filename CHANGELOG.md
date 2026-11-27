@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Windows GUI installer (Inno Setup `installer.iss` + `gui-install.ps1`) with wizard pages for the server address, API token and the employee-notice confirmation; it installs under `Program Files`, registers the scheduled tasks and ships no secrets. The `release` workflow builds it with Inno Setup. It does not evade or disable Windows Defender; clearing a SmartScreen/Defender warning is left to code signing or an administrator-added exclusion.
 - Telemetry schema 1.1 sections for opt-in active-window, bounded file-audit, and screenshot data.
 - Explicit employee-notice acknowledgement and size/count bounds for sensitive collectors.
 - Pillow 13.0.0 in canonical package metadata and the hash-locked deployment dependency set.
